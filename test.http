@@ -1,0 +1,24 @@
+# 环境变量http://localhost:3000=""1=1L5fJbLV7SXtD7e73zPUJkd1q="PAT"
+
+# 2.1 建联系人
+curl -s -X POST "http://localhost:3000/api/v1/accounts/1/contacts"
+  -H "Content-Type: application/json"
+  -H "api_access_token: L5fJbLV7SXtD7e73zPUJkd1q"
+  -d '{"name":"Felix QA","phone_number":"+6281234567890"}' | tee /tmp/ct.json
+
+CT_ID=$(jq -r '.id' /tmp/ct.json)
+
+# 2.2 建会话（用 inbox 的**数字 id**）
+INBOX_ID=WA_Bridge_inbox_id
+curl -s -X POST "http://localhost:3000/api/v1/accounts/1/conversations"
+  -H "Content-Type: application/json"
+  -H "api_access_token: L5fJbLV7SXtD7e73zPUJkd1q"
+  -d "{"contact_id":$CT_ID,"inbox_id":$INBOX_ID,"source_id":"wa:+6281234567890"}" | tee /tmp/cv.json
+
+CV_ID=$(jq -r '.id' /tmp/cv.json)
+
+# 2.3 发一条“访客来消息”
+curl -s -X POST "http://localhost:3000/api/v1/accounts/1/conversations/$CV_ID/messages"
+  -H "Content-Type: application/json"
+  -H "api_access_token: L5fJbLV7SXtD7e73zPUJkd1q"
+  -d '{"content":"Hello from bridge","message_type":0,"private":false}'

@@ -1,0 +1,22 @@
+{
+  "name": "@wa/collector",
+  "version": "0.1.0",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "license": "MIT",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@wa/common": "file:../common",
+    "axios": "^1.7.2",
+    "body-parser": "^1.20.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "pino-pretty": "^13.1.2"
+  }
+}

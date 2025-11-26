@@ -1,0 +1,15 @@
+sudo tee /usr/local/bin/adspower-proxy >/dev/null <<'SH'
+#!/bin/bash
+# 让 AdsPower 及其子进程（指纹浏览器）全部走 Clash 代理
+export http_proxy="http://127.0.0.1:7890"
+export https_proxy="http://127.0.0.1:7890"
+export all_proxy="http://127.0.0.1:7890"
+
+# 如果以后你开了 socks-port，也可以顺便带上：
+# export all_proxy="socks5://127.0.0.1:7891"
+
+# !!! 把下面这行改成你的 AdsPower 真正启动命令 !!!
+exec /opt/AdsPower Global/adspower_global "$@"
+SH
+
+sudo chmod +x /usr/local/bin/adspower-proxy

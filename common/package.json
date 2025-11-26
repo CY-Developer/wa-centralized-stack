@@ -1,0 +1,12 @@
+{
+  "name": "@wa/common",
+  "version": "0.1.0",
+  "private": true,
+  "description": "shared utils for wa-centralized-stack",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "dotenv-expand": "^10.0.0"
+  }
+}

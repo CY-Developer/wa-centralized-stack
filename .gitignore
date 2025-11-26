@@ -1,0 +1,40 @@
+# Node.js dependencies
+node_modules/
+bridge/node_modules/
+bridge/media/
+chatwoot-local/
+collector/data
+collector/logs
+# Logs
+*.log
+logs/
+# Environment files
+.env
+.envrc
+*.env
+
+# Build directories
+build/
+dist/
+
+# Docker related files
+docker-compose.override.yml
+docker-compose.local.yml
+docker-compose.yml.backup*
+*.swp
+
+# IDE config files
+.idea/
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Common temp files
+*.tmp
+*.bak
+*.swp
+
+# Generated files
+package-lock.json

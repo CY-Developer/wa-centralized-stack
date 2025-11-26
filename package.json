@@ -1,0 +1,14 @@
+{
+  "name": "wa-centralized-stack",
+  "private": true,
+  "workspaces": [
+    "collector",
+    "sender",
+    "common"
+  ],
+  "dependencies": {
+    "pino": "^10.1.0",
+    "whatsapp-web.js": "^1.34.2",
+    "wpp-adspower": "file:bridge"
+  }
+}
