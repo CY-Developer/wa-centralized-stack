@@ -9,7 +9,6 @@ collector/logs
 *.log
 logs/
 # Environment files
-.env
 .envrc
 *.env
 
