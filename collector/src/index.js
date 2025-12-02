@@ -646,7 +646,7 @@ app.post('/chatwoot/webhook', async (req, res) => {
 
         if (!phone) return res.json({ok: true, skipped: 'no phone'});
         const chatIdOrPhone = String(phone).replace(/^wa:[^:]*:/, '').replace(/^wa:/, '');
-
+        let phone_t =  sender.additional_attributes.phone
         const headers = {};
         if (WA_BRIDGE_TOKEN) headers['x-api-token'] = WA_BRIDGE_TOKEN;
 
@@ -678,42 +678,27 @@ app.post('/chatwoot/webhook', async (req, res) => {
             const dataUrl = a.data_url || a.dataUrl;
             if (dataUrl) {
                 if (/^data:/i.test(dataUrl)) {
-                    // data:xxx;base64,... 这种，才按 base64 解析
                     const m = dataUrl.match(/^data:(.*?);base64,(.*)$/i);
                     if (m) {
                         mimetype = m[1] || mimetype;
                         b64 = m[2];
                     }
                 } else if (/^https?:\/\//i.test(dataUrl)) {
-                    // Chatwoot 默认就是把文件的下载地址放在 data_url 里
                     url = dataUrl;
                 }
             }
 
-            // 某些版本可能有 file_url，就当备选
-            if (!b64 && !url && a.file_url && /^https?:\/\//i.test(a.file_url)) {
+            // 支持本地文件路径和HTTP URL
+            if (!b64 && !url && a.file_url) {
                 url = a.file_url;
             }
 
             if (!b64 && !url) {
-                // 连链接都没有，就直接记个日志跳过，避免发一个空的 /send/media
                 logToCollector('[CW->WA] SKIP_MEDIA_NO_URL', {
                     msgId: message.id,
                     attachment: { id: a.id, file_type: a.file_type }
                 });
             } else {
-                const payload = {
-                    caption: (message.content || '') || undefined
-                };
-
-                if (b64) {
-                    payload.b64 = b64;
-                    payload.mimetype = mimetype;
-                    if (a.filename) payload.filename = a.filename;
-                } else if (url) {
-                    payload.url = url;
-                }
-
                 const { sessionId: finalSession, to: resolvedTo } = await resolveWaTarget({
                     redis,
                     conversation_id: conversation.id || conversation.conversation_id,
@@ -730,32 +715,103 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     return res.json({ ok: true, skipped: 'no target' });
                 }
 
-                logToCollector('[CW->WA] SEND_MEDIA', {
-                    url: `${WA_BRIDGE_URL}/send/media`,
+
+                // 修复：生成有效的文件名
+                let filename = a.filename || '';
+                if (!filename && url) {
+                    // 从URL提取文件名或生成默认文件名
+                    const urlMatch = url.match(/\/([^\/?]+)\.(\w+)(?=\?|$)/);
+                    if (urlMatch) {
+                        filename = urlMatch[0].substring(1); // 去掉开头的斜杠
+                    } else {
+                        // 生成基于时间和类型的文件名
+                        const timestamp = Date.now();
+                        const ext = mediaType === 'video' ? 'mp4' :
+                            mediaType === 'image' ? 'jpg' :
+                                mediaType === 'audio' ? 'mp3' : 'bin';
+                        filename = `file_${timestamp}.${ext}`;
+                    }
+                }
+
+                logToCollector('[CW->WA] SEND_MEDIA_DEBUG', {
+                    url: `${WA_BRIDGE_URL}/send-media/${finalSession}`,
                     session: finalSession,
                     to: toForBridge,
                     type: mediaType,
-                    hasB64: Boolean(payload.b64),
-                    hasUrl: Boolean(payload.url),
-                    captionLen: (payload.caption || '').length
+                    hasB64: Boolean(b64),
+                    hasUrl: Boolean(url),
+                    urlType: url ? (url.startsWith('http') ? 'http' : 'local') : 'none',
+                    captionLen: (message.content || '').length,
+                    filename: filename,
+                    attachmentInfo: {
+                        filename: a.filename,
+                        file_type: a.file_type,
+                        file_size: a.file_size
+                    }
                 });
 
-                await postWithRetry(
-                    `${WA_BRIDGE_URL}/send/media`,
-                    {
-                        sessionId: finalSession,
-                        to: toForBridge,
-                        type: mediaType,
-                        url: payload.url,
-                        b64: payload.b64,
-                        mimetype: payload.mimetype,
-                        filename: payload.filename,
-                        caption: payload.caption
-                    },
-                    headers
-                );
+                // 修复：构建完整的payload
+                const payload = {
+                    chatIdOrPhone: toForBridge,
+                    mediaType: mediaType,
+                    caption: message.content || '',
+                    forceOwnDownload: true,
+                    filename: filename  // 确保有有效的文件名
+                };
+
+                // 根据内容类型设置url或b64
+                if (b64) {
+                    payload.b64 = b64;
+                    payload.mimetype = mimetype;
+                } else if (url) {
+                    payload.url = url;
+                }
+
+                // 修复：对于视频文件，添加特定的处理参数
+                if (mediaType === 'video') {
+                    payload.videoCompression = false; // 禁用视频压缩，避免处理错误
+                    payload.forceUpload = true; // 强制重新上传
+                }
+
+                logToCollector('[CW->WA] FINAL_PAYLOAD', {
+                    payloadKeys: Object.keys(payload),
+                    urlLength: url ? url.length : 0,
+                    hasFilename: Boolean(payload.filename),
+                    filename: payload.filename
+                });
+
+                try {
+
+                    await postWithRetry(
+                        `${WA_BRIDGE_URL}/send-media/${finalSession}`,
+                        payload,
+                        headers
+                    );
+                } catch (error) {
+                    logToCollector('[CW->WA] SEND_MEDIA_ERROR', {
+                        error: error.message,
+                        status: error.status,
+                        payload: {
+                            chatIdOrPhone: payload.chatIdOrPhone,
+                            mediaType: payload.mediaType,
+                            urlLength: payload.url ? payload.url.length : 0,
+                            filename: payload.filename
+                        },
+                        session: finalSession
+                    });
+
+                    // 修复：返回更具体的错误信息
+                    if (error.status === 400) {
+                        return res.json({
+                            ok: false,
+                            error: 'WhatsApp manager rejected the request. Check session status and file accessibility.'
+                        });
+                    }
+                    throw error;
+                }
             }
-        } else if (text && text.trim()) {
+        }
+        else if (text && text.trim()) {
             const {sessionId: finalSession, to: resolvedTo} = await resolveWaTarget({
                 redis,
                 conversation_id: conversation.id || conversation.conversation_id,

@@ -99,11 +99,36 @@ async function humanTypeThenSendText(chat, text, opts={}){
 }
 
 // 拿 Chat（兼容传 phone 或 jid）
-async function getChat(sessionId, idOrPhone){
-    const client = sessions[sessionId]?.client;
-    if (!client) throw new Error('session not found');
-    const jid = toJid(idOrPhone);
-    return client.getChatById(jid);
+async function getChat(sessionId, chatId) {
+    try {
+        const session = sessions[sessionId];
+        if (!session || !session.client) {
+            throw new Error(`Session ${sessionId} not found`);
+        }
+
+        // 确保聊天ID格式正确
+        let formattedChatId = chatId;
+        if (!formattedChatId.includes('@')) {
+            formattedChatId = formattedChatId.includes('-') ?
+                `${chatId}@g.us` : `${chatId}@c.us`;
+        }
+
+        console.log('[WA-MANAGER] GET_CHAT', { sessionId, originalChatId: chatId, formattedChatId });
+
+        const chat = await session.client.getChatById(formattedChatId);
+        if (!chat) {
+            throw new Error(`Chat ${formattedChatId} not found in session ${sessionId}`);
+        }
+
+        return chat;
+    } catch (error) {
+        console.error('[WA-MANAGER] GET_CHAT_ERROR', {
+            sessionId,
+            chatId,
+            error: error.message
+        });
+        throw error;
+    }
 }
 
 // 同会话冷却
@@ -156,38 +181,72 @@ function ensureFilenameByMime(name, mime) {
     return extFromMime ? `${base}${extFromMime}` : (name || 'upload.bin');
 }
 
-async function loadMedia({ filePath, url, b64, mimetype, filename }){
-    // 1) 如果传的是 Windows 驱动器路径却误放在 url 字段，自动矫正
-    if (!filePath && url && /^[a-zA-Z]:[\\/]/.test(url)) {
-        filePath = url; url = null;
-    }
+async function loadMedia(options = {}) {
+    const { filePath, url, b64, mimetype, filename } = options;
 
-    // 2) base64 直接构建
-    if (b64) {
-        const clean = b64.replace(/^data:.*;base64,/, '');
-        const mt = mimetype || 'application/octet-stream';
-        const fn = filename || ('file' + Date.now());
-        return new MessageMedia(mt, clean, fn);
-    }
+    console.log('[WA-MANAGER] LOAD_MEDIA', {
+        hasFilePath: Boolean(filePath),
+        hasUrl: Boolean(url),
+        hasB64: Boolean(b64),
+        filename,
+        mimetype
+    });
 
-    // 3) 本地路径：优先从文件读，最稳
-    if (filePath) {
-        const abs = path.resolve(String(filePath));
-        const buf = await fs.promises.readFile(abs);
-        const base64 = buf.toString('base64');
-        const mt = mimetype || guessMimeByExt(abs);
-        const fn = filename || path.basename(abs);
-        return new MessageMedia(mt, base64, fn);
-    }
+    try {
+        // 优先处理base64
+        if (b64) {
+            const buffer = Buffer.from(b64, 'base64');
+            return new MessageMedia(mimetype || 'application/octet-stream', b64, filename);
+        }
 
-    // 4) 仅当确实是 http(s) 才走 fromUrl
-    if (url && /^https?:\/\//i.test(url)) {
-        // 注意：fromUrl 内部会自己读并构造 MessageMedia
-        return await MessageMedia.fromUrl(url, { unsafeMime: true, filename: filename || undefined });
-    }
+        // 处理HTTP URL下载
+        if (url && url.startsWith('http')) {
+            console.log('[WA-MANAGER] DOWNLOADING_HTTP_URL', { url: url.substring(0, 100) + '...' });
 
-    throw new Error('no media source');
+            const response = await fetch(url, {
+                timeout: 30000, // 30秒超时
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const arrayBuffer = await response.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            const detectedMimetype = mimetype || response.headers.get('content-type') || 'application/octet-stream';
+
+            console.log('[WA-MANAGER] HTTP_DOWNLOAD_SUCCESS', {
+                size: buffer.length,
+                mimetype: detectedMimetype
+            });
+
+            return new MessageMedia(detectedMimetype, buffer.toString('base64'), filename);
+        }
+
+        // 处理本地文件路径
+        if (filePath) {
+            console.log('[WA-MANAGER] LOADING_LOCAL_FILE', { filePath });
+            const media = await MessageMedia.fromFilePath(filePath);
+            if (filename && media) {
+                media.filename = filename;
+            }
+            return media;
+        }
+
+        throw new Error('No valid media source provided');
+    } catch (error) {
+        console.error('[WA-MANAGER] LOAD_MEDIA_ERROR', {
+            error: error.message,
+            filePath,
+            url: url ? url.substring(0, 100) + '...' : null
+        });
+        throw error;
+    }
 }
+
 
 
 // === media save helpers ===
@@ -867,8 +926,8 @@ app.post('/send-text/:sessionId', async (req,res)=>{
 // ====== [routes] 拟人文本发送 插入结束 ======
 // === 替换这个路由：发送媒体（图片/视频/音频/文档），支持本地 filePath，拟人化 + 可选“文档方式” ===
 // === 发送媒体：图片/视频/音频/文档。支持本地 filePath，默认发“黄框大图”，并触发清晰化 ===
-app.post('/send-media/:sessionId', async (req,res)=>{
-    try{
+app.post('/send-media/:sessionId', async (req, res) => {
+    try {
         const { sessionId } = req.params;
         let {
             chatIdOrPhone,
@@ -876,49 +935,123 @@ app.post('/send-media/:sessionId', async (req,res)=>{
             filePath, url, b64, mimetype, filename,
             caption,
             asVoice,                   // audio -> 语音(PTT)
-            sendAsDocument,            // 可选：true 则走文档卡片（不会“糊”，但无大图预览）
-            forceOwnDownload           // 可选：true 发送后拉一遍，促使本端从“糊图”变清晰
+            sendAsDocument,            // 可选：true 则走文档卡片
+            forceOwnDownload           // 可选：true 发送后拉一遍，促使本端从"糊图"变清晰
         } = req.body || {};
 
+        // 修复：添加详细的请求日志
+        console.log('[WA-MANAGER] MEDIA_REQUEST', {
+            sessionId,
+            chatIdOrPhone,
+            mediaType,
+            hasFilePath: Boolean(filePath),
+            hasUrl: Boolean(url),
+            hasB64: Boolean(b64),
+            filename,
+            captionLength: caption ? caption.length : 0
+        });
+
         if (!chatIdOrPhone) throw new Error('need chatIdOrPhone');
-        if (!mediaType)      throw new Error('need mediaType');
+        if (!mediaType) throw new Error('need mediaType');
 
-        // 若误把本地盘符路径放在 url 中，loadMedia 会自动矫正
-        const chat  = await getChat(sessionId, chatIdOrPhone);
-        const media = await loadMedia({ filePath, url, b64, mimetype, filename });
+        // 修复：统一字段名处理，支持url和filePath
 
-        // —— 拟人：限速 + 同会话冷却 + 打字中
+        const mediaSource = filePath || url;
+        if (!mediaSource && !b64) throw new Error('need filePath, url or b64');
+
+        // 修复：检查会话状态
+        const session = sessions[sessionId];
+        if (!session || !session.client) {
+            throw new Error(`Session ${sessionId} not found or client not ready`);
+        }
+
+        // 修复：确保客户端已认证
+        if (session.client.pupPage && session.client.pupPage.isClosed()) {
+            throw new Error('WhatsApp page is closed');
+        }
+
+        const chat = await getChat(sessionId, chatIdOrPhone);
+        if (!chat) {
+            throw new Error(`Chat not found for ${chatIdOrPhone}`);
+        }
+
+        // 修复：增强loadMedia函数，支持HTTP URL下载
+        const media = await loadMedia({
+            filePath: filePath || (url && url.startsWith('http') ? null : url),
+            url: url && url.startsWith('http') ? url : null,
+            b64,
+            mimetype,
+            filename
+        });
+
+        if (!media) {
+            throw new Error('Failed to load media');
+        }
+
+        // 拟人：限速 + 同会话冷却 + 打字中
         await takeSendToken();
         await ensureChatCooldown(sessionId, chat.id._serialized);
-        const plan = [ rnd(800, 2000), rnd(600, 1400) ];
-        for (const seg of plan){ await chat.sendStateTyping(); await sleep(seg); }
+        const plan = [rnd(800, 2000), rnd(600, 1400)];
+        for (const seg of plan) {
+            await chat.sendStateTyping();
+            await sleep(seg);
+        }
         await chat.clearState();
 
-        // —— 参数：默认就是“图片方式”发送（黄框大图预览）
+        // 参数：默认就是"图片方式"发送
         const opts = {};
         if (caption) opts.caption = String(caption);
         if (mediaType === 'audio' && asVoice) opts.sendAudioAsVoice = true;
 
-        // 只有显式要求时才走“文档方式”（红框那种）
+        // 只有显式要求时才走"文档方式"
         if (sendAsDocument === true && ALLOW_DOC) {
             opts.sendMediaAsDocument = true;
         }
 
-        const msg = await chat.sendMessage(media, opts);
-
-        // —— 关键：为了让发送端尽快从“糊图”变清晰，默认触发一次自下载
-        // 若想全局默认可改成：const FORCE = true;
-        const FORCE = (forceOwnDownload !== false);
-        if (FORCE) {
-            setTimeout(async ()=>{ try { await msg.downloadMedia(); } catch(_){ } }, 600);
+        // 修复：添加视频特定参数
+        if (mediaType === 'video') {
+            opts.sendVideoAsGif = false; // 明确不发送为GIF
         }
 
-        res.json({ ok:true, id: msg.id?._serialized || null });
-    }catch(e){
-        res.status(400).json({ ok:false, error: e.message || String(e) });
+        console.log('[WA-MANAGER] SENDING_MEDIA', {
+            mediaType,
+            opts,
+            filename
+        });
+
+        const msg = await chat.sendMessage(media, opts);
+
+        // 关键：为了让发送端尽快从"糊图"变清晰，默认触发一次自下载
+        const FORCE = (forceOwnDownload !== false);
+        if (FORCE) {
+            setTimeout(async () => {
+                try {
+                    await msg.downloadMedia();
+                    console.log('[WA-MANAGER] MEDIA_DOWNLOADED', { msgId: msg.id?._serialized });
+                } catch(e) {
+                    console.warn('[WA-MANAGER] DOWNLOAD_FAILED', { error: e.message });
+                }
+            }, 1000); // 增加延迟确保消息已发送
+        }
+
+        console.log('[WA-MANAGER] MEDIA_SENT', {
+            ok: true,
+            id: msg.id?._serialized || null,
+            mediaType,
+            timestamp: new Date().toISOString()
+        });
+
+        res.json({ ok: true, id: msg.id?._serialized || null });
+    } catch (e) {
+        console.error('[WA-MANAGER] MEDIA_ERROR', {
+            error: e.message,
+            stack: e.stack,
+            sessionId: req.params.sessionId,
+            body: req.body
+        });
+        res.status(400).json({ ok: false, error: e.message || String(e) });
     }
 });
-
 
 // Endpoint: send message
 app.post('/send', async (req, res) => {
@@ -1002,7 +1135,6 @@ app.post('/send/media', async (req, res) => {
         const { sessionId, to, type, url, b64, mimetype, filename, caption } = req.body || {};
         if (!sessionId || to == null) return bad(400, 'missing sessionId/to');
 
-        // ❗ 修正：不要用 SESSIONS.get(...)，而是用 sessions[sessionId]
         const session = sessions[sessionId];
         if (!session || !session.client) return bad(400, 'session not ready');
 
