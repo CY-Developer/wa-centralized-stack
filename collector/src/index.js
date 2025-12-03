@@ -30,7 +30,24 @@ const redis = REDIS_URL ? new IORedis(REDIS_URL, {maxRetriesPerRequest: null}) :
 function ensureDir(p) {
     if (!fs.existsSync(p)) fs.mkdirSync(p, {recursive: true});
 }
+// ===== 新增：LID 检测函数 =====
+function extractPhoneFromName(name) {
+    if (!name) return null;
+    const match = String(name).match(/\+?[\d\s\-]{7,}/);
+    if (match) {
+        const digits = match[0].replace(/[^\d]/g, '');
+        if (digits.length >= 7 && digits.length <= 15) return digits;
+    }
+    return null;
+}
 
+function isLidFormat(jidOrPhone) {
+    const s = String(jidOrPhone || '');
+    if (/@lid$/i.test(s)) return true;
+    const digits = s.replace(/\D/g, '');
+    if (/^6789\d{10,}/.test(digits)) return true;
+    return false;
+}
 ensureDir(MEDIA_DIR);
 const COLLECTOR_LOG = path.resolve(process.env.COLLECTOR_LOG || path.join(__dirname, 'collector.log'));
 const collectorStream = fs.createWriteStream(COLLECTOR_LOG, {flags: 'a'});
@@ -59,7 +76,8 @@ function rewriteCwDataUrl(u) {
     if (!u) return u;
     try {
         const src = new URL(u);
-        // 只重写来自 Chatwoot 的 localhost:3000
+
+        // 重写来自 Chatwoot 的 localhost:3000
         if (src.hostname === 'localhost' && (src.port === '' || src.port === '3000')) {
             const base = new URL(CW_INTERNAL_BASE);
             src.protocol = base.protocol;
@@ -67,6 +85,19 @@ function rewriteCwDataUrl(u) {
             src.port = base.port;
             return src.toString();
         }
+
+        // ===== 新增：内网 HTTPS -> HTTP 转换 =====
+        const internalPatterns = [
+            /^192\.168\./, /^10\./, /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
+            /^127\./, /localhost/i
+        ];
+        const isInternal = internalPatterns.some(p => p.test(src.hostname));
+        if (isInternal && src.protocol === 'https:') {
+            src.protocol = 'http:';
+            console.log('[URL_REWRITE] https->http:', u, '->', src.toString());
+            return src.toString();
+        }
+
         return u;
     } catch {
         return u;
@@ -101,29 +132,45 @@ async function resolveWaTarget({redis, conversation_id, sender, fallback, WA_DEF
         || idSess
         || WA_DEFAULT_SESSION;
 
-    // 5) 选 to（优先 chatId / phone_e164 / phone；最后用 identifier 里的 digits / fallback）
-    let toRaw = m?.chatId
-        || m?.phone_e164
-        || m?.phone
-        || m?.phone_raw
-        || idDigits
-        || fallback
-        || '';
+    // 5) 分别获取 phone 和 phone_lid
+    let to = '';      // 真实电话
+    let to_lid = '';  // 隐私号
 
-    // 6) 归一：群聊保留 @g.us；其余取纯数字交给 manager 去 getNumberId
-    let to = /@g\.us$/i.test(toRaw) ? toRaw : String(toRaw).replace(/[^\d]/g, '');
+    // 从 Redis 映射中获取
+    if (m?.phone) {
+        to = String(m.phone).replace(/\D/g, '');
+    }
+    if (m?.phone_lid) {
+        to_lid = String(m.phone_lid).replace(/\D/g, '');
+    }
 
-    // 7) 记录一下我们最终采用了什么（方便你在 collector.log 里看）
+    // 如果 Redis 没有，尝试从 identifier 或 fallback 获取
+    if (!to && !to_lid) {
+        const digits = idDigits || String(fallback || '').replace(/\D/g, '');
+        if (digits) {
+            // 无法判断是电话还是 LID，假设是电话
+            to = digits;
+        }
+    }
+
+    // 6) 群聊特殊处理
+    const chatIdRaw = m?.chatId || '';
+    if (/@g\.us$/i.test(chatIdRaw)) {
+        to = chatIdRaw;
+        to_lid = '';
+    }
+
+    // 7) 记录日志
     logToCollector('[CW_TARGET]', {
-        from: m ? (m.chatId ? 'redis.chatId' : (m.phone_e164 || m.phone ? 'redis.phone' : 'redis.other')) :
-            (idDigits ? 'identifier' : (fallback ? 'fallback' : 'none')),
         contact_id: sender?.id || null,
         conversation_id,
         sessionId,
-        to
+        to: to || 'none',
+        to_lid: to_lid || 'none',
+        source: m ? 'redis' : (idDigits ? 'identifier' : 'fallback')
     });
 
-    return {sessionId, to};
+    return { sessionId, to, to_lid };
 }
 
 
@@ -172,7 +219,7 @@ async function postWithRetry(url, data, headers = {}, tries = 2) {
         url,
         data,
         headers: {'Content-Type': 'application/json', ...headers},
-        timeout: 8000,
+        timeout: 120000,
         httpAgent: keepAliveHttp,
         httpsAgent: keepAliveHttps,
         maxBodyLength: 30 * 1024 * 1024,
@@ -349,6 +396,7 @@ app.post('/ingest', async (req, res) => {
         const {
             sessionId,
             phone,
+            phone_lid,
             name,
             text,
             type,
@@ -416,21 +464,28 @@ app.post('/ingest', async (req, res) => {
         if (redis) {
             const now = new Date().toISOString();
 
-            // —— 计算 chatId（个人：<E164去掉+>@c.us；群/状态已在前面被过滤，这里都是个人）
+            // 计算 chatId（优先用真实电话，其次用隐私号）
             const calcChatId = (() => {
-                const e164Digits = String(phoneE164 || '').replace(/^\+/, '');
-                return e164Digits ? `${e164Digits}@c.us` : (normalizeWaTo(String(req.body?.chatId || '')) || null);
+                if (phone) {
+                    const digits = String(phone).replace(/\D/g, '');
+                    if (digits) return `${digits}@c.us`;
+                }
+                if (phone_lid) {
+                    const digits = String(phone_lid).replace(/\D/g, '');
+                    if (digits) return `${digits}@lid`;
+                }
+                return normalizeWaTo(String(req.body?.chatId || '')) || null;
             })();
 
             const payload = {
                 sessionId,
-                phone: String(phone || ''),            // webhook 原始 phone（不带 +）
-                phone_e164: String(phoneE164 || ''),   // 统一为 +E164
+                phone: String(phone || ''),            // 真实电话
+                phone_lid: String(phone_lid || ''),    // 隐私号
+                phone_e164: String(phoneE164 || ''),
                 name: String(name || ''),
-                chatId: calcChatId,                    // 统一后的 chatId：<digits>@c.us
+                chatId: calcChatId,
                 updated_at: now
             };
-
             // 1) 以“联系人ID”为键（核心）
             await redis.set(
                 `cw:mapping:contact:${contact.id}`,
@@ -446,7 +501,8 @@ app.post('/ingest', async (req, res) => {
             // 3) 同步到 Chatwoot 右侧【联系人备注】
             const noteContent =
                 `sessionId: ${payload.sessionId}\n` +
-                `raw phone: ${payload.phone}\n` +
+                `phone: ${payload.phone}\n` +
+                `phone_lid: ${payload.phone_lid}\n` +
                 `phone_e164: ${payload.phone_e164}\n` +
                 `chatId: ${payload.chatId}\n` +
                 `updated_at: ${payload.updated_at}`;
@@ -659,62 +715,78 @@ app.post('/chatwoot/webhook', async (req, res) => {
             [];
         const attachments = Array.isArray(attachmentsRaw) ? attachmentsRaw : [];
 
-        // === 发送媒体 ===
+        // === 发送媒体（支持多图/多附件）===
         if (attachments.length > 0) {
-            const a = attachments[0] || {};
+            const mediaList = [];
 
-            // 1) 识别媒体大类：image/video/audio/file
-            let mediaType = 'file';
-            const ft = String(a.file_type || '').toLowerCase();
-            if (ft.startsWith('image')) mediaType = 'image';
-            else if (ft.startsWith('video')) mediaType = 'video';
-            else if (ft.startsWith('audio')) mediaType = 'audio';
+            for (const a of attachments) {
+                if (!a) continue;
 
-            // 2) 从 data_url / file_url 里拿出 b64 或 URL
-            let b64;
-            let url;
-            let mimetype = 'application/octet-stream';
+                // 从 file_type 判断媒体类型
+                let mediaType = 'file';
+                const ft = String(a.file_type || '').toLowerCase();
+                if (ft.startsWith('image')) mediaType = 'image';
+                else if (ft.startsWith('video')) mediaType = 'video';
+                else if (ft.startsWith('audio')) mediaType = 'audio';
 
-            const dataUrl = a.data_url || a.dataUrl;
-            if (dataUrl) {
-                if (/^data:/i.test(dataUrl)) {
-                    // data:xxx;base64,... 这种，才按 base64 解析
-                    const m = dataUrl.match(/^data:(.*?);base64,(.*)$/i);
-                    if (m) {
-                        mimetype = m[1] || mimetype;
-                        b64 = m[2];
+                let b64, url;
+                let mimetype = a.file_type || 'application/octet-stream';
+
+                const dataUrl = a.data_url || a.dataUrl;
+                if (dataUrl) {
+                    if (/^data:/i.test(dataUrl)) {
+                        const m = dataUrl.match(/^data:(.*?);base64,(.*)$/i);
+                        if (m) {
+                            mimetype = m[1] || mimetype;
+                            b64 = m[2];
+                        }
+                    } else if (/^https?:\/\//i.test(dataUrl)) {
+                        url = rewriteCwDataUrl(dataUrl);
                     }
-                } else if (/^https?:\/\//i.test(dataUrl)) {
-                    // Chatwoot 默认就是把文件的下载地址放在 data_url 里
-                    url = dataUrl;
                 }
-            }
 
-            // 某些版本可能有 file_url，就当备选
-            if (!b64 && !url && a.file_url && /^https?:\/\//i.test(a.file_url)) {
-                url = a.file_url;
-            }
+                if (!b64 && !url && a.file_url && /^https?:\/\//i.test(a.file_url)) {
+                    url = rewriteCwDataUrl(a.file_url);
+                }
 
-            if (!b64 && !url) {
-                // 连链接都没有，就直接记个日志跳过，避免发一个空的 /send/media
-                logToCollector('[CW->WA] SKIP_MEDIA_NO_URL', {
-                    msgId: message.id,
-                    attachment: { id: a.id, file_type: a.file_type }
+                if (!b64 && !url) continue;
+
+                // ===== 关键修复：确保 MIME 类型是完整格式 =====
+                // Chatwoot 可能返回 'image' 而不是 'image/png'
+                if (mimetype && !mimetype.includes('/')) {
+                    // 从文件名推断
+                    const fn = (a.file_name || a.filename || '').toLowerCase();
+                    if (mimetype === 'image') {
+                        if (fn.endsWith('.png')) mimetype = 'image/png';
+                        else if (fn.endsWith('.gif')) mimetype = 'image/gif';
+                        else if (fn.endsWith('.webp')) mimetype = 'image/webp';
+                        else mimetype = 'image/jpeg';  // 默认
+                    } else if (mimetype === 'video') {
+                        if (fn.endsWith('.webm')) mimetype = 'video/webm';
+                        else if (fn.endsWith('.mov')) mimetype = 'video/quicktime';
+                        else if (fn.endsWith('.avi')) mimetype = 'video/x-msvideo';
+                        else mimetype = 'video/mp4';  // 默认
+                    } else if (mimetype === 'audio') {
+                        if (fn.endsWith('.mp3')) mimetype = 'audio/mpeg';
+                        else if (fn.endsWith('.wav')) mimetype = 'audio/wav';
+                        else if (fn.endsWith('.ogg') || fn.endsWith('.opus')) mimetype = 'audio/ogg';
+                        else mimetype = 'audio/mpeg';  // 默认
+                    } else {
+                        mimetype = 'application/octet-stream';
+                    }
+                }
+
+                mediaList.push({
+                    type: mediaType,
+                    url,
+                    b64,
+                    mimetype,
+                    filename: a.file_name || a.filename
                 });
-            } else {
-                const payload = {
-                    caption: (message.content || '') || undefined
-                };
-
-                if (b64) {
-                    payload.b64 = b64;
-                    payload.mimetype = mimetype;
-                    if (a.filename) payload.filename = a.filename;
-                } else if (url) {
-                    payload.url = url;
-                }
-
-                const { sessionId: finalSession, to: resolvedTo } = await resolveWaTarget({
+            }
+            if (mediaList.length > 0) {
+                // 调用 resolveWaTarget 获取 sessionId 和收件人
+                const { sessionId: finalSession, to, to_lid } = await resolveWaTarget({
                     redis,
                     conversation_id: conversation.id || conversation.conversation_id,
                     sender,
@@ -722,61 +794,78 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     WA_DEFAULT_SESSION
                 });
 
-                const toForBridge = /@g\.us$/i.test(resolvedTo)
-                    ? resolvedTo
-                    : String(resolvedTo).replace(/[^\d]/g, '');
-
-                if (!toForBridge) {
-                    return res.json({ ok: true, skipped: 'no target' });
+                // 检查是否有收件人
+                if (!to && !to_lid) {
+                    logToCollector('[CW->WA] SKIP_MEDIA', { reason: 'no phone and no lid' });
+                    return res.json({ ok: true, skipped: 'no recipient (no phone and no lid)' });
                 }
 
                 logToCollector('[CW->WA] SEND_MEDIA', {
-                    url: `${WA_BRIDGE_URL}/send/media`,
                     session: finalSession,
-                    to: toForBridge,
-                    type: mediaType,
-                    hasB64: Boolean(payload.b64),
-                    hasUrl: Boolean(payload.url),
-                    captionLen: (payload.caption || '').length
+                    to: to || 'none',
+                    to_lid: to_lid || 'none',
+                    count: mediaList.length,
+                    types: mediaList.map(m => m.type),
+                    mimes: mediaList.map(m => m.mimetype)
                 });
 
-                await postWithRetry(
-                    `${WA_BRIDGE_URL}/send/media`,
-                    {
-                        sessionId: finalSession,
-                        to: toForBridge,
-                        type: mediaType,
-                        url: payload.url,
-                        b64: payload.b64,
-                        mimetype: payload.mimetype,
-                        filename: payload.filename,
-                        caption: payload.caption
-                    },
-                    headers
-                );
+                const payload = {
+                    sessionId: finalSession,
+                    to: to || '',
+                    to_lid: to_lid || '',
+                    caption: message.content || ''
+                };
+
+                if (mediaList.length === 1) {
+                    const m = mediaList[0];
+                    payload.type = m.type;
+                    payload.mimetype = m.mimetype;
+                    if (m.b64) {
+                        payload.b64 = m.b64;
+                    } else {
+                        payload.url = m.url;
+                    }
+                    if (m.filename) payload.filename = m.filename;
+                } else {
+                    payload.attachments = mediaList;
+                }
+
+                try {
+                    await postWithRetry(`${WA_BRIDGE_URL}/send/media`, payload, headers);
+                } catch (err) {
+                    console.error('[CW->WA] SEND_MEDIA_ERROR', err?.response?.data || err?.message);
+                    logToCollector('[CW->WA] SEND_MEDIA_ERROR', {
+                        error: err?.message,
+                        response: err?.response?.data
+                    });
+                }
             }
         } else if (text && text.trim()) {
-            const {sessionId: finalSession, to: resolvedTo} = await resolveWaTarget({
+            const { sessionId: finalSession, to, to_lid } = await resolveWaTarget({
                 redis,
                 conversation_id: conversation.id || conversation.conversation_id,
                 sender,
                 fallback: chatIdOrPhone,
                 WA_DEFAULT_SESSION
             });
-            // 规范 to：群聊保留 @g.us；私聊传纯数字
-            const toForBridge = /@g\.us$/i.test(resolvedTo) ? resolvedTo : String(resolvedTo).replace(/[^\d]/g, '');
-            if (!toForBridge) return res.json({ok: true, skipped: 'no target'});
+
+            // 检查是否有收件人
+            if (!to && !to_lid) {
+                logToCollector('[CW->WA] SKIP_TEXT', { reason: 'no phone and no lid' });
+                return res.json({ ok: true, skipped: 'no recipient (no phone and no lid)' });
+            }
 
             logToCollector('[CW->WA] SEND_TEXT', {
                 url: `${WA_BRIDGE_URL}/send/text`,
                 session: finalSession,
-                to: toForBridge,
+                to: to || 'none',
+                to_lid: to_lid || 'none',
                 textLen: text.length
             });
 
             await postWithRetry(
                 `${WA_BRIDGE_URL}/send/text`,
-                {sessionId: finalSession, to: toForBridge, text},
+                { sessionId: finalSession, to: to || '', to_lid: to_lid || '', text },
                 headers
             );
         }

@@ -11,29 +11,29 @@ logs/
 # Environment files
 .envrc
 *.env
-
 # Build directories
 build/
 dist/
-
 # Docker related files
 docker-compose.override.yml
 docker-compose.local.yml
 docker-compose.yml.backup*
 *.swp
-
 # IDE config files
 .idea/
 .vscode/
-
 # OS generated files
 .DS_Store
 Thumbs.db
-
 # Common temp files
 *.tmp
 *.bak
 *.swp
-
 # Generated files
 package-lock.json
+
+# managed
+**.data.json
+**.node-persist**
+**_IGNORE_**
+# end managed
