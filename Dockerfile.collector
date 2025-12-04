@@ -1,0 +1,29 @@
+# Dockerfile for Collector Service (Monorepo 适配版)
+FROM node:20
+
+# 关键：跳过 puppeteer Chrome 下载（避免构建卡住）
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+# npm 国内镜像源（加速外部依赖下载）
+ENV NPM_CONFIG_REGISTRY=https://registry.npmmirror.com/
+
+WORKDIR /app
+
+# 第一步：先拷贝所有子包的 package.json（包括根目录、common、collector）
+# 目的：让 npm 解析 Monorepo 依赖，建立子包链接
+COPY package*.json ./
+COPY common/package*.json ./common/
+COPY collector/package*.json ./collector/
+
+# 第二步：安装所有依赖（包括外部依赖 + 内部子包链接）
+RUN npm install
+
+# 第三步：拷贝所有子包的源码（包括 common 的 src 目录）
+# 此时 common 子包的代码已拷贝到容器内 /app/common，且根目录 node_modules 有 @wa/common 链接
+COPY . .
+
+# 暴露端口（保持和 docker-compose.yml 一致）
+EXPOSE 7001
+
+# 启动服务
+ENV NODE_ENV=production
+CMD ["sh", "-c", "node collector/src/index.js | tee -a /app/collector/src/collector.log"]

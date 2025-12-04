@@ -63,7 +63,7 @@ function logToCollector(tag, data) {
     // 同步打一份到控制台，方便本地开发
     console.log(tag, data || '');
 }
-
+const syncingConversations = new Map();
 global.logToCollector = logToCollector; // 需要的话其他文件也能用
 
 // 进程启动时就落一条，告诉你日志实际写到哪
@@ -422,6 +422,7 @@ app.post('/ingest', async (req, res) => {
         const contact = await cw.ensureContact({
             account_id: CHATWOOT_ACCOUNT_ID,
             rawPhone: phone,
+            rawPhone_lid: phone_lid,
             rawName: name,
             sessionId
         });
@@ -548,6 +549,134 @@ app.post('/ingest', async (req, res) => {
         res.status(500).json({ok: false, error: e?.message || String(e), cw: e?.response?.data});
     }
 });
+app.post('/message-status', async (req, res) => {
+    try {
+        const { sessionId, messageId, ack, status, timestamp } = req.body || {};
+
+        if (ack === 0 || status === 'failed') {
+            console.log(`[MSG_STATUS] FAILED: ${messageId?.substring(0, 30)}...`);
+            logToCollector('[MSG_STATUS] FAILED', { sessionId, messageId, ack, status });
+        }
+
+        res.json({ ok: true });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e?.message });
+    }
+});
+
+/**
+ * 接口2：我方发送消息入站（同步 WhatsApp 端发送的消息到 Chatwoot）
+ */
+app.post('/ingest-outgoing', async (req, res) => {
+    try {
+        const {
+            sessionId, messageId, phone, phone_lid, name,
+            text, type, timestamp, to, chatId,
+            fromMe, direction, attachment
+        } = req.body || {};
+
+        console.log(`[INGEST_OUT] msgId=${messageId?.substring(0, 25)}..., to=${to?.substring(0, 20)}`);
+
+        if (!fromMe || direction !== 'outgoing') {
+            return res.json({ ok: true, skipped: 'not outgoing' });
+        }
+
+        if (/@g\.us$/i.test(to) || /@broadcast/i.test(to)) {
+            return res.json({ ok: true, skipped: 'group/broadcast' });
+        }
+
+        // 去重
+        if (redis) {
+            const key = `wa:outgoing:${messageId}`;
+            if (await redis.get(key)) {
+                return res.json({ ok: true, skipped: 'duplicate' });
+            }
+            await redis.set(key, '1');
+            await redis.expire(key, 300);
+        }
+
+        const targetPhone = phone || phone_lid || to?.replace(/@.*/, '').replace(/\D/g, '');
+        if (!targetPhone) {
+            return res.json({ ok: true, skipped: 'no phone' });
+        }
+
+        const inbox_id = await resolveInboxId();
+
+        const contact = await cw.ensureContact({
+            account_id: CHATWOOT_ACCOUNT_ID,
+            rawPhone: targetPhone,
+            rawName: name || targetPhone,
+            sessionId
+        });
+
+        const conv = await cw.ensureConversation({
+            account_id: CHATWOOT_ACCOUNT_ID,
+            inbox_id,
+            contact_id: contact.id
+        });
+        const conversation_id = conv.id || conv;
+
+        // 处理附件
+        const attachments = normalizeAttachments({ attachment, messageId });
+
+        // 创建消息
+        let created;
+        try {
+            // 尝试用 Chatwoot API 创建 outgoing 消息
+            const msgPayload = {
+                content: text || '',
+                message_type: 'outgoing',
+                private: false
+            };
+
+            if (attachments.length > 0) {
+                // 有附件：使用 FormData
+                const FormData = require('form-data');
+                const form = new FormData();
+                form.append('content', text || '');
+                form.append('message_type', 'outgoing');
+                form.append('private', 'false');
+
+                for (const att of attachments) {
+                    if (att.data_url) {
+                        const m = att.data_url.match(/^data:(.+);base64,(.+)$/);
+                        if (m) {
+                            const buffer = Buffer.from(m[2], 'base64');
+                            form.append('attachments[]', buffer, {
+                                filename: att.filename || 'file',
+                                contentType: m[1]
+                            });
+                        }
+                    }
+                }
+
+                created = await cw.request(
+                    'POST',
+                    `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversation_id}/messages`,
+                    form,
+                    form.getHeaders()
+                );
+            } else {
+                // 无附件：JSON 请求
+                created = await cw.request(
+                    'POST',
+                    `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversation_id}/messages`,
+                    msgPayload
+                );
+            }
+        } catch (e) {
+            console.log(`[INGEST_OUT] Create message error:`, e?.message);
+            // 降级：尝试简单的消息创建
+            created = { id: null };
+        }
+
+        console.log(`[INGEST_OUT] Created: ${created?.id || 'unknown'}`);
+        res.json({ ok: true, conversation_id, message_id: created?.id });
+    } catch (e) {
+        console.error('[INGEST_OUT_ERROR]', e?.message);
+        res.status(500).json({ ok: false, error: e?.message });
+    }
+});
 
 // === 直连 Chatwoot 的测试接口（验证图片可显示）===
 // app.post('/test/chatwoot', async (req, res) => {
@@ -597,6 +726,497 @@ app.post('/ingest', async (req, res) => {
 //
 
 
+/**
+ * POST /sync-messages
+ * 同步 WhatsApp 消息到 Chatwoot
+ *
+ * Body:
+ * {
+ *   conversation_id: 149,           // Chatwoot 会话 ID（必填）
+ *   hours: 12,                       // 同步最近多少小时（默认 12）
+ *   after: "2025-01-01T00:00:00Z",   // 或指定开始时间 ISO 格式
+ *   before: "2025-01-01T12:00:00Z",  // 或指定结束时间 ISO 格式
+ *   direction: "both",               // "incoming" | "outgoing" | "both"
+ *   replace: false,                  // 是否删除 Chatwoot 中该时间段的消息再同步
+ *   dryRun: false                    // 测试模式，不实际执行
+ * }
+ */
+app.post('/sync-messages', async (req, res) => {
+    try {
+        const {
+            conversation_id,
+            hours = 12,
+            after,
+            before,
+            direction = 'both',
+            replace = false,
+            dryRun = false
+        } = req.body || {};
+
+        if (!conversation_id) {
+            return res.status(400).json({ ok: false, error: 'conversation_id required' });
+        }
+
+        logToCollector('[SYNC] Start', { conversation_id, hours, after, before, direction, dryRun });
+
+        // 1. 获取会话详情
+        const conv = await cw.getConversationDetails(CHATWOOT_ACCOUNT_ID, conversation_id);
+        if (!conv) {
+            return res.status(404).json({ ok: false, error: 'Conversation not found' });
+        }
+
+        const sender = conv.meta?.sender || {};
+        const inboxId = conv.inbox_id;
+
+        logToCollector('[SYNC] Conversation', {
+            contact_id: sender.id,
+            contact_name: sender.name,
+            inbox_id: inboxId
+        });
+
+        // 2. 从 Redis 获取 WhatsApp 映射
+        let waMapping = null;
+        if (redis) {
+            // 尝试多种 key 格式
+            const keys = [
+                `cw:mapping:conv:${conversation_id}`,
+                `cw:mapping:contact:${sender.id}`,
+                `wa:conv:${conversation_id}`
+            ];
+
+            for (const key of keys) {
+                const data = await redis.get(key);
+                if (data) {
+                    try {
+                        waMapping = JSON.parse(data);
+                        logToCollector('[SYNC] Found mapping', { key, data: waMapping });
+                        break;
+                    } catch (_) {}
+                }
+            }
+        }
+
+        // 如果没有映射，尝试从联系人信息推断
+        if (!waMapping) {
+            const phone = sender.phone_number?.replace(/[^\d]/g, '') ||
+                sender.identifier?.replace(/[^\d]/g, '');
+
+            if (phone) {
+                waMapping = {
+                    sessionId: WA_DEFAULT_SESSION.split(',')[0]?.trim(),
+                    phone: phone,
+                    chatId: `${phone}@c.us`
+                };
+                logToCollector('[SYNC] Inferred mapping from phone', waMapping);
+            }
+        }
+
+        if (!waMapping?.sessionId) {
+            return res.status(400).json({
+                ok: false,
+                error: 'No WhatsApp mapping found',
+                hint: 'Contact needs to have exchanged messages first'
+            });
+        }
+
+        const { sessionId, chatId, phone, phone_lid } = waMapping;
+        const waChatId = chatId || (phone ? `${phone}@c.us` : (phone_lid ? `${phone_lid}@lid` : null));
+
+        if (!waChatId) {
+            return res.status(400).json({ ok: false, error: 'Cannot determine WhatsApp chat ID' });
+        }
+
+        // 3. 计算时间范围
+        let afterTs, beforeTs;
+        const nowTs = Math.floor(Date.now() / 1000);
+
+        if (after) {
+            afterTs = Math.floor(new Date(after).getTime() / 1000);
+        } else {
+            afterTs = nowTs - hours * 3600;
+        }
+
+        if (before) {
+            beforeTs = Math.floor(new Date(before).getTime() / 1000);
+        } else {
+            beforeTs = nowTs;
+        }
+
+        logToCollector('[SYNC] Time range', {
+            after: new Date(afterTs * 1000).toISOString(),
+            before: new Date(beforeTs * 1000).toISOString()
+        });
+
+        // 4. 从 WhatsApp 获取消息
+        const waUrl = `${WA_BRIDGE_URL}/messages-sync/${sessionId}/${encodeURIComponent(waChatId)}`;
+        const waParams = new URLSearchParams({
+            limit: '200',
+            after: String(afterTs),
+            before: String(beforeTs),
+            includeMedia: '1',
+            includeBase64: '1'
+        });
+
+
+        const waHeaders = {};
+        if (WA_BRIDGE_TOKEN) waHeaders['x-api-token'] = WA_BRIDGE_TOKEN;
+
+        let waMessages = [];
+        try {
+            const waResp = await axios.get(`${waUrl}?${waParams}`, {
+                headers: waHeaders,
+                timeout: 1800000  // 超时时间
+            });
+            waMessages = waResp.data?.messages || [];
+            logToCollector('[SYNC] WA messages', { count: waMessages.length });
+        } catch (e) {
+            logToCollector('[SYNC] WA fetch error', { error: e?.message });
+            return res.status(500).json({ ok: false, error: `Failed to fetch WA messages: ${e?.message}` });
+        }
+
+        // 5. 获取 Chatwoot 现有消息
+        let cwMessages = [];
+        try {
+            cwMessages = await cw.getConversationMessages({
+                account_id: CHATWOOT_ACCOUNT_ID,
+                conversation_id,
+                after: afterTs * 1000,
+                before: beforeTs * 1000
+            });
+            logToCollector('[SYNC] CW messages', { count: cwMessages.length });
+        } catch (e) {
+            logToCollector('[SYNC] CW fetch error', { error: e?.message });
+        }
+
+        // 6. 比对并找出需要同步的消息
+        // 创建 Chatwoot 消息的索引（按时间戳和内容）
+        const cwMsgIndex = new Map();
+        for (const m of cwMessages) {
+            const ts = Math.floor(new Date(m.created_at).getTime() / 1000);
+            const key = `${ts}_${(m.content || '').substring(0, 50)}`;
+            cwMsgIndex.set(key, m);
+
+            // 也按 source_id 索引
+            if (m.source_id) {
+                cwMsgIndex.set(`src_${m.source_id}`, m);
+            }
+        }
+
+        const toSync = [];
+        const skipped = [];
+
+        for (const waMsg of waMessages) {
+            // 检查是否已存在
+            const key = `${waMsg.timestamp}_${(waMsg.body || '').substring(0, 50)}`;
+            const srcKey = `src_${waMsg.id}`;
+
+            if (cwMsgIndex.has(key) || cwMsgIndex.has(srcKey)) {
+                skipped.push({ id: waMsg.id, reason: 'already_exists' });
+                continue;
+            }
+
+            // 根据方向过滤
+            if (direction === 'incoming' && waMsg.fromMe) {
+                skipped.push({ id: waMsg.id, reason: 'direction_filter' });
+                continue;
+            }
+            if (direction === 'outgoing' && !waMsg.fromMe) {
+                skipped.push({ id: waMsg.id, reason: 'direction_filter' });
+                continue;
+            }
+
+            toSync.push(waMsg);
+        }
+
+        logToCollector('[SYNC] Analysis', {
+            waTotal: waMessages.length,
+            cwTotal: cwMessages.length,
+            toSync: toSync.length,
+            skipped: skipped.length
+        });
+
+        // Dry run 模式
+        if (dryRun) {
+            return res.json({
+                ok: true,
+                dryRun: true,
+                summary: {
+                    waMessages: waMessages.length,
+                    cwMessages: cwMessages.length,
+                    toSync: toSync.length,
+                    skipped: skipped.length
+                },
+                messagesToSync: toSync.map(m => ({
+                    id: m.id,
+                    fromMe: m.fromMe,
+                    type: m.type,
+                    body: (m.body || '').substring(0, 100),
+                    timestamp: m.timestamp,
+                    datetime: m.datetime
+                })),
+                skipped: skipped.slice(0, 20)
+            });
+        }
+
+        // 7. 如果需要替换，先删除 Chatwoot 中该时间段的消息
+
+        if (replace && cwMessages.length > 0) {
+            logToCollector('[SYNC] Replace mode - deleting CW messages', { count: cwMessages.length });
+            let deleteSuccess = 0;
+            let deleteFailed = 0;
+
+            for (const msg of cwMessages) {
+                try {
+                    await cw.deleteMessage({
+                        account_id: CHATWOOT_ACCOUNT_ID,
+                        conversation_id,
+                        message_id: msg.id
+                    });
+                    deleteSuccess++;
+                } catch (e) {
+                    deleteFailed++;
+                    console.log(`[SYNC] Delete message ${msg.id} failed:`, e?.message);
+                }
+                // 添加小延迟避免请求过快
+                await new Promise(r => setTimeout(r, 50));
+            }
+
+            logToCollector('[SYNC] Delete complete', { success: deleteSuccess, failed: deleteFailed });
+
+            // 替换模式下，同步所有 WA 消息
+            toSync.length = 0;
+            toSync.push(...waMessages.filter(m => {
+                if (direction === 'incoming' && m.fromMe) return false;
+                if (direction === 'outgoing' && !m.fromMe) return false;
+                return true;
+            }));
+        }
+
+
+
+        // 8. 按时间顺序同步消息
+        toSync.sort((a, b) => a.timestamp - b.timestamp);
+
+        const syncLock = {
+            startTime: Date.now(),
+            msgIds: new Set()
+        };
+        syncingConversations.set(conversation_id, syncLock);
+        console.log(`[SYNC] Lock set for conversation ${conversation_id}`);
+
+        const syncResults = [];
+        let successCount = 0;
+
+        for (const waMsg of toSync) {
+            try {
+                // 记录消息内容用于 webhook 去重
+                const msgKey = `${waMsg.body || ''}`.substring(0, 100);
+                syncLock.msgIds.add(msgKey);
+
+                await syncOneMessage({
+                    account_id: CHATWOOT_ACCOUNT_ID,
+                    conversation_id,
+                    message: waMsg,
+                    waBridgeUrl: WA_BRIDGE_URL,
+                    waBridgeToken: WA_BRIDGE_TOKEN
+                });
+                successCount++;
+                syncResults.push({ id: waMsg.id, success: true });
+            } catch (e) {
+                logToCollector('[SYNC] Message sync failed', { id: waMsg.id, error: e?.message });
+                syncResults.push({ id: waMsg.id, success: false, error: e?.message });
+            }
+
+            // 添加延迟
+            await new Promise(r => setTimeout(r, 100));
+        }
+
+        logToCollector('[SYNC] Complete', {
+            synced: successCount,
+            failed: toSync.length - successCount
+        });
+
+        // 延迟释放同步锁
+        setTimeout(() => {
+            syncingConversations.delete(conversation_id);
+            console.log(`[SYNC] Lock released for conversation ${conversation_id}`);
+        }, 5000);
+
+        res.json({
+            ok: true,
+            summary: {
+                waMessages: waMessages.length,
+                cwMessages: cwMessages.length,
+                synced: successCount,
+                failed: toSync.length - successCount,
+                skipped: skipped.length
+            },
+            results: syncResults
+        });
+
+    } catch (e) {
+        // 确保释放锁
+        if (typeof conversation_id !== 'undefined') {
+            syncingConversations.delete(conversation_id);
+            console.log(`[SYNC] Lock released (error)`);
+        }
+        logToCollector('[SYNC] Error', { error: e?.message, stack: e?.stack });
+        res.status(500).json({ ok: false, error: e?.message });
+    }
+});
+
+
+
+/**
+ * 同步单条消息到 Chatwoot
+ */
+
+async function syncOneMessage({ account_id, conversation_id, message, waBridgeUrl, waBridgeToken }) {
+    const { id, fromMe, type, body, timestamp, media } = message;
+
+    let attachments = [];
+
+    if (media && !media.error) {
+        // 优先使用 data_url (base64)
+        if (media.data_url) {
+            console.log(`[syncOneMessage] ${id}: Using data_url (${media.mimetype})`);
+            attachments.push({
+                data_url: media.data_url,
+                file_type: media.mimetype,
+                filename: media.filename || `media_${Date.now()}`
+            });
+        }
+        // 备用：从纳管器下载
+        else if (media.fileUrl && waBridgeUrl) {
+            try {
+                let mediaUrl = media.fileUrl;
+                if (!mediaUrl.startsWith('http')) {
+                    mediaUrl = `${waBridgeUrl}${mediaUrl}`;
+                }
+                console.log(`[syncOneMessage] ${id}: Downloading from ${mediaUrl}`);
+
+                const headers = {};
+                if (waBridgeToken) headers['x-api-token'] = waBridgeToken;
+
+                const resp = await axios.get(mediaUrl, {
+                    responseType: 'arraybuffer',
+                    headers,
+                    timeout: 30000
+                });
+
+                const base64 = Buffer.from(resp.data).toString('base64');
+                const contentType = resp.headers['content-type'] || media.mimetype || 'application/octet-stream';
+
+                attachments.push({
+                    data_url: `data:${contentType};base64,${base64}`,
+                    file_type: contentType,
+                    filename: media.filename || `media_${Date.now()}`
+                });
+                console.log(`[syncOneMessage] ${id}: Downloaded OK`);
+            } catch (e) {
+                console.warn(`[syncOneMessage] ${id}: Download failed: ${e?.message}`);
+            }
+        } else {
+            console.warn(`[syncOneMessage] ${id}: No media source available`);
+        }
+    }
+
+    console.log(`[syncOneMessage] ${id}: fromMe=${fromMe}, type=${type}, body=${(body||'').substring(0,30)}, attachments=${attachments.length}`);
+
+    try {
+        if (fromMe) {
+            return await cw.createOutgoingMessage({
+                account_id,
+                conversation_id,
+                content: body || '',
+                attachments,
+                source_id: id
+            });
+        } else {
+            return await cw.createIncomingMessage({
+                account_id,
+                conversation_id,
+                content: body || '',
+                attachments
+            });
+        }
+    } catch (e) {
+        console.error(`[syncOneMessage] ${id} failed:`, e?.message);
+        throw e;
+    }
+}
+
+
+/**
+ * GET /sync-status/:conversation_id
+ * 获取会话的同步状态
+ */
+app.get('/sync-status/:conversation_id', async (req, res) => {
+    try {
+        const { conversation_id } = req.params;
+
+        const conv = await cw.getConversationDetails(CHATWOOT_ACCOUNT_ID, conversation_id);
+        if (!conv) {
+            return res.status(404).json({ ok: false, error: 'Conversation not found' });
+        }
+
+        const sender = conv.meta?.sender || {};
+
+        // 获取映射信息
+        let waMapping = null;
+        if (redis) {
+            const keys = [
+                `cw:mapping:conv:${conversation_id}`,
+                `cw:mapping:contact:${sender.id}`
+            ];
+
+            for (const key of keys) {
+                const data = await redis.get(key);
+                if (data) {
+                    try {
+                        waMapping = JSON.parse(data);
+                        break;
+                    } catch (_) {}
+                }
+            }
+        }
+
+        // 尝试从联系人信息推断
+        if (!waMapping) {
+            const phone = sender.phone_number?.replace(/[^\d]/g, '') ||
+                sender.identifier?.replace(/[^\d]/g, '');
+            if (phone) {
+                waMapping = {
+                    sessionId: WA_DEFAULT_SESSION.split(',')[0]?.trim(),
+                    phone: phone,
+                    chatId: `${phone}@c.us`,
+                    inferred: true
+                };
+            }
+        }
+
+        res.json({
+            ok: true,
+            conversation_id: parseInt(conversation_id),
+            contact: {
+                id: sender.id,
+                name: sender.name,
+                phone: sender.phone_number,
+                identifier: sender.identifier
+            },
+            waMapping: waMapping ? {
+                sessionId: waMapping.sessionId,
+                chatId: waMapping.chatId,
+                phone: waMapping.phone,
+                phone_lid: waMapping.phone_lid,
+                inferred: waMapping.inferred || false
+            } : null,
+            canSync: !!(waMapping?.sessionId && (waMapping.chatId || waMapping.phone || waMapping.phone_lid))
+        });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e?.message });
+    }
+});
 app.post('/chatwoot/webhook', async (req, res) => {
     // 统一入站打点：不再丢失任何一次调用
     logToCollector('[CW_WEBHOOK] ARRIVE', {
@@ -676,6 +1296,20 @@ app.post('/chatwoot/webhook', async (req, res) => {
             if (seen) return SKIP('dup event', {msgId, stamp});
             await redis.set(deKey, '1');
             await redis.expire(deKey, 300); // 5 分钟窗口
+        }
+        const syncLock = syncingConversations.get(conversation_id);
+        if (syncLock) {
+            const content = (message.content || '').substring(0, 100);
+            // 检查是否是同步的消息
+            if (syncLock.msgIds.has(content)) {
+                console.log(`[CW_WEBHOOK] Skip synced message: "${content.substring(0, 30)}..."`);
+                return SKIP('synced message');
+            }
+            // 同步开始 10 秒内，跳过所有 outgoing 消息
+            if (Date.now() - syncLock.startTime < 10000) {
+                console.log(`[CW_WEBHOOK] Skip during sync window`);
+                return SKIP('sync in progress');
+            }
         }
 
         if (!WA_DEFAULT_SESSION || !WA_BRIDGE_URL) {
@@ -784,9 +1418,9 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     filename: a.file_name || a.filename
                 });
             }
+
             if (mediaList.length > 0) {
-                // 调用 resolveWaTarget 获取 sessionId 和收件人
-                const { sessionId: finalSession, to, to_lid } = await resolveWaTarget({
+                const {sessionId: finalSession, to, to_lid} = await resolveWaTarget({
                     redis,
                     conversation_id: conversation.id || conversation.conversation_id,
                     sender,
@@ -794,19 +1428,16 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     WA_DEFAULT_SESSION
                 });
 
-                // 检查是否有收件人
                 if (!to && !to_lid) {
-                    logToCollector('[CW->WA] SKIP_MEDIA', { reason: 'no phone and no lid' });
-                    return res.json({ ok: true, skipped: 'no recipient (no phone and no lid)' });
+                    logToCollector('[CW->WA] SKIP_MEDIA', {reason: 'no recipient'});
+                    return res.json({ok: true, skipped: 'no recipient'});
                 }
 
                 logToCollector('[CW->WA] SEND_MEDIA', {
                     session: finalSession,
                     to: to || 'none',
                     to_lid: to_lid || 'none',
-                    count: mediaList.length,
-                    types: mediaList.map(m => m.type),
-                    mimes: mediaList.map(m => m.mimetype)
+                    count: mediaList.length
                 });
 
                 const payload = {
@@ -820,25 +1451,33 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     const m = mediaList[0];
                     payload.type = m.type;
                     payload.mimetype = m.mimetype;
-                    if (m.b64) {
-                        payload.b64 = m.b64;
-                    } else {
-                        payload.url = m.url;
-                    }
+                    if (m.b64) payload.b64 = m.b64;
+                    else payload.url = m.url;
                     if (m.filename) payload.filename = m.filename;
                 } else {
                     payload.attachments = mediaList;
                 }
 
-                try {
-                    await postWithRetry(`${WA_BRIDGE_URL}/send/media`, payload, headers);
-                } catch (err) {
-                    console.error('[CW->WA] SEND_MEDIA_ERROR', err?.response?.data || err?.message);
-                    logToCollector('[CW->WA] SEND_MEDIA_ERROR', {
-                        error: err?.message,
-                        response: err?.response?.data
-                    });
-                }
+                // ===== 关键修改：先返回成功，异步发送 =====
+                // 这样 Chatwoot 不会因为超时显示红色失败
+                res.json({ok: true, queued: true, mediaCount: mediaList.length});
+
+                // 异步发送
+                setImmediate(async () => {
+                    try {
+                        const result = await postWithRetry(`${WA_BRIDGE_URL}/send/media`, payload, headers);
+                        logToCollector('[CW->WA] MEDIA_SENT', {
+                            success: result?.data?.success,
+                            total: result?.data?.total,
+                            methods: result?.data?.results?.map(r => r.method)
+                        });
+                    } catch (err) {
+                        console.error('[CW->WA] MEDIA_ERROR', err?.message);
+                        logToCollector('[CW->WA] MEDIA_ERROR', {error: err?.message});
+                    }
+                });
+
+                return;  // 已响应
             }
         } else if (text && text.trim()) {
             const { sessionId: finalSession, to, to_lid } = await resolveWaTarget({
@@ -849,28 +1488,39 @@ app.post('/chatwoot/webhook', async (req, res) => {
                 WA_DEFAULT_SESSION
             });
 
-            // 检查是否有收件人
             if (!to && !to_lid) {
-                logToCollector('[CW->WA] SKIP_TEXT', { reason: 'no phone and no lid' });
-                return res.json({ ok: true, skipped: 'no recipient (no phone and no lid)' });
+                logToCollector('[CW->WA] SKIP_TEXT', { reason: 'no recipient' });
+                return res.json({ ok: true, skipped: 'no recipient' });
             }
 
             logToCollector('[CW->WA] SEND_TEXT', {
-                url: `${WA_BRIDGE_URL}/send/text`,
                 session: finalSession,
                 to: to || 'none',
                 to_lid: to_lid || 'none',
-                textLen: text.length
+                len: text.length
             });
 
-            await postWithRetry(
-                `${WA_BRIDGE_URL}/send/text`,
-                { sessionId: finalSession, to: to || '', to_lid: to_lid || '', text },
-                headers
-            );
+            // 先返回成功
+            res.json({ ok: true, queued: true });
+
+            // 异步发送
+            setImmediate(async () => {
+                try {
+                    await postWithRetry(
+                        `${WA_BRIDGE_URL}/send/text`,
+                        { sessionId: finalSession, to: to || '', to_lid: to_lid || '', text },
+                        headers
+                    );
+                    logToCollector('[CW->WA] TEXT_SENT', { len: text.length });
+                } catch (err) {
+                    console.error('[CW->WA] TEXT_ERROR', err?.message);
+                }
+            });
+
+            return;
         }
 
-        return res.json({ok: true});
+        return res.json({ ok: true });
     } catch (err) {
         console.error('[WEBHOOK_ERROR]', err.response?.data || err.message);
         return res.status(500).json({ok: false, error: err.message, bridge: err.response?.data});

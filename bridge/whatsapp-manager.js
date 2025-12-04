@@ -57,6 +57,24 @@ async function postWithRetry(url, data, headers, tries = 6) {
         }
     }
 }
+const sentMessageCache = new Map();
+const SENT_CACHE_TTL = 60000;
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, ts] of sentMessageCache.entries()) {
+        if (now - ts > SENT_CACHE_TTL) sentMessageCache.delete(key);
+    }
+}, 30000);
+
+function markSentFromChatwoot(msgId) {
+    if (msgId) sentMessageCache.set(msgId, Date.now());
+}
+
+function isSentFromChatwoot(msgId) {
+    return sentMessageCache.has(msgId);
+}
+
 function parseRecipient(to) {
     const raw = String(to || '').trim();
     if (!raw) return { kind: 'invalid', digits: '', jid: '' };
@@ -248,7 +266,73 @@ async function loadMedia({ filePath, url, b64, mimetype, filename }){
 
     throw new Error('no media source');
 }
+async function sendVideo(chat, media, caption) {
+    const chatId = chat?.id?._serialized || 'unknown';
+    const isLid = /@lid$/i.test(chatId);
 
+    // 检查视频大小
+    const sizeBytes = Buffer.from(media.data, 'base64').length;
+    const sizeMB = sizeBytes / (1024 * 1024);
+
+    console.log(`[sendVideo] chatId=${chatId}, isLid=${isLid}, size=${sizeMB.toFixed(2)}MB, mime=${media.mimetype}, file=${media.filename}`);
+
+    // 如果视频太大，直接用文档模式
+    if (sizeMB > 16) {
+        console.log(`[sendVideo] Video too large, using document mode`);
+        try {
+            const opts = { sendMediaAsDocument: true };
+            if (caption) opts.caption = caption;
+            const msg = await chat.sendMessage(media, opts);
+            if (msg) return { ok: true, msg, method: 'as_document' };
+        } catch (e) {
+            console.log(`[sendVideo] document mode failed:`, e?.message);
+        }
+        return { ok: false, error: 'Video too large' };
+    }
+
+    // 方案1：直接发送（不带任何额外选项）
+    try {
+        const opts = {};
+        if (caption) opts.caption = caption;
+        const msg = await chat.sendMessage(media, opts);
+        if (msg) {
+            console.log(`[sendVideo] OK: default`);
+            return { ok: true, msg, method: 'default' };
+        }
+    } catch (e) {
+        console.log(`[sendVideo] default failed:`, e?.message);
+    }
+
+    // 方案2：对于小视频尝试 GIF 模式
+    if (sizeMB < 8) {
+        try {
+            const opts = { sendVideoAsGif: true };
+            if (caption) opts.caption = caption;
+            const msg = await chat.sendMessage(media, opts);
+            if (msg) {
+                console.log(`[sendVideo] OK: as_gif`);
+                return { ok: true, msg, method: 'as_gif' };
+            }
+        } catch (e) {
+            console.log(`[sendVideo] as_gif failed:`, e?.message);
+        }
+    }
+
+    // 方案3：文档模式（保底）
+    try {
+        const opts = { sendMediaAsDocument: true };
+        if (caption) opts.caption = caption;
+        const msg = await chat.sendMessage(media, opts);
+        if (msg) {
+            console.log(`[sendVideo] OK: as_document (fallback)`);
+            return { ok: true, msg, method: 'as_document' };
+        }
+    } catch (e) {
+        console.log(`[sendVideo] as_document failed:`, e?.message);
+    }
+
+    return { ok: false, error: 'All video methods failed' };
+}
 // === media save helpers ===
 const fs   = require('fs');
 
@@ -555,6 +639,74 @@ async function initSessionViaAdsPower(sessionId){
             delete sessions[sessionId].refreshTimer;
         }
     });
+
+    client.on('message_ack', async (msg, ack) => {
+        try {
+            if (!msg.fromMe) return;
+            const msgId = msg.id?._serialized || '';
+            if (ack === 0) {
+                console.error(`[${sessionId}] MSG SEND FAILED: ${msgId.substring(0, 30)}...`);
+                try {
+                    await postWithRetry(`${COLLECTOR_BASE}/message-status`, {
+                        sessionId, messageId: msgId, ack, status: 'failed', timestamp: Date.now()
+                    }, { 'x-api-token': COLLECTOR_TOKEN });
+                } catch (_) {}
+            }
+        } catch (_) {}
+    });
+
+    // 我方消息同步
+    // client.on('message_create', async (message) => {
+    //     try {
+    //         if (!message.fromMe) return;
+    //
+    //         const msgId = message.id?._serialized || '';
+    //         if (isSentFromChatwoot(msgId)) return;
+    //
+    //         const toJid = message.to || '';
+    //         if (/@g\.us$/i.test(toJid) || /@broadcast/i.test(toJid)) return;
+    //
+    //         let phone = '', phone_lid = '';
+    //         if (/@c\.us$/i.test(toJid)) {
+    //             phone = toJid.replace(/@.*/, '').replace(/\D/g, '');
+    //         } else if (/@lid$/i.test(toJid)) {
+    //             phone_lid = toJid.replace(/@.*/, '').replace(/\D/g, '');
+    //         }
+    //
+    //         const chat = await message.getChat().catch(() => null);
+    //         const contact = await message.getContact().catch(() => null);
+    //
+    //         console.log(`[${sessionId}] OUTGOING: ${msgId.substring(0, 25)}..., type=${message.type}`);
+    //
+    //         const payload = {
+    //             sessionId, messageId: msgId,
+    //             phone, phone_lid,
+    //             name: contact?.pushname || contact?.name || chat?.name || '',
+    //             text: message.body || '',
+    //             type: message.type || 'chat',
+    //             timestamp: message.timestamp ? (message.timestamp * 1000) : Date.now(),
+    //             to: toJid,
+    //             chatId: chat?.id?._serialized || toJid,
+    //             fromMe: true, direction: 'outgoing'
+    //         };
+    //
+    //         if (message.hasMedia) {
+    //             try {
+    //                 const media = await message.downloadMedia();
+    //                 if (media?.data) {
+    //                     payload.attachment = {
+    //                         data_url: `data:${media.mimetype};base64,${media.data}`,
+    //                         mime: media.mimetype, name: media.filename
+    //                     };
+    //                 }
+    //             } catch (_) {}
+    //         }
+    //
+    //         await postWithRetry(`${COLLECTOR_BASE}/ingest-outgoing`, payload, { 'x-api-token': COLLECTOR_TOKEN }).catch(() => {});
+    //     } catch (e) {
+    //         console.error(`[${sessionId}] message_create error:`, e?.message);
+    //     }
+    // });
 
     client.on('message', async (message) => {
         try {
@@ -1030,7 +1182,6 @@ app.post('/send', async (req, res) => {
 });
 
 // ========== 发文本 ==========
-// === REPLACE: /send/text ===
 app.post('/send/text', async (req, res) => {
     const ok  = (code, data) => res.status(code).json(data);
     const bad = (code, msg)  => ok(code, { ok: false, error: msg });
@@ -1045,78 +1196,260 @@ app.post('/send/text', async (req, res) => {
 
         let targetJid = null;
 
-        // 优先用真实电话
         if (to) {
             const { kind, digits, jid } = parseRecipient(to);
             if (kind === 'group') {
                 targetJid = jid;
             } else if (kind === 'user') {
                 const r = await session.client.getNumberId(digits).catch(() => null);
-                targetJid = r && r._serialized ? r._serialized : null;
-
-                if (!targetJid && digits.length >= 7 && digits.length <= 15) {
-                    const directJid = `${digits}@c.us`;
-                    try {
-                        const chat = await session.client.getChatById(directJid);
-                        if (chat) targetJid = directJid;
-                    } catch (_) {}
+                targetJid = r?._serialized || null;
+                if (!targetJid && digits.length >= 7) {
+                    targetJid = `${digits}@c.us`;
                 }
             }
         }
 
-        // 如果没有真实电话或发送失败，尝试用隐私号
         if (!targetJid && to_lid) {
-            const lidJid = `${to_lid.replace(/\D/g, '')}@lid`;
-            try {
-                const chat = await session.client.getChatById(lidJid);
-                if (chat) targetJid = lidJid;
-            } catch (_) {
-                // 尝试直接发送
-                targetJid = lidJid;
-            }
-            console.log(`[send/text] Using LID: ${lidJid}`);
+            targetJid = `${to_lid.replace(/\D/g, '')}@lid`;
+            console.log(`[send/text] Using LID: ${targetJid}`);
         }
 
-        if (!targetJid) return bad(400, 'recipient not found (no phone and no lid)');
+        if (!targetJid) return bad(400, 'recipient not found');
 
-        // ===== 关键修复：先获取 Chat 对象，再通过 Chat 发送 =====
-        let chat = null;
-        try {
-            chat = await session.client.getChatById(targetJid);
-        } catch (e) {
-            console.log(`[send/text] getChatById failed for ${targetJid}:`, e?.message);
-        }
+        // 发送消息
+        const msg = await session.client.sendMessage(targetJid, String(text));
+        const msgId = msg?.id?._serialized || null;
 
-        if (chat) {
-            await chat.sendMessage(String(text));
-        } else {
-            await session.client.sendMessage(targetJid, String(text));
-        }
+        // 标记为从 Chatwoot 发送
+        markSentFromChatwoot(msgId);
 
-        return ok(200, { ok: true, to: targetJid });
+        return ok(200, { ok: true, to: targetJid, msgId });
     } catch (e) {
-        return res.status(500).json({ ok: false, error: e?.message || String(e) });
+        return res.status(500).json({ ok: false, error: e?.message });
     }
 });
 
 
-// =====================================
-// 视频发送修复 - 替换 /send/media 路由
-// =====================================
-// 核心思路：
-// 1. 视频发送时尝试多种选项组合
-// 2. 添加详细的断点日志
-// 3. 视频作为媒体失败时，尝试作为文档发送
+
+
+
+/**
+ * GET /messages-sync/:sessionId/:chatId
+ * 获取指定时间范围内的消息（用于同步）
+ *
+ * Query:
+ * - limit: 消息数量限制，默认 100
+ * - after: 开始时间戳（秒），默认最近 12 小时
+ * - before: 结束时间戳（秒），默认当前时间
+ * - includeMedia: 是否包含媒体，1=是（返回 fileUrl）
+ * - includeBase64: 是否包含 base64 数据，1=是（返回 data_url，用于同步）
+ * - timezone: 时区偏移（小时），默认 0
+ */
+app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
+    const { sessionId, chatId } = req.params;
+    const limit = parseInt(req.query.limit) || 100;
+    const includeMedia = String(req.query.includeMedia || '0') === '1';
+    const includeBase64 = String(req.query.includeBase64 || '0') === '1';
+    const timezoneOffset = parseInt(req.query.timezone || '0') * 3600;
+
+    // 时间参数（支持秒和毫秒）
+    let afterTs = req.query.after ? parseInt(req.query.after) : null;
+    let beforeTs = req.query.before ? parseInt(req.query.before) : null;
+
+    // 自动识别毫秒并转换为秒
+    if (afterTs && afterTs > 9999999999) afterTs = Math.floor(afterTs / 1000);
+    if (beforeTs && beforeTs > 9999999999) beforeTs = Math.floor(beforeTs / 1000);
+
+    // 默认：最近 12 小时
+    const now = Math.floor(Date.now() / 1000);
+    if (!afterTs) afterTs = now - 12 * 3600;
+    if (!beforeTs) beforeTs = now;
+
+    const session = sessions[sessionId];
+    if (!session) return res.status(400).json({ ok: false, error: 'Session not found' });
+    if (session.status !== 'ready') return res.status(400).json({ ok: false, error: 'Session not ready' });
+
+    try {
+        console.log(`[messages-sync] session=${sessionId}, chat=${chatId}`);
+        console.log(`[messages-sync] includeMedia=${includeMedia}, includeBase64=${includeBase64}`);
+        console.log(`[messages-sync] time: ${new Date(afterTs * 1000).toISOString()} ~ ${new Date(beforeTs * 1000).toISOString()}`);
+
+        const chat = await session.client.getChatById(chatId);
+
+        // 获取更多消息用于过滤（因为 WhatsApp 返回的是最近的消息）
+        const fetchLimit = Math.min(limit * 5, 500);
+        const rawMessages = await chat.fetchMessages({ limit: fetchLimit });
+
+        console.log(`[messages-sync] Fetched ${rawMessages.length} raw messages from WhatsApp`);
+
+        const out = [];
+        let mediaCount = 0;
+        let mediaErrorCount = 0;
+
+        for (const msg of rawMessages) {
+            const msgTs = msg.timestamp || 0;
+
+            // 时间过滤
+            if (msgTs < afterTs || msgTs > beforeTs) continue;
+            if (out.length >= limit) break;
+
+            const idSer = msg.id?._serialized || msg.id;
+
+            // 获取消息内容
+            let body = '';
+            if (msg.type === 'chat') {
+                body = msg.body || '';
+            } else if (msg._data?.caption) {
+                body = String(msg._data.caption);
+            } else if (msg.body) {
+                body = msg.body;
+            }
+
+            const item = {
+                id: idSer,
+                fromMe: !!msg.fromMe,
+                type: msg.type,
+                body: body,
+                timestamp: msgTs,
+                timestampMs: msgTs * 1000,
+                datetime: new Date((msgTs + timezoneOffset) * 1000).toISOString(),
+                ack: msg.ack
+            };
+
+            // 处理媒体
+            if (includeMedia || includeBase64) {
+                const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
+                if (msg.hasMedia || MEDIA_TYPES.has(msg.type)) {
+                    try {
+                        const media = await msg.downloadMedia();
+                        if (media?.data) {
+                            mediaCount++;
+
+                            // 获取文件扩展名
+                            const ext = mimeToExt(media.mimetype) || '';
+                            const filename = media.filename || `${idSer}${ext}`;
+
+                            item.media = {
+                                mimetype: media.mimetype,
+                                filename: filename,
+                                bytes: Buffer.from(media.data, 'base64').length,
+                                // ===== 关键：直接返回 data_url =====
+                                data_url: `data:${media.mimetype};base64,${media.data}`
+                            };
+
+                            console.log(`[messages-sync] Media OK: ${idSer}, size=${item.media.bytes}`);
+                        }
+                    } catch (e) {
+                        mediaErrorCount++;
+                        console.log(`[messages-sync] Media download failed for ${idSer}:`, e?.message);
+                        item.media = { error: e?.message };
+                    }
+                }
+            }
+
+            out.push(item);
+        }
+
+        // 按时间排序（旧到新）
+        out.sort((a, b) => a.timestamp - b.timestamp);
+
+        console.log(`[messages-sync] Returning ${out.length} messages, media: ${mediaCount} ok, ${mediaErrorCount} failed`);
+
+        res.json({
+            ok: true,
+            sessionId,
+            chatId,
+            count: out.length,
+            mediaCount,
+            mediaErrorCount,
+            hasBase64: includeBase64,
+            timeRange: {
+                after: afterTs,
+                before: beforeTs,
+                afterDate: new Date(afterTs * 1000).toISOString(),
+                beforeDate: new Date(beforeTs * 1000).toISOString()
+            },
+            messages: out
+        });
+    } catch (err) {
+        console.error(`[messages-sync] Error:`, err.message);
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+/**
+ * POST /messages-batch/:sessionId
+ * 批量获取多个聊天的消息
+ */
+app.post('/messages-batch/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    const { chatIds, after, before, limit = 50, includeMedia = false } = req.body || {};
+
+    const session = sessions[sessionId];
+    if (!session) return res.status(400).json({ ok: false, error: 'Session not found' });
+    if (session.status !== 'ready') return res.status(400).json({ ok: false, error: 'Session not ready' });
+
+    if (!Array.isArray(chatIds) || chatIds.length === 0) {
+        return res.status(400).json({ ok: false, error: 'chatIds array required' });
+    }
+
+    let afterTs = after ? parseInt(after) : Math.floor(Date.now() / 1000) - 12 * 3600;
+    let beforeTs = before ? parseInt(before) : Math.floor(Date.now() / 1000);
+    if (afterTs > 9999999999) afterTs = Math.floor(afterTs / 1000);
+    if (beforeTs > 9999999999) beforeTs = Math.floor(beforeTs / 1000);
+
+    const results = {};
+
+    for (const chatId of chatIds) {
+        try {
+            const chat = await session.client.getChatById(chatId);
+            const rawMessages = await chat.fetchMessages({ limit: Math.min(limit * 3, 200) });
+
+            const messages = [];
+            for (const msg of rawMessages) {
+                const msgTs = msg.timestamp || 0;
+                if (msgTs < afterTs || msgTs > beforeTs) continue;
+                if (messages.length >= limit) break;
+
+                const item = {
+                    id: msg.id?._serialized || msg.id,
+                    fromMe: !!msg.fromMe,
+                    type: msg.type,
+                    body: msg.body || '',
+                    timestamp: msgTs
+                };
+
+                if (includeMedia && msg.hasMedia) {
+                    try {
+                        const media = await msg.downloadMedia();
+                        if (media?.data) {
+                            const saved = saveBase64ToFile(sessionId, chatId, item.id, media);
+                            item.media = { mimetype: saved.mimetype, fileUrl: saved.fileUrl };
+                        }
+                    } catch (_) {}
+                }
+
+                messages.push(item);
+            }
+
+            messages.sort((a, b) => a.timestamp - b.timestamp);
+            results[chatId] = { ok: true, count: messages.length, messages };
+        } catch (e) {
+            results[chatId] = { ok: false, error: e?.message };
+        }
+    }
+
+    res.json({ ok: true, results });
+});
 
 app.post('/send/media', async (req, res) => {
     const ok  = (code, data) => res.status(code).json(data);
     const bad = (code, msg)  => ok(code, { ok: false, error: msg });
 
     try {
-        const { sessionId, to, to_lid, type, url, b64, mimetype, filename, caption, urls, attachments } = req.body || {};
+        const { sessionId, to, to_lid, url, b64, mimetype, filename, caption, attachments } = req.body || {};
 
-        console.log(`[send/media] ===== START =====`);
-        console.log(`[send/media] Input: sessionId=${sessionId}, to=${to || 'none'}, to_lid=${to_lid || 'none'}`);
+        console.log(`[send/media] START: to=${to || 'none'}, to_lid=${to_lid || 'none'}`);
 
         if (!sessionId) return bad(400, 'missing sessionId');
         if (!to && !to_lid) return bad(400, 'missing to or to_lid');
@@ -1124,45 +1457,53 @@ app.post('/send/media', async (req, res) => {
         const session = sessions[sessionId];
         if (!session || !session.client) return bad(400, 'session not ready');
 
-        let targetJid = null;
+        // ===== 关键：确定 chatIdOrPhone =====
+        let chatIdOrPhone = null;
 
-        // 优先用真实电话
         if (to) {
             const { kind, digits, jid } = parseRecipient(to);
-            console.log(`[send/media] parseRecipient: kind=${kind}, digits=${digits}, jid=${jid}`);
-
             if (kind === 'group') {
-                targetJid = jid;
-            } else if (kind === 'user') {
+                chatIdOrPhone = jid;
+            } else if (kind === 'user' && digits) {
+                // 尝试获取真实 JID
                 const r = await session.client.getNumberId(digits).catch(() => null);
-                targetJid = r && r._serialized ? r._serialized : null;
-                console.log(`[send/media] getNumberId result: ${targetJid}`);
-
-                if (!targetJid && digits.length >= 7) {
-                    targetJid = `${digits}@c.us`;
-                    console.log(`[send/media] Using direct @c.us: ${targetJid}`);
-                }
+                chatIdOrPhone = r?._serialized || (digits.length >= 7 ? `${digits}@c.us` : null);
             }
         }
 
-        // 如果没有真实电话，尝试用隐私号
-        if (!targetJid && to_lid) {
-            targetJid = `${to_lid.replace(/\D/g, '')}@lid`;
-            console.log(`[send/media] Using LID: ${targetJid}`);
+        // 如果没有真实电话，使用隐私号
+        if (!chatIdOrPhone && to_lid) {
+            chatIdOrPhone = `${to_lid.replace(/\D/g, '')}@lid`;
+            console.log(`[send/media] Using LID: ${chatIdOrPhone}`);
         }
 
-        if (!targetJid) return bad(400, 'recipient not found (no phone and no lid)');
+        if (!chatIdOrPhone) return bad(400, 'recipient not found');
 
-        // ===== 收集所有要发送的媒体 =====
+        // ===== 关键修复：获取 Chat 对象（和成功版本一样）=====
+        let chat = null;
+        try {
+            chat = await session.client.getChatById(chatIdOrPhone);
+            console.log(`[send/media] Got chat: ${chat?.id?._serialized}`);
+        } catch (e) {
+            console.log(`[send/media] getChatById failed: ${e?.message}`);
+            // 尝试从缓存获取
+            const cached = (session.chats || []).find(c => c?.id?._serialized === chatIdOrPhone);
+            if (cached) {
+                chat = cached;
+                console.log(`[send/media] Using cached chat`);
+            }
+        }
+
+        if (!chat) {
+            return bad(400, `Cannot get chat for ${chatIdOrPhone}`);
+        }
+
+        // 收集媒体
         const mediaItems = [];
-
-        if (url || b64) {
-            mediaItems.push({ url, b64, mimetype, filename, caption });
-        }
-
+        if (url || b64) mediaItems.push({ url, b64, mimetype, filename, caption });
         if (Array.isArray(attachments)) {
             for (const att of attachments) {
-                if (att && typeof att === 'object') {
+                if (att) {
                     mediaItems.push({
                         url: att.url || att.file_url || att.data_url,
                         b64: att.b64,
@@ -1174,266 +1515,116 @@ app.post('/send/media', async (req, res) => {
             }
         }
 
-        if (mediaItems.length === 0) return bad(400, 'missing url/b64/attachments');
+        if (mediaItems.length === 0) return bad(400, 'missing media');
 
-        console.log(`[send/media] Collected ${mediaItems.length} media items`);
+        console.log(`[send/media] Chat: ${chat.id._serialized}, items: ${mediaItems.length}`);
 
         const results = [];
 
-        // 获取 chat 对象
-        let chat = null;
-        const cachedChats = session.chats || [];
-        chat = cachedChats.find(c => c?.id?._serialized === targetJid);
-        console.log(`[send/media] Chat from cache: ${!!chat}`);
-
-        if (!chat) {
-            for (let retry = 0; retry < 3; retry++) {
-                try {
-                    chat = await session.client.getChatById(targetJid);
-                    if (chat) {
-                        console.log(`[send/media] getChatById succeeded on retry ${retry}`);
-                        break;
-                    }
-                } catch (e) {
-                    console.log(`[send/media] getChatById attempt ${retry + 1} failed:`, e?.message);
-                    if (retry < 2) await sleep(500);
-                }
-            }
-        }
-
-        console.log(`[send/media] Target: ${targetJid}, hasChat: ${!!chat}, itemCount: ${mediaItems.length}`);
-
         for (let i = 0; i < mediaItems.length; i++) {
             const item = mediaItems[i];
-            console.log(`[send/media] ===== Processing item ${i} =====`);
-            console.log(`[send/media] Item ${i} raw: url=${item.url ? 'yes' : 'no'}, b64=${item.b64 ? 'yes' : 'no'}, mimetype=${item.mimetype}, filename=${item.filename}`);
 
             try {
-                // 规范化 MIME 类型
                 const itemMime = normalizeMime(item.mimetype, item.filename);
-                console.log(`[send/media] Item ${i} normalized mime: ${itemMime}`);
 
-                // 确保有文件名
+                // 确保文件名
                 let itemFilename = item.filename;
                 if (!itemFilename) {
                     if (item.url) {
-                        try {
-                            const urlPath = new URL(item.url).pathname;
-                            itemFilename = path.basename(urlPath) || null;
-                            console.log(`[send/media] Item ${i} filename from URL: ${itemFilename}`);
-                        } catch (_) {}
+                        try { itemFilename = path.basename(new URL(item.url).pathname); } catch (_) {}
                     }
                     if (!itemFilename) {
-                        const ext = itemMime.includes('jpeg') ? '.jpg' :
-                            itemMime.includes('png') ? '.png' :
-                                itemMime.includes('gif') ? '.gif' :
-                                    itemMime.includes('webp') ? '.webp' :
-                                        itemMime.includes('mp4') ? '.mp4' :
-                                            itemMime.includes('webm') ? '.webm' :
-                                                itemMime.includes('quicktime') ? '.mov' :
-                                                    itemMime.includes('ogg') ? '.ogg' :
-                                                        itemMime.includes('opus') ? '.opus' :
-                                                            itemMime.includes('mpeg') ? '.mp3' :
-                                                                itemMime.includes('mp3') ? '.mp3' :
-                                                                    itemMime.includes('wav') ? '.wav' : '.bin';
-                        itemFilename = `media_${Date.now()}_${i}${ext}`;
-                        console.log(`[send/media] Item ${i} generated filename: ${itemFilename}`);
+                        itemFilename = ensureFilenameByMime(`media_${Date.now()}_${i}`, itemMime);
                     }
                 }
 
+                console.log(`[send/media] Item ${i}: ${itemMime}, ${itemFilename}`);
+
                 // 加载媒体
-                console.log(`[send/media] Item ${i} loading media...`);
                 let media;
                 if (item.b64) {
-                    console.log(`[send/media] Item ${i} using base64 data`);
                     media = new MessageMedia(itemMime, item.b64, itemFilename);
                 } else if (item.url) {
-                    console.log(`[send/media] Item ${i} downloading from URL: ${item.url.substring(0, 60)}...`);
                     media = await loadMedia({ url: item.url, mimetype: itemMime, filename: itemFilename });
                 } else {
-                    console.log(`[send/media] Item ${i} skipped - no url or b64`);
                     continue;
                 }
 
-                console.log(`[send/media] Item ${i} media loaded: mimetype=${media.mimetype}, filename=${media.filename}, dataLen=${media.data?.length || 0}`);
-
-                // 判断媒体类型
+                // 判断类型
                 const mime = normalizeMime(media.mimetype || itemMime, itemFilename);
                 const isVideo = mime.startsWith('video/');
-                const isImage = mime.startsWith('image/');
                 const isAudio = mime.startsWith('audio/');
                 const isVoice = isAudio && (mime.includes('ogg') || mime.includes('opus'));
 
-                console.log(`[send/media] Item ${i} type detection: mime=${mime}, isVideo=${isVideo}, isImage=${isImage}, isAudio=${isAudio}, isVoice=${isVoice}`);
+                const itemCaption = (i === 0) ? (item.caption || caption || '') : '';
 
                 let msg = null;
-                let sendError = null;
+                let method = 'standard';
 
-                // ===== 视频特殊处理 =====
+                // ===== 关键修复：统一使用 chat.sendMessage =====
+                const opts = {};
+                if (itemCaption) opts.caption = itemCaption;
+                if (isVoice) opts.sendAudioAsVoice = true;
+
                 if (isVideo) {
-                    console.log(`[send/media] Item ${i} is VIDEO - using special handling`);
-
-                    // 方案1：尝试不带任何选项发送
-                    console.log(`[send/media] Item ${i} VIDEO attempt 1: no options`);
+                    // 视频：使用修复后的 sendVideo 函数
+                    const r = await sendVideo(chat, media, itemCaption);
+                    if (r.ok) {
+                        msg = r.msg;
+                        method = r.method;
+                    } else {
+                        results.push({ ok: false, error: r.error, index: i });
+                        continue;
+                    }
+                } else {
+                    // 非视频：直接用 chat.sendMessage
                     try {
-                        const opts1 = {};
-                        if (i === 0 && (item.caption || caption)) {
-                            opts1.caption = item.caption || caption || '';
-                        }
-                        if (chat) {
-                            msg = await chat.sendMessage(media, opts1);
-                        } else {
-                            msg = await session.client.sendMessage(targetJid, media, opts1);
-                        }
-                        if (msg) {
-                            console.log(`[send/media] Item ${i} VIDEO attempt 1 succeeded`);
-                        }
+                        msg = await chat.sendMessage(media, opts);
+                        method = 'chat.sendMessage';
                     } catch (e) {
-                        console.log(`[send/media] Item ${i} VIDEO attempt 1 failed:`, e?.message);
-                        sendError = e;
-                    }
-
-                    // 方案2：尝试 sendMediaAsDocument: false
-                    if (!msg) {
-                        console.log(`[send/media] Item ${i} VIDEO attempt 2: sendMediaAsDocument=false`);
-                        try {
-                            const opts2 = { sendMediaAsDocument: false };
-                            if (i === 0 && (item.caption || caption)) {
-                                opts2.caption = item.caption || caption || '';
-                            }
-                            if (chat) {
-                                msg = await chat.sendMessage(media, opts2);
-                            } else {
-                                msg = await session.client.sendMessage(targetJid, media, opts2);
-                            }
-                            if (msg) {
-                                console.log(`[send/media] Item ${i} VIDEO attempt 2 succeeded`);
-                            }
-                        } catch (e) {
-                            console.log(`[send/media] Item ${i} VIDEO attempt 2 failed:`, e?.message);
-                            sendError = e;
-                        }
-                    }
-
-                    // 方案3：尝试 sendMediaAsDocument: true（作为文件发送）
-                    if (!msg) {
-                        console.log(`[send/media] Item ${i} VIDEO attempt 3: sendMediaAsDocument=true`);
-                        try {
-                            const opts3 = { sendMediaAsDocument: true };
-                            if (i === 0 && (item.caption || caption)) {
-                                opts3.caption = item.caption || caption || '';
-                            }
-                            if (chat) {
-                                msg = await chat.sendMessage(media, opts3);
-                            } else {
-                                msg = await session.client.sendMessage(targetJid, media, opts3);
-                            }
-                            if (msg) {
-                                console.log(`[send/media] Item ${i} VIDEO attempt 3 succeeded (as document)`);
-                            }
-                        } catch (e) {
-                            console.log(`[send/media] Item ${i} VIDEO attempt 3 failed:`, e?.message);
-                            sendError = e;
-                        }
-                    }
-
-                    // 方案4：尝试 sendVideoAsGif: true
-                    if (!msg) {
-                        console.log(`[send/media] Item ${i} VIDEO attempt 4: sendVideoAsGif=true`);
-                        try {
-                            const opts4 = { sendVideoAsGif: true };
-                            if (i === 0 && (item.caption || caption)) {
-                                opts4.caption = item.caption || caption || '';
-                            }
-                            if (chat) {
-                                msg = await chat.sendMessage(media, opts4);
-                            } else {
-                                msg = await session.client.sendMessage(targetJid, media, opts4);
-                            }
-                            if (msg) {
-                                console.log(`[send/media] Item ${i} VIDEO attempt 4 succeeded (as gif)`);
-                            }
-                        } catch (e) {
-                            console.log(`[send/media] Item ${i} VIDEO attempt 4 failed:`, e?.message);
-                            sendError = e;
-                        }
-                    }
-
-                } else {
-                    // ===== 非视频媒体（图片、音频、文件）=====
-                    console.log(`[send/media] Item ${i} is NOT video - standard handling`);
-
-                    const opts = {};
-                    if (i === 0 && (item.caption || caption)) {
-                        opts.caption = item.caption || caption || '';
-                    }
-
-                    if (isImage) {
-                        opts.sendMediaAsDocument = false;
-                    }
-                    if (isVoice) {
-                        opts.sendAudioAsVoice = true;
-                    }
-
-                    console.log(`[send/media] Item ${i} opts: ${JSON.stringify(opts)}`);
-
-                    // 尝试 chat.sendMessage
-                    if (chat) {
-                        try {
-                            console.log(`[send/media] Item ${i} trying chat.sendMessage...`);
-                            msg = await chat.sendMessage(media, opts);
-                            if (msg) {
-                                console.log(`[send/media] Item ${i} chat.sendMessage succeeded`);
-                            }
-                        } catch (e) {
-                            console.log(`[send/media] Item ${i} chat.sendMessage failed:`, e?.message);
-                            sendError = e;
-                        }
-                    }
-
-                    // 尝试 client.sendMessage
-                    if (!msg) {
-                        try {
-                            console.log(`[send/media] Item ${i} trying client.sendMessage...`);
-                            msg = await session.client.sendMessage(targetJid, media, opts);
-                            if (msg) {
-                                console.log(`[send/media] Item ${i} client.sendMessage succeeded`);
-                            }
-                        } catch (e) {
-                            console.log(`[send/media] Item ${i} client.sendMessage failed:`, e?.message);
-                            sendError = e;
-                        }
+                        console.error(`[send/media] Item ${i} failed:`, e?.message);
+                        results.push({ ok: false, error: e?.message, index: i });
+                        continue;
                     }
                 }
 
-                // 记录结果
                 if (msg) {
-                    console.log(`[send/media] Item ${i} SENT OK, msgId=${msg?.id?._serialized}`);
-                    results.push({ ok: true, id: msg?.id?._serialized || null, index: i });
-                } else {
-                    console.error(`[send/media] Item ${i} FAILED:`, sendError?.message);
-                    results.push({ ok: false, error: sendError?.message || 'send failed', index: i });
+                    const msgId = msg.id?._serialized || null;
+                    console.log(`[send/media] Item ${i} OK: method=${method}`);
+
+                    // 标记为从 Chatwoot 发送
+                    if (typeof markSentFromChatwoot === 'function') {
+                        markSentFromChatwoot(msgId);
+                    }
+
+                    // 触发清晰化
+                    setTimeout(async () => {
+                        try { await msg.downloadMedia(); } catch (_) {}
+                    }, 600);
+
+                    results.push({ ok: true, id: msgId, index: i, method });
                 }
 
-                // 多个媒体之间加延迟
-                if (i < mediaItems.length - 1) {
-                    const delay = rnd(800, 2000);
-                    console.log(`[send/media] Waiting ${delay}ms before next item...`);
-                    await sleep(delay);
-                }
+                if (i < mediaItems.length - 1) await sleep(rnd(800, 1500));
             } catch (e) {
-                console.error(`[send/media] Item ${i} EXCEPTION:`, e?.message || e);
-                results.push({ ok: false, error: e?.message || String(e), index: i });
+                console.error(`[send/media] Item ${i} exception:`, e?.message);
+                results.push({ ok: false, error: e?.message, index: i });
             }
         }
 
         const successCount = results.filter(r => r.ok).length;
-        console.log(`[send/media] ===== COMPLETE: ${successCount}/${mediaItems.length} succeeded =====`);
+        console.log(`[send/media] DONE: ${successCount}/${mediaItems.length}`);
 
-        return ok(200, { ok: true, to: targetJid, results, total: mediaItems.length, success: successCount });
+        return ok(200, {
+            ok: successCount > 0,
+            to: chat.id._serialized,
+            results,
+            total: mediaItems.length,
+            success: successCount
+        });
     } catch (e) {
-        console.error('[send/media] FATAL ERROR:', e);
-        return res.status(500).json({ ok: false, error: e?.message || String(e) });
+        console.error('[send/media] ERROR:', e);
+        return res.status(500).json({ ok: false, error: e?.message });
     }
 });
 

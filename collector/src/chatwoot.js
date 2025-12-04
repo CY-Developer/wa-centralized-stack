@@ -1,4 +1,3 @@
-// collector/src/chatwoot.js
 const axios = require('axios');
 const FormData = require('form-data');
 const path = require('path');
@@ -85,6 +84,29 @@ function parseDataUrlLoose(dataUrl) {
   const filename = forceFileExt('upload', mime);
   return { buffer: buf, filename, contentType: mime };
 }
+
+async function request(method, urlPath, data, extraHeaders = {}) {
+  const url = `${CW_BASE}${urlPath}`;
+  const headers = {
+    'api_access_token': CW_TOKEN,  // 修复：使用 CW_TOKEN 而不是 CFG.chatwoot.apiAccessToken
+    ...extraHeaders
+  };
+
+  if (!(data instanceof require('form-data'))) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const response = await axios({
+    method,
+    url,
+    headers,
+    data: data instanceof require('form-data') ? data : JSON.stringify(data),
+    timeout: 30000
+  });
+
+  return response.data;
+}
+
 
 async function fetchAsBuffer(url) {
   const res = await axios.get(url, {
@@ -205,7 +227,7 @@ async function updateContact({ account_id = DEFAULT_ACCOUNT_ID, contact_id, patc
   return cwRequest('patch', `/api/v1/accounts/${account_id}/contacts/${contact_id}`, { data: patch });
 }
 
-async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawName, sessionId }) {
+async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone,rawPhone_lid, rawName, sessionId }) {
   // 归属主键：必须 phone + sessionId 同时相同（你现行规则）
   const digits = (String(rawPhone || '').match(/\d+/g) || []).join('');
   const identifier = `wa:${sessionId || 'default'}:${digits}`;
@@ -415,23 +437,191 @@ async function updateContactNote({ account_id, contact_id, note_id, content }) {
   );
 }
 
+/**
+ * 获取会话消息列表
+ */
+async function getConversationMessages({ account_id = DEFAULT_ACCOUNT_ID, conversation_id, after, before }) {
+  let allMessages = [];
+  let beforeId = null;
+  let hasMore = true;
+  let pageCount = 0;
+  const maxPages = 100;
+
+  const afterDate = after ? new Date(after) : null;
+  const beforeDate = before ? new Date(before) : null;
+
+  console.log(`[getConversationMessages] Start: conv=${conversation_id}`);
+  console.log(`[getConversationMessages] Range: ${afterDate?.toISOString() || 'none'} ~ ${beforeDate?.toISOString() || 'none'}`);
+
+  while (hasMore && pageCount < maxPages) {
+    try {
+      let url = `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`;
+      if (beforeId) {
+        url += `?before=${beforeId}`;
+      }
+
+      const result = await cwRequest('get', url);
+      const messages = result?.payload || result || [];
+
+      if (!Array.isArray(messages) || messages.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      // 打印第一页的时间范围，帮助调试
+      if (pageCount === 0 && messages.length > 0) {
+        const firstTime = new Date(messages[0].created_at).toISOString();
+        const lastTime = new Date(messages[messages.length - 1].created_at).toISOString();
+        console.log(`[getConversationMessages] Page 1 messages: ${lastTime} ~ ${firstTime}`);
+      }
+
+      allMessages.push(...messages);
+      pageCount++;
+
+      console.log(`[getConversationMessages] Page ${pageCount}: got ${messages.length}, total ${allMessages.length}`);
+
+      if (messages.length < 15) {
+        hasMore = false;
+      } else {
+        const lastMsg = messages[messages.length - 1];
+        beforeId = lastMsg.id;
+
+        if (after) {
+          const lastTs = new Date(lastMsg.created_at).getTime();
+          if (lastTs < after) {
+            console.log(`[getConversationMessages] Reached boundary: msg time ${new Date(lastTs).toISOString()} < after`);
+            hasMore = false;
+          }
+        }
+      }
+
+      if (hasMore) await new Promise(r => setTimeout(r, 50));
+    } catch (e) {
+      console.error(`[getConversationMessages] Error:`, e?.message);
+      hasMore = false;
+    }
+  }
+
+  console.log(`[getConversationMessages] Total: ${allMessages.length} in ${pageCount} pages`);
+
+  // 时间过滤
+  if (after || before) {
+    const total = allMessages.length;
+    let afterBefore = 0;  // 在 before 之后的（太新）
+    let beforeAfter = 0;  // 在 after 之前的（太旧）
+
+    allMessages = allMessages.filter(m => {
+      const ts = new Date(m.created_at).getTime();
+      if (before && ts > before) { afterBefore++; return false; }
+      if (after && ts < after) { beforeAfter++; return false; }
+      return true;
+    });
+
+    console.log(`[getConversationMessages] Filter: ${allMessages.length} in range, ${afterBefore} too new, ${beforeAfter} too old`);
+  }
+
+  return allMessages;
+}
 
 
-// ---------- 导出 ----------
+
+/**
+ * 创建 outgoing 消息（客服/我方发送的消息）
+ */
+async function createOutgoingMessage({
+                                       account_id = DEFAULT_ACCOUNT_ID,
+                                       conversation_id,
+                                       content,
+                                       attachments = [],
+                                       source_id
+                                     }) {
+  const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+
+  if (hasAttachments) {
+    // 有附件：使用 FormData
+    const url = `${CW_BASE}/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`;
+
+    const files = [];
+    for (const att of attachments) {
+      if (!att) continue;
+
+      if (att.data_url) {
+        const parsed = parseDataUrlLoose(att.data_url);
+        if (parsed) {
+          const ct = cleanMime(att.file_type || parsed.contentType);
+          const fn = forceFileExt(att.filename || parsed.filename, ct);
+          files.push({ buffer: parsed.buffer, filename: fn, contentType: ct });
+        }
+      } else if (att.file_url) {
+        try {
+          const file = await fetchAsBuffer(att.file_url);
+          const ct = cleanMime(att.file_type || file.contentType);
+          const fn = forceFileExt(att.filename || file.filename, ct);
+          files.push({ buffer: file.buffer, filename: fn, contentType: ct });
+        } catch (e) {
+          console.error('[createOutgoingMessage] Fetch attachment failed:', e?.message);
+        }
+      }
+    }
+
+    const form = new FormData();
+    form.append('content', String(content || ''));
+    form.append('message_type', 'outgoing');
+    form.append('private', 'false');
+
+    for (const f of files) {
+      form.append('attachments[]', f.buffer, { filename: f.filename, contentType: f.contentType });
+    }
+
+    const headers = { ...form.getHeaders(), api_access_token: CW_TOKEN };
+    const res = await axios.post(url, form, {
+      headers,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      validateStatus: s => s >= 200 && s < 300
+    });
+
+    return res.data;
+  }
+
+  // 无附件：JSON 请求
+  return cwRequest('post', `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`, {
+    data: {
+      content: String(content || ''),
+      message_type: 'outgoing',
+      private: false
+    }
+  });
+}
+
+
+/**
+ * 删除消息（用于 replace 模式）
+ */
+async function deleteMessage({ account_id = DEFAULT_ACCOUNT_ID, conversation_id, message_id }) {
+  try {
+    const result = await cwRequest('delete', `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages/${message_id}`);
+    console.log(`[deleteMessage] Deleted message ${message_id}`);
+    return result;
+  } catch (e) {
+    console.error(`[deleteMessage] Failed to delete ${message_id}:`, e?.message);
+    throw e;
+  }
+}
+
 module.exports = {
-  // 基础
   listAccounts,
   listInboxes,
   getInboxIdByIdentifier,
   createContactNote,
   updateContactNote,
-  // 联系人
   ensureContact,
-
-  // 会话
   ensureConversation,
   getConversationDetails,
-
-  // 消息
+  request,
   createIncomingMessage,
+
+  getConversationMessages,
+  createOutgoingMessage,
+  deleteMessage,
 };

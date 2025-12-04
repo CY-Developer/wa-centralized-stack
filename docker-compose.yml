@@ -1,0 +1,31 @@
+
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    environment:
+      - NODE_ENV=production
+    network_mode: "host"
+    ports:
+      - "5010:5010"
+    volumes:
+      - ./.env:/app/.env:ro
+
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile.collector
+    environment:
+      - NODE_ENV=production
+    ports:
+      - "7001:7001"
+    volumes:
+      - ./.env:/app/.env:ro  # 原有：挂载 .env
+      
+    networks:
+      - wa_network
+
+networks:
+  wa_network:
+    driver: bridge

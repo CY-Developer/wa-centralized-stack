@@ -1,0 +1,24 @@
+
+# Dockerfile for Bridge Service (using root package.json)
+FROM node:20
+
+# Set the working directory
+WORKDIR /app
+
+# Copy the root package.json and package-lock.json
+COPY package*.json ./
+
+# Install dependencies from root package.json
+RUN npm install
+
+# Copy the rest of the application files
+COPY . .
+
+# Expose the port used by the service
+EXPOSE 5010
+
+# Set environment variable
+ENV NODE_ENV=production
+
+# Start the application
+CMD ["node", "bridge/whatsapp-manager.js"]
