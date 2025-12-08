@@ -227,23 +227,29 @@ async function updateContact({ account_id = DEFAULT_ACCOUNT_ID, contact_id, patc
   return cwRequest('patch', `/api/v1/accounts/${account_id}/contacts/${contact_id}`, { data: patch });
 }
 
-async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone,rawPhone_lid, rawName, sessionId }) {
-  // 归属主键：必须 phone + sessionId 同时相同（你现行规则）
-  const digits = (String(rawPhone || '').match(/\d+/g) || []).join('');
+async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPhone_lid, rawName, sessionId, messageId }) {
+  // 核心：从messageId提取@lid前的纯数字（适配格式：false_67894943707296@lid_xxx）
+  const getLidDigits = (mid) => {
+    if (!mid) return '';
+    // 只取@lid前面的纯数字（比如67894943707296）
+    const match = mid.match(/(\d+)@lid/);
+    return match ? match[1] : '';
+  };
+
+  // 1. 优先用rawPhone，空则直接替换为@lid纯数字
+  const finalPhone = rawPhone || getLidDigits(messageId);
+  // 归属主键：基于最终电话的纯数字 + sessionId
+  const digits = (String(finalPhone || '').match(/\d+/g) || []).join('');
   const identifier = `wa:${sessionId || 'default'}:${digits}`;
-  const phone_e164 = normalizeE164(rawPhone, rawName); // 用于联系人 phone_number
+  // 接口电话参数直接用finalPhone（空则为@lid纯数字）
+  const phone_e164 = normalizeE164(finalPhone, rawName);
 
-  // 先按 identifier 精确找
+  // 以下逻辑完全保留，仅替换了finalPhone作为电话来源
   let contact = await searchContact({ account_id, identifier });
-
-  // 按你的显示名格式：sessionId>name（保留）
   const wantName = buildDisplayName(sessionId, rawName, phone_e164, identifier);
-
-  // 仅保存 sessionId 到自定义属性（其它信息不放这儿）
   const wantAttrs = { session_id: sessionId || null };
 
   if (!contact) {
-    // 先尝试“带手机号”创建；若手机号已被别的联系人占用，则降级为不带手机号创建
     try {
       contact = await createContact({
         account_id,
@@ -257,7 +263,6 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone,rawPhon
       const msg = (e._cw?.error || e._cw?.message || e.message || '').toLowerCase();
       const dupPhone = msg.includes('phone number') && msg.includes('taken');
       if (!dupPhone) throw e;
-      // 重试：不写 phone_number，避免 422
       contact = await createContact({
         account_id,
         name: wantName,
@@ -268,23 +273,18 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone,rawPhon
       });
     }
   } else {
-    // 需要时做 patch：name / phone_number（仅当不会与别人冲突）/ custom_attributes
     const patch = {};
     const pure = (s) => (s || '').replace(/[^\+\d]/g, '');
-
     if (contact.name !== wantName) patch.name = wantName;
-
     if (phone_e164) {
       const owner = await findContactByPhone({ account_id, phone_e164 });
-      if (!owner || owner.id === contact.id) {  // 没被别人占
+      if (!owner || owner.id === contact.id) {
         if (pure(contact.phone_number) !== pure(phone_e164)) patch.phone_number = phone_e164;
       }
     }
-
     if ((contact.custom_attributes?.session_id || null) !== (sessionId || null)) {
       patch.custom_attributes = { ...(contact.custom_attributes || {}), session_id: sessionId || null };
     }
-
     if (Object.keys(patch).length) {
       try { contact = await updateContact({ account_id, contact_id: contact.id, patch }); } catch {}
     }

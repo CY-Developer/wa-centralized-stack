@@ -326,21 +326,25 @@ async function resolveInboxId() {
 
 // ===== App 初始化 =====
 const app = express();
+
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-token, Authorization');
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+    next();
+});
+
 app.use('/media', express.static(MEDIA_DIR));
 app.use(bodyParser.json({limit: '25mb'}));
 app.use(morgan('dev'));
-app.use(morgan('short', {stream: collectorStream}));
-app.all('/chatwoot/webhook', (req, _res, next) => {
-    logToCollector('[CW_WEBHOOK] TAP', {
-        ua: req.headers['user-agent'],
-        ct: req.headers['content-type'],
-        q: req.query
-    });
-    next();
-});
 // 统一鉴权：头 x-api-token 或 query ?token=
 app.use((req, res, next) => {
-
+    if (req.method === 'OPTIONS') {
+        return next();
+    }
     // 鉴权（支持 header: x-api-token 或 query: ?token=）
     const t = (
         req.headers['x-api-token'] ||
@@ -351,7 +355,6 @@ app.use((req, res, next) => {
     if (INGEST_TOKEN && t !== INGEST_TOKEN) {
         return res.status(401).json({ok: false, error: 'bad token'});
     }
-
     next();
 });
 // 健康检查
