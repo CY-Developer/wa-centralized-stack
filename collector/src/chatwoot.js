@@ -144,6 +144,11 @@ async function fetchAsBuffer(url) {
 // 根据 sessionId 和原始 name/phone 生成联系人显示名
 function buildDisplayName(sessionId, rawName, phone_e164, identifier) {
   const rhs = (rawName && rawName.trim()) || phone_e164 || identifier || 'WA User';
+
+  if (sessionId === 'k17se6o0') return `Briana>${rhs}`;
+  if (sessionId === 'k17sdxph') return `Abby>${rhs}`;
+  if (sessionId === 'k16f9wid') return `Chloe>${rhs}`;
+  if (sessionId === 'k16hf6nn') return `Ivor>${rhs}`;
   return `${sessionId || 'unknown'}>${rhs}`;
 }
 
@@ -608,10 +613,457 @@ async function deleteMessage({ account_id = DEFAULT_ACCOUNT_ID, conversation_id,
     throw e;
   }
 }
+/**
+ * ========== chatwoot.js 新增函数 ==========
+ * 将以下代码添加到 chatwoot.js 文件末尾（在 module.exports 之前）
+ */
+
+// ========== 批量查询消息 ==========
+/**
+ * 批量查询指定时间范围内的消息
+ * @param {Object} options
+ * @param {number} options.account_id - 账户 ID
+ * @param {number} options.conversation_id - 会话 ID
+ * @param {string} options.after - 开始时间 ISO 格式
+ * @param {string} options.before - 结束时间 ISO 格式
+ * @returns {Promise<Array>} 消息数组 [{id, content, created_at, created_at_unix, message_type, sender_type, source_id}...]
+ */
+async function batchQueryMessages({
+                                    account_id = DEFAULT_ACCOUNT_ID,
+                                    conversation_id,
+                                    after,
+                                    before
+                                  }) {
+  console.log(`[batchQueryMessages] Start: conv=${conversation_id}, after=${after}, before=${before}`);
+
+  try {
+    const result = await cwRequest('post', `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages/batch_query`, {
+      data: { after, before }
+    });
+
+    const messages = result?.messages || [];
+    console.log(`[batchQueryMessages] Got ${messages.length} messages`);
+
+    return messages;
+  } catch (e) {
+    console.error(`[batchQueryMessages] Error:`, e?.message);
+
+    // 如果新 API 不存在，降级到旧方法
+    if (e?.response?.status === 404 || e?.message?.includes('404')) {
+      console.log(`[batchQueryMessages] Fallback to getConversationMessages`);
+      return await getConversationMessages({
+        account_id,
+        conversation_id,
+        after: after ? new Date(after).getTime() : null,
+        before: before ? new Date(before).getTime() : null
+      });
+    }
+
+    throw e;
+  }
+}
+
+// ========== 批量删除消息 ==========
+/**
+ * 批量删除消息（支持 ID 列表或时间范围）
+ * @param {Object} options
+ * @param {number} options.account_id - 账户 ID
+ * @param {number} options.conversation_id - 会话 ID
+ * @param {Array<number>} options.message_ids - 消息 ID 数组（可选）
+ * @param {string} options.after - 开始时间 ISO 格式（可选）
+ * @param {string} options.before - 结束时间 ISO 格式（可选）
+ * @param {boolean} options.hard_delete - 是否硬删除（默认软删除）
+ * @returns {Promise<Object>} { ok, deleted, failed, errors, total_found }
+ */
+async function batchDeleteMessages({
+                                     account_id = DEFAULT_ACCOUNT_ID,
+                                     conversation_id,
+                                     message_ids = null,
+                                     after = null,
+                                     before = null,
+                                     hard_delete = false
+                                   }) {
+  console.log(`[batchDeleteMessages] Start: conv=${conversation_id}, ids=${message_ids?.length || 0}, after=${after}, before=${before}`);
+
+  try {
+    const result = await cwRequest('post', `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages/batch_destroy`, {
+      data: {
+        message_ids,
+        after,
+        before,
+        hard_delete
+      }
+    });
+
+    console.log(`[batchDeleteMessages] Result: deleted=${result?.deleted}, failed=${result?.failed}`);
+    return result;
+  } catch (e) {
+    console.error(`[batchDeleteMessages] Error:`, e?.message);
+
+    // 如果新 API 不存在，降级到逐条删除
+    if (e?.response?.status === 404 || e?.message?.includes('404')) {
+      console.log(`[batchDeleteMessages] Fallback to single delete`);
+      return await fallbackBatchDelete({
+        account_id,
+        conversation_id,
+        message_ids,
+        after,
+        before
+      });
+    }
+
+    throw e;
+  }
+}
+
+/**
+ * 降级批量删除（逐条删除）
+ */
+async function fallbackBatchDelete({
+                                     account_id,
+                                     conversation_id,
+                                     message_ids,
+                                     after,
+                                     before
+                                   }) {
+  let messages = [];
+
+  // 如果提供了 ID 列表
+  if (message_ids && message_ids.length > 0) {
+    messages = message_ids.map(id => ({ id }));
+  }
+  // 否则按时间范围查询
+  else if (after || before) {
+    const allMessages = await getConversationMessages({
+      account_id,
+      conversation_id,
+      after: after ? new Date(after).getTime() : null,
+      before: before ? new Date(before).getTime() : null
+    });
+    messages = allMessages;
+  }
+
+  let deleted = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const msg of messages) {
+    try {
+      await deleteMessage({
+        account_id,
+        conversation_id,
+        message_id: msg.id
+      });
+      deleted++;
+    } catch (e) {
+      failed++;
+      errors.push({ id: msg.id, error: e?.message });
+    }
+    // 小延迟避免请求过快
+    await new Promise(r => setTimeout(r, 30));
+  }
+
+  return {
+    ok: true,
+    deleted,
+    failed,
+    errors,
+    total_found: messages.length
+  };
+}
+
+
+// ========== 消息对齐辅助函数 ==========
+/**
+ * 在消息数组中查找匹配的消息（按内容和时间容差）
+ * @param {Array} messages - 消息数组
+ * @param {string} content - 要查找的内容
+ * @param {number} targetTimestamp - 目标时间戳（秒）
+ * @param {number} toleranceSeconds - 时间容差（秒），默认 60
+ * @returns {Object|null} 找到的消息或 null
+ */
+function findMessageByContentAndTime(messages, content, targetTimestamp, toleranceSeconds = 60) {
+  if (!messages || messages.length === 0) return null;
+  if (!content) return null;
+
+  const normalizedContent = String(content).trim().toLowerCase();
+  const minTs = targetTimestamp - toleranceSeconds;
+  const maxTs = targetTimestamp + toleranceSeconds;
+
+  for (const msg of messages) {
+    const msgContent = String(msg.content || msg.body || '').trim().toLowerCase();
+    const msgTs = msg.created_at_unix || msg.timestamp || Math.floor(new Date(msg.created_at).getTime() / 1000);
+
+    // 时间在容差范围内
+    if (msgTs >= minTs && msgTs <= maxTs) {
+      // 内容匹配（支持部分匹配）
+      if (msgContent === normalizedContent ||
+          msgContent.includes(normalizedContent) ||
+          normalizedContent.includes(msgContent)) {
+        return msg;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * 计算两组消息的时间偏移量
+ * @param {Array} cwMessages - Chatwoot 消息
+ * @param {Array} waMessages - WhatsApp 消息
+ * @returns {Object} { offset: 秒数, confidence: 置信度 }
+ */
+function calculateTimeOffset(cwMessages, waMessages) {
+  if (!cwMessages?.length || !waMessages?.length) {
+    return { offset: 0, confidence: 0 };
+  }
+
+  const offsets = [];
+
+  // 尝试匹配前 10 条消息
+  const sampleSize = Math.min(10, waMessages.length);
+  for (let i = 0; i < sampleSize; i++) {
+    const waMsg = waMessages[i];
+    const waTs = waMsg.timestamp;
+    const waContent = waMsg.body || '';
+
+    if (!waContent) continue;
+
+    // 在 CW 消息中查找匹配
+    const matchedCw = findMessageByContentAndTime(cwMessages, waContent, waTs, 120);
+    if (matchedCw) {
+      const cwTs = matchedCw.created_at_unix || Math.floor(new Date(matchedCw.created_at).getTime() / 1000);
+      offsets.push(cwTs - waTs);
+    }
+  }
+
+  if (offsets.length === 0) {
+    return { offset: 0, confidence: 0 };
+  }
+
+  // 取中位数作为偏移量
+  offsets.sort((a, b) => a - b);
+  const medianOffset = offsets[Math.floor(offsets.length / 2)];
+  const confidence = offsets.length / sampleSize;
+
+  return {
+    offset: medianOffset,
+    confidence,
+    samples: offsets.length
+  };
+}
+
+/**
+ * 批量创建消息
+ * @param {Object} options
+ * @param {number} options.account_id - 账户 ID
+ * @param {number} options.conversation_id - 会话 ID
+ * @param {Array} options.messages - 消息数组
+ * @returns {Promise<Object>}
+ */
+async function batchCreateMessages({
+                                     account_id = DEFAULT_ACCOUNT_ID,
+                                     conversation_id,
+                                     messages
+                                   }) {
+  if (!messages || messages.length === 0) {
+    return { ok: true, created: 0, failed: 0, skipped: 0, created_ids: [] };
+  }
+
+  console.log(`[batchCreateMessages] Start: conv=${conversation_id}, count=${messages.length}`);
+
+  try {
+    // 尝试使用批量 API
+    const result = await request('post',
+        `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages/batch_create`,
+        { messages }
+    );
+
+    console.log(`[batchCreateMessages] Success: created=${result?.created}, skipped=${result?.skipped}, failed=${result?.failed}`);
+    return result;
+
+  } catch (e) {
+    const status = e?.response?.status || e?.status;
+
+    // 如果批量 API 不存在（404），降级到逐条创建
+    if (status === 404) {
+      console.log(`[batchCreateMessages] API not found (404), fallback to single create`);
+      return await fallbackBatchCreate({
+        account_id,
+        conversation_id,
+        messages
+      });
+    }
+
+    console.error(`[batchCreateMessages] Error: ${e?.message}`);
+    throw e;
+  }
+}
+
+/**
+ * 降级批量创建（逐条）
+ */
+async function fallbackBatchCreate({
+                                     account_id = DEFAULT_ACCOUNT_ID,
+                                     conversation_id,
+                                     messages
+                                   }) {
+  let created = 0;
+  let failed = 0;
+  let skipped = 0;
+  const errors = [];
+  const created_ids = [];
+
+  for (const msg of messages) {
+    try {
+      const isIncoming = msg.message_type === 0 || msg.message_type === 'incoming';
+
+      let result;
+      if (isIncoming) {
+        result = await createIncomingMessage({
+          account_id,
+          conversation_id,
+          content: msg.content || '',
+          source_id: msg.source_id,
+          private: msg.private || false,
+          content_attributes: msg.content_attributes || {},
+          attachments: msg.attachments || []
+        });
+      } else {
+        result = await createOutgoingMessage({
+          account_id,
+          conversation_id,
+          content: msg.content || '',
+          source_id: msg.source_id,
+          private: msg.private || false,
+          content_attributes: msg.content_attributes || {},
+          attachments: msg.attachments || []
+        });
+      }
+
+      if (result?.id) {
+        created++;
+        created_ids.push(result.id);
+      }
+    } catch (e) {
+      const errMsg = e?.message || '';
+
+      // 重复消息不算失败
+      if (errMsg.includes('duplicate') ||
+          errMsg.includes('same_second') ||
+          errMsg.includes('record_invalid') ||
+          errMsg.includes('Duplicate message')) {
+        skipped++;
+      } else {
+        failed++;
+        errors.push({ source_id: msg.source_id, error: errMsg });
+      }
+    }
+
+    // 小延迟
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  return {
+    ok: true,
+    created,
+    failed,
+    skipped,
+    created_ids,
+    failed_details: errors
+  };
+}
+
+
+
+
+
+/**
+ * 分批同步消息（推荐用于大量消息）
+ * @param {Object} options
+ * @param {number} options.account_id
+ * @param {number} options.conversation_id
+ * @param {Array} options.messages - 所有要同步的消息
+ * @param {number} options.batchSize - 每批数量，默认 50
+ * @param {number} options.delayMs - 批次间延迟，默认 200ms
+ * @param {Function} options.onProgress - 进度回调 (current, total)
+ */
+async function syncMessagesInBatches({
+                                       account_id = DEFAULT_ACCOUNT_ID,
+                                       conversation_id,
+                                       messages,
+                                       batchSize = 50,
+                                       delayMs = 200,
+                                       onProgress = null
+                                     }) {
+  if (!messages || messages.length === 0) {
+    return { ok: true, total: 0, created: 0, failed: 0, skipped: 0 };
+  }
+
+  const total = messages.length;
+  let totalCreated = 0;
+  let totalFailed = 0;
+  let totalSkipped = 0;
+  const allErrors = [];
+
+  console.log(`[syncMessagesInBatches] Start: conv=${conversation_id}, total=${total}, batchSize=${batchSize}`);
+
+  for (let i = 0; i < total; i += batchSize) {
+    const batch = messages.slice(i, i + batchSize);
+    const batchNum = Math.floor(i / batchSize) + 1;
+    const totalBatches = Math.ceil(total / batchSize);
+
+    console.log(`[syncMessagesInBatches] Processing batch ${batchNum}/${totalBatches}`);
+
+    try {
+      const result = await batchCreateMessages({
+        account_id,
+        conversation_id,
+        messages: batch
+      });
+
+      totalCreated += result.created || 0;
+      totalFailed += result.failed || 0;
+      totalSkipped += result.skipped || 0;
+
+      if (result.failed_details) {
+        allErrors.push(...result.failed_details);
+      }
+    } catch (e) {
+      console.error(`[syncMessagesInBatches] Batch ${batchNum} failed: ${e?.message}`);
+      totalFailed += batch.length;
+      allErrors.push({ batch: batchNum, error: e?.message });
+    }
+
+    // 进度回调
+    if (onProgress) {
+      onProgress(Math.min(i + batchSize, total), total);
+    }
+
+    // 批次间延迟
+    if (i + batchSize < total) {
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+
+  console.log(`[syncMessagesInBatches] Complete: created=${totalCreated}, skipped=${totalSkipped}, failed=${totalFailed}`);
+
+  return {
+    ok: true,
+    total,
+    created: totalCreated,
+    failed: totalFailed,
+    skipped: totalSkipped,
+    errors: allErrors
+  };
+}
 
 module.exports = {
   listAccounts,
   listInboxes,
+  batchCreateMessages,
+  syncMessagesInBatches,
   getInboxIdByIdentifier,
   createContactNote,
   updateContactNote,
@@ -621,6 +1073,10 @@ module.exports = {
   request,
   createIncomingMessage,
 
+  batchQueryMessages,
+  batchDeleteMessages,
+  findMessageByContentAndTime,
+  calculateTimeOffset,
   getConversationMessages,
   createOutgoingMessage,
   deleteMessage,
