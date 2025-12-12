@@ -821,26 +821,38 @@ async function initSessionViaAdsPower(sessionId){
                     chatId: chat?.id?._serialized || ''
                 };
 
-                // 可选：媒体占位
+                // 媒体处理（带5秒超时保护）
                 if (message.hasMedia === true && typeof message.downloadMedia === 'function') {
                     try {
-                        const media = await message.downloadMedia();
+                        const mediaPromise = message.downloadMedia();
+                        const timeoutPromise = new Promise((_, reject) =>
+                            setTimeout(() => reject(new Error('timeout')), 5000)
+                        );
+                        const media = await Promise.race([mediaPromise, timeoutPromise]);
                         if (media && media.mimetype && media.data) {
                             payload.attachment = {
                                 data_url: `data:${media.mimetype};base64,${media.data}`,
                                 mime: media.mimetype,
                                 name: media.filename || undefined
                             };
+                            console.log(`[${sessionId}] media OK: ${media.mimetype}, ${media.data.length} bytes`);
                         }
-                    } catch (_) {}
+                    } catch (mediaErr) {
+                        console.log(`[${sessionId}] media skip: ${mediaErr?.message}`);
+                    }
                 }
 
-                console.error(payload,rec,message,message)
-                await postWithRetry(`${COLLECTOR_BASE}/ingest`, payload, { 'x-api-token': COLLECTOR_TOKEN });
-            } catch (e) {
-                console.log(`[${sessionId}] forward to collector failed:`, e?.response?.data || e?.message || e);
-            }
+                // ★ 推送前日志
+                console.log(`[${sessionId}] >>> PUSH: phone=${payload.phone}, text="${(payload.text || '').slice(0, 30)}..."`);
 
+                await postWithRetry(`${COLLECTOR_BASE}/ingest`, payload, { 'x-api-token': COLLECTOR_TOKEN });
+
+                // ★ 推送成功日志
+                console.log(`[${sessionId}] <<< PUSH OK`);
+
+            } catch (e) {
+                console.error(`[${sessionId}] <<< PUSH FAIL: ${e?.response?.status || ''} ${e?.message || e}`);
+            }
 
             //（已在 ready 里有周期性刷新，这里再加一次短延迟刷新，让“已读/新来”更快反映到缓存）
             sess.__debounced = sess.__debounced || {};
