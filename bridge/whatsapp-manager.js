@@ -1228,8 +1228,18 @@ app.post('/send/text', async (req, res) => {
 
         if (!targetJid) return bad(400, 'recipient not found');
 
+        // ===== 新增：转义 WhatsApp Markdown 特殊字符 =====
+        const escapeWhatsAppMarkdown = (str) => {
+            if (!str) return str;
+            // 在特殊字符前插入零宽空格，防止 WhatsApp 将其识别为格式标记
+            // * 粗体, _ 斜体, ~ 删除线, ``` 代码块, ` 行内代码
+            return str.replace(/([*_~`])/g, '\u200B$1');
+        };
+
+        const safeText = escapeWhatsAppMarkdown(String(text));
+
         // 发送消息
-        const msg = await session.client.sendMessage(targetJid, String(text));
+        const msg = await session.client.sendMessage(targetJid, safeText);
         const msgId = msg?.id?._serialized || null;
 
         // 标记为从 Chatwoot 发送

@@ -64,6 +64,162 @@ function logToCollector(tag, data) {
     console.log(tag, data || '');
 }
 const syncingConversations = new Map();
+
+// 核心策略：同步进行中时，完全阻止所有发送操作，不依赖内容匹配
+const syncLockManager = {
+
+    // 获取锁 - 如果已有锁在进行中，返回失败
+    acquireLock(conversation_id) {
+        const existing = syncingConversations.get(conversation_id);
+
+        if (existing) {
+            const elapsed = Date.now() - existing.startTime;
+
+            // 如果锁未释放且未超时，拒绝新的同步
+            if (!existing.released && elapsed < 5 * 60 * 1000) {
+                logToCollector('[SYNC_LOCK] Rejected - lock active', {
+                    conversation_id,
+                    lockId: existing.lockId,
+                    elapsed: Math.round(elapsed / 1000),
+                    completed: existing.completed
+                });
+                return {
+                    success: false,
+                    reason: 'sync_in_progress',
+                    elapsed: Math.round(elapsed / 1000),
+                    completed: existing.completed
+                };
+            }
+
+            // 超时或已释放，强制清理
+            logToCollector('[SYNC_LOCK] Force cleaning stale lock', {
+                conversation_id,
+                elapsed: Math.round(elapsed / 1000)
+            });
+        }
+
+        // 生成唯一的锁 ID
+        const lockId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        const newLock = {
+            lockId,
+            startTime: Date.now(),
+            completed: false,
+            released: false,
+            messageCount: 0
+        };
+
+        syncingConversations.set(conversation_id, newLock);
+
+        logToCollector('[SYNC_LOCK] Acquired', {
+            conversation_id,
+            lockId
+        });
+
+        return { success: true, lock: newLock };
+    },
+
+    // 设置消息数量（用于日志）
+    setMessageCount(conversation_id, count) {
+        const lock = syncingConversations.get(conversation_id);
+        if (lock) {
+            lock.messageCount = count;
+        }
+    },
+
+    // 检查是否应该阻止发送 - 核心方法
+    // 只要有活跃的锁（未释放），就阻止发送
+    shouldBlockSend(conversation_id) {
+        const lock = syncingConversations.get(conversation_id);
+
+        if (!lock) {
+            return { block: false, reason: 'no_lock' };
+        }
+
+        if (lock.released) {
+            return { block: false, reason: 'lock_released' };
+        }
+
+        // 有活跃的锁，阻止发送
+        const elapsed = Date.now() - lock.startTime;
+        return {
+            block: true,
+            reason: lock.completed ? 'sync_completed_waiting' : 'sync_in_progress',
+            elapsed: Math.round(elapsed / 1000),
+            lockId: lock.lockId
+        };
+    },
+
+    // 标记完成并安排释放
+    markComplete(conversation_id, delayMs = 20000) {
+        const lock = syncingConversations.get(conversation_id);
+        if (!lock) return;
+
+        lock.completed = true;
+        lock.completedAt = Date.now();
+
+        const lockId = lock.lockId;
+
+        logToCollector('[SYNC_LOCK] Marked complete', {
+            conversation_id,
+            lockId,
+            messageCount: lock.messageCount,
+            willReleaseIn: delayMs
+        });
+
+        // 延迟释放
+        setTimeout(() => {
+            const currentLock = syncingConversations.get(conversation_id);
+            if (currentLock && currentLock.lockId === lockId && !currentLock.released) {
+                currentLock.released = true;
+                logToCollector('[SYNC_LOCK] Released', { conversation_id, lockId });
+
+                // 再过10秒后完全删除
+                setTimeout(() => {
+                    const stillThere = syncingConversations.get(conversation_id);
+                    if (stillThere && stillThere.lockId === lockId) {
+                        syncingConversations.delete(conversation_id);
+                        logToCollector('[SYNC_LOCK] Deleted', { conversation_id, lockId });
+                    }
+                }, 10000);
+            }
+        }, delayMs);
+    },
+
+    // 强制释放锁
+    forceRelease(conversation_id) {
+        const lock = syncingConversations.get(conversation_id);
+        if (lock) {
+            lock.released = true;
+            syncingConversations.delete(conversation_id);
+            logToCollector('[SYNC_LOCK] Force released', { conversation_id, lockId: lock.lockId });
+        }
+    },
+
+    // 获取锁状态（调试用）
+    getStatus(conversation_id) {
+        const lock = syncingConversations.get(conversation_id);
+        if (!lock) return null;
+        return {
+            lockId: lock.lockId,
+            startTime: lock.startTime,
+            elapsed: Date.now() - lock.startTime,
+            completed: lock.completed,
+            released: lock.released,
+            messageCount: lock.messageCount
+        };
+    },
+
+    // 获取所有活跃锁（调试用）
+    getAllLocks() {
+        const result = {};
+        for (const [convId, lock] of syncingConversations) {
+            result[convId] = this.getStatus(convId);
+        }
+        return result;
+    }
+};
+
 global.logToCollector = logToCollector; // 需要的话其他文件也能用
 
 // 进程启动时就落一条，告诉你日志实际写到哪
@@ -248,6 +404,39 @@ async function postWithRetry(url, data, headers = {}, tries = 2) {
             await new Promise(r => setTimeout(r, transient ? 400 : backoff));
             backoff = Math.min(4000, backoff * 2);
         }
+    }
+}
+
+async function markMessageAsFailed(account_id, conversation_id, message_id, errorReason) {
+    try {
+        logToCollector('[CW_MSG_FAILED]', {
+            account_id,
+            conversation_id,
+            message_id,
+            error: errorReason
+        });
+
+        if (conversation_id && account_id) {
+            try {
+                await cw.createOutgoingMessage({
+                    account_id,
+                    conversation_id,
+                    content: `⚠️ 消息发送失败: ${errorReason}`,
+                    private: true,
+                    content_attributes: {
+                        message_type: 'activity',
+                        is_error: true
+                    }
+                });
+            } catch (e) {
+                console.error('[markMessageAsFailed] Failed to create error note:', e.message);
+            }
+        }
+
+        return true;
+    } catch (e) {
+        console.error('[markMessageAsFailed] Error:', e.message);
+        return false;
     }
 }
 
@@ -1110,14 +1299,22 @@ app.post('/sync-messages', async (req, res) => {
         // 9. 按时间顺序排序
         toSync.sort((a, b) => a.timestamp - b.timestamp);
 
-        // 设置同步锁
-        const syncLock = {
-            startTime: Date.now(),
-            msgIds: new Set(),
-            completed: false  // ★★★ 新增：同步完成标志 ★★★
-        };
-        syncingConversations.set(conversation_id, syncLock);
-        logToCollector('[SYNC] Lock set', { conversation_id });
+        // 【Bug 3 修复】使用 syncLockManager 设置同步锁
+        const lockResult = syncLockManager.acquireLock(conversation_id);
+        if (!lockResult.success) {
+            logToCollector('[SYNC] Rejected - sync already in progress', {
+                conversation_id,
+                reason: lockResult.reason,
+                elapsed: lockResult.elapsed
+            });
+            return res.status(429).json({
+                ok: false,
+                error: '同步正在进行中，请稍后再试',
+                retryAfter: Math.max(30 - (lockResult.elapsed || 0), 10)
+            });
+        }
+        const syncLock = lockResult.lock;
+        logToCollector('[SYNC] Lock acquired', { conversation_id, lockId: syncLock.lockId });
 
         let syncResults = [];
         let successCount = 0;
@@ -1131,17 +1328,7 @@ app.post('/sync-messages', async (req, res) => {
                 batchSize
             });
 
-            // ========== 关键修复：在批量创建前，将所有消息添加到同步锁 ==========
-            // 这样 webhook 处理器会跳过这些消息，避免转发回 WhatsApp
-            for (const waMsg of toSync) {
-                const msgKey = `${waMsg.body || ''}`.substring(0, 100);
-                syncLock.msgIds.add(msgKey);
-                // 同时添加 source_id 作为备用检查
-                if (waMsg.id) {
-                    syncLock.msgIds.add(waMsg.id);
-                }
-            }
-            logToCollector('[SYNC] Added messages to sync lock', { count: syncLock.msgIds.size });
+            syncLockManager.setMessageCount(conversation_id, toSync.length);
 
             // 预处理消息：下载媒体文件
             const preparedMessages = [];
@@ -1285,17 +1472,8 @@ app.post('/sync-messages', async (req, res) => {
             skipped: skippedCount
         });
 
-        // ★★★ 关键修复：同步完成后立即标记完成，缩短锁保留时间 ★★★
-        const currentLock = syncingConversations.get(conversation_id);
-        if (currentLock) {
-            currentLock.completed = true;  // 标记同步已完成
-        }
-
-        // 延迟释放同步锁（只需保留足够时间过滤掉同步创建的消息的 webhook）
-        setTimeout(() => {
-            syncingConversations.delete(conversation_id);
-            logToCollector('[SYNC] Lock released', { conversation_id });
-        }, 10000);  // ★★★ 缩短到 10 秒 ★★★
+        // 【v3】同步完成后等待 25 秒再释放锁，确保所有 webhook 都被阻止
+        syncLockManager.markComplete(conversation_id, 20000);
 
         res.json({
             ok: true,
@@ -1314,7 +1492,8 @@ app.post('/sync-messages', async (req, res) => {
 
     } catch (e) {
         if (typeof conversation_id !== 'undefined') {
-            syncingConversations.delete(conversation_id);
+            // 【Bug 3 修复】使用 syncLockManager 强制释放锁
+            syncLockManager.forceRelease(conversation_id);
         }
         logToCollector('[SYNC] Error', { error: e?.message, stack: e?.stack });
         res.status(500).json({ ok: false, error: e?.message });
@@ -1784,6 +1963,7 @@ app.post('/chatwoot/webhook', async (req, res) => {
 
         const account_id = conversation.account_id || CHATWOOT_ACCOUNT_ID;
         const conversation_id = conversation.id || message.conversation_id;
+        const message_id = message.id;  // 【Bug 1 修复】保存消息 ID 用于失败标记
 // —— 去重：同一 message 在 created/updated/重试场景只发一次 —— //
         const msgId = message.id || message.source_id || message.message_id;
         const stamp = message.updated_at || message.created_at || Date.now();
@@ -1794,35 +1974,17 @@ app.post('/chatwoot/webhook', async (req, res) => {
             await redis.set(deKey, '1');
             await redis.expire(deKey, 300); // 5 分钟窗口
         }
-        const syncLock = syncingConversations.get(conversation_id);
-        if (syncLock) {
-            const content = (message.content || '').substring(0, 100);
-            const sourceId = message.source_id || '';
 
-            // ★★★ 关键修复：只跳过同步的消息，不跳过用户新发送的消息 ★★★
-            // 检查是否是同步的消息（通过内容或 source_id）
-            if (syncLock.msgIds.has(content)) {
-                console.log(`[CW_WEBHOOK] Skip synced message (content): "${content.substring(0, 30)}..."`);
-                return SKIP('synced message (content)');
-            }
-            if (sourceId && syncLock.msgIds.has(sourceId)) {
-                console.log(`[CW_WEBHOOK] Skip synced message (source_id): ${sourceId}`);
-                return SKIP('synced message (source_id)');
-            }
-
-            // ★★★ 修复：不再无条件跳过所有消息 ★★★
-            // 如果消息不在同步列表中，说明是用户新发送的，应该正常转发
-            // 只有当同步正在进行中（尚未完成）时，才等待
-            if (!syncLock.completed) {
-                const syncElapsed = Date.now() - syncLock.startTime;
-                // 只在同步的前 5 秒等待，之后允许新消息通过
-                if (syncElapsed < 5000) {
-                    console.log(`[CW_WEBHOOK] Sync in progress, waiting... (${Math.round(syncElapsed/1000)}s elapsed)`);
-                    return SKIP('sync starting');
-                }
-            }
-            // 消息不在同步列表中，允许正常发送
-            console.log(`[CW_WEBHOOK] Message not in sync list, allowing through`);
+        // 【v3】使用 shouldBlockSend - 同步进行中时完全阻止所有发送
+        const blockCheck = syncLockManager.shouldBlockSend(conversation_id);
+        if (blockCheck.block) {
+            logToCollector('[CW_WEBHOOK] Blocked by sync lock', {
+                conversation_id,
+                reason: blockCheck.reason,
+                elapsed: blockCheck.elapsed,
+                lockId: blockCheck.lockId
+            });
+            return SKIP(`sync_lock: ${blockCheck.reason}`);
         }
 
         if (!WA_DEFAULT_SESSION || !WA_BRIDGE_URL) {
@@ -1950,7 +2112,8 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     session: finalSession,
                     to: to || 'none',
                     to_lid: to_lid || 'none',
-                    count: mediaList.length
+                    count: mediaList.length,
+                    message_id
                 });
 
                 const payload = {
@@ -1971,28 +2134,59 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     payload.attachments = mediaList;
                 }
 
-                // ===== 关键修改：先返回成功，异步发送 =====
-                // 这样 Chatwoot 不会因为超时显示红色失败
-                res.json({ok: true, queued: true, mediaCount: mediaList.length});
+                // 【Bug 1 修复】同步发送，等待结果
+                try {
+                    const result = await postWithRetry(`${WA_BRIDGE_URL}/send/media`, payload, headers);
 
-                // 异步发送
-                setImmediate(async () => {
-                    try {
-                        const result = await postWithRetry(`${WA_BRIDGE_URL}/send/media`, payload, headers);
-                        logToCollector('[CW->WA] MEDIA_SENT', {
-                            success: result?.data?.success,
-                            total: result?.data?.total,
-                            methods: result?.data?.results?.map(r => r.method)
+                    const success = result?.ok || result?.success;
+                    const failedItems = (result?.results || []).filter(r => !r.ok);
+
+                    logToCollector('[CW->WA] MEDIA_RESULT', {
+                        success,
+                        total: result?.total,
+                        failed: failedItems.length,
+                        message_id
+                    });
+
+                    if (!success || failedItems.length > 0) {
+                        const errorMsg = failedItems.map(f => f.error).join('; ') || 'media send failed';
+                        await markMessageAsFailed(account_id, conversation_id, message_id, errorMsg);
+                        return res.json({
+                            ok: false,
+                            error: errorMsg,
+                            message_id,
+                            failed_items: failedItems
                         });
-                    } catch (err) {
-                        console.error('[CW->WA] MEDIA_ERROR', err?.message);
-                        logToCollector('[CW->WA] MEDIA_ERROR', {error: err?.message});
                     }
-                });
 
-                return;  // 已响应
+                    return res.json({
+                        ok: true,
+                        sent: true,
+                        mediaCount: mediaList.length,
+                        message_id
+                    });
+
+                } catch (err) {
+                    const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
+                    console.error('[CW->WA] MEDIA_ERROR', errorMsg);
+                    logToCollector('[CW->WA] MEDIA_ERROR', {
+                        error: errorMsg,
+                        message_id
+                    });
+
+                    await markMessageAsFailed(account_id, conversation_id, message_id, errorMsg);
+
+                    return res.json({
+                        ok: false,
+                        error: errorMsg,
+                        message_id
+                    });
+                }
             }
-        } else if (text && text.trim()) {
+        }
+
+        // === 发送纯文本 ===
+        if (text && text.trim()) {
             const { sessionId: finalSession, to, to_lid } = await resolveWaTarget({
                 redis,
                 conversation_id: conversation.id || conversation.conversation_id,
@@ -2010,34 +2204,85 @@ app.post('/chatwoot/webhook', async (req, res) => {
                 session: finalSession,
                 to: to || 'none',
                 to_lid: to_lid || 'none',
-                len: text.length
+                len: text.length,
+                message_id
             });
 
-            // 先返回成功
-            res.json({ ok: true, queued: true });
+            // 【Bug 1 修复】同步发送，等待结果
+            try {
+                const result = await postWithRetry(
+                    `${WA_BRIDGE_URL}/send/text`,
+                    { sessionId: finalSession, to: to || '', to_lid: to_lid || '', text },
+                    headers
+                );
 
-            // 异步发送
-            setImmediate(async () => {
-                try {
-                    await postWithRetry(
-                        `${WA_BRIDGE_URL}/send/text`,
-                        { sessionId: finalSession, to: to || '', to_lid: to_lid || '', text },
-                        headers
-                    );
-                    logToCollector('[CW->WA] TEXT_SENT', { len: text.length });
-                } catch (err) {
-                    console.error('[CW->WA] TEXT_ERROR', err?.message);
+                const success = result?.ok;
+
+                logToCollector('[CW->WA] TEXT_RESULT', {
+                    success,
+                    msgId: result?.msgId,
+                    message_id
+                });
+
+                if (!success) {
+                    const errorMsg = result?.error || 'text send failed';
+                    await markMessageAsFailed(account_id, conversation_id, message_id, errorMsg);
+                    return res.json({
+                        ok: false,
+                        error: errorMsg,
+                        message_id
+                    });
                 }
-            });
 
-            return;
+                return res.json({
+                    ok: true,
+                    sent: true,
+                    message_id,
+                    waMessageId: result?.msgId
+                });
+
+            } catch (err) {
+                const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
+                console.error('[CW->WA] TEXT_ERROR', errorMsg);
+                logToCollector('[CW->WA] TEXT_ERROR', {
+                    error: errorMsg,
+                    message_id
+                });
+
+                await markMessageAsFailed(account_id, conversation_id, message_id, errorMsg);
+
+                return res.json({
+                    ok: false,
+                    error: errorMsg,
+                    message_id
+                });
+            }
         }
 
-        return res.json({ ok: true });
+        return res.json({ ok: true, skipped: 'no content' });
     } catch (err) {
         console.error('[WEBHOOK_ERROR]', err.response?.data || err.message);
         return res.status(500).json({ok: false, error: err.message, bridge: err.response?.data});
     }
+});
+
+// ===== 【调试端点】同步锁状态查询和强制释放 =====
+app.get('/sync-lock/:conversation_id', (req, res) => {
+    const { conversation_id } = req.params;
+    const status = syncLockManager.getStatus(Number(conversation_id));
+    res.json({ ok: true, conversation_id: Number(conversation_id), lock: status });
+});
+
+// 查看所有活跃的锁
+app.get('/sync-locks', (req, res) => {
+    const allLocks = syncLockManager.getAllLocks();
+    res.json({ ok: true, locks: allLocks, count: Object.keys(allLocks).length });
+});
+
+app.delete('/sync-lock/:conversation_id', (req, res) => {
+    const { conversation_id } = req.params;
+    syncLockManager.forceRelease(Number(conversation_id));
+    res.json({ ok: true, released: true });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
