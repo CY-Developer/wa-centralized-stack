@@ -821,14 +821,77 @@ async function initSessionViaAdsPower(sessionId){
                     chatId: chat?.id?._serialized || ''
                 };
 
-                // 媒体处理（带5秒超时保护）
+                // 媒体处理（API + DOM提取备选）
                 if (message.hasMedia === true && typeof message.downloadMedia === 'function') {
                     try {
-                        const mediaPromise = message.downloadMedia();
-                        const timeoutPromise = new Promise((_, reject) =>
-                            setTimeout(() => reject(new Error('timeout')), 5000)
-                        );
-                        const media = await Promise.race([mediaPromise, timeoutPromise]);
+                        // ===== 第一次尝试 API 下载 =====
+                        let media = null;
+                        try {
+                            const mediaPromise = message.downloadMedia();
+                            const timeoutPromise = new Promise((_, reject) =>
+                                setTimeout(() => reject(new Error('timeout')), 5000)
+                            );
+                            media = await Promise.race([mediaPromise, timeoutPromise]);
+                        } catch (e1) {
+                            // API 失败
+                        }
+
+                        // ===== 如果 API 失败，从 DOM 提取 =====
+                        if (!media?.data && (message.type === 'image' || message.type === 'sticker')) {
+                            console.log(`[${sessionId}] API failed, extracting from DOM...`);
+
+                            try {
+                                const client = sessions[sessionId]?.client;
+                                if (client?.pupPage) {
+                                    const extracted = await client.pupPage.evaluate(async (msgId) => {
+                                        const msgEl = document.querySelector(`[data-id="${msgId}"]`);
+                                        if (!msgEl) return { error: 'msg_not_found' };
+
+                                        // 检查下载按钮
+                                        const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
+                                            || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
+
+                                        if (downloadBtn) {
+                                            downloadBtn.click();
+                                            await new Promise(r => setTimeout(r, 5000));
+                                        }
+
+                                        // 提取图片
+                                        const img = msgEl.querySelector('img[src^="blob:"]')
+                                            || msgEl.querySelector('img[draggable="false"]');
+
+                                        if (img?.src?.startsWith('blob:')) {
+                                            try {
+                                                const response = await fetch(img.src);
+                                                const blob = await response.blob();
+                                                return new Promise((resolve) => {
+                                                    const reader = new FileReader();
+                                                    reader.onloadend = () => {
+                                                        const base64 = reader.result;
+                                                        const matches = base64.match(/^data:(.+);base64,(.+)$/);
+                                                        if (matches) {
+                                                            resolve({ mimetype: matches[1], data: matches[2] });
+                                                        } else {
+                                                            resolve({ error: 'invalid_base64' });
+                                                        }
+                                                    };
+                                                    reader.readAsDataURL(blob);
+                                                });
+                                            } catch (e) {
+                                                return { error: 'blob_fetch_failed' };
+                                            }
+                                        }
+                                        return { error: 'no_image_src' };
+                                    }, message.id._serialized);
+
+                                    if (extracted?.data) {
+                                        media = extracted;
+                                        console.log(`[${sessionId}] DOM extraction OK`);
+                                    }
+                                }
+                            } catch (_) {}
+                        }
+
                         if (media && media.mimetype && media.data) {
                             payload.attachment = {
                                 data_url: `data:${media.mimetype};base64,${media.data}`,
@@ -836,9 +899,11 @@ async function initSessionViaAdsPower(sessionId){
                                 name: media.filename || undefined
                             };
                             console.log(`[${sessionId}] media OK: ${media.mimetype}, ${media.data.length} bytes`);
+                        } else {
+                            console.log(`[${sessionId}] media unavailable`);
                         }
                     } catch (mediaErr) {
-                        console.log(`[${sessionId}] media skip: ${mediaErr?.message}`);
+                        console.log(`[${sessionId}] media error: ${mediaErr?.message}`);
                     }
                 }
 
@@ -1343,7 +1408,129 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
                 if (msg.hasMedia || MEDIA_TYPES.has(msg.type)) {
                     try {
-                        const media = await msg.downloadMedia();
+                        // ===== 第一次尝试用 API 下载 =====
+                        let media = await msg.downloadMedia().catch(() => null);
+
+                        // ===== 如果 API 失败，从 DOM 提取媒体 =====
+                        if (!media?.data) {
+                            console.log(`[messages-sync] API failed, extracting from DOM for ${idSer}...`);
+
+                            try {
+                                const extracted = await session.client.pupPage.evaluate(async (msgId, msgType) => {
+                                    // 查找消息元素
+                                    let msgEl = document.querySelector(`[data-id="${msgId}"]`);
+
+                                    if (!msgEl) {
+                                        // 滚动查找
+                                        const container = document.querySelector('[data-testid="conversation-panel-messages"]')
+                                            || document.querySelector('._ajyl');
+                                        if (container) {
+                                            container.scrollTop = 0;
+                                            await new Promise(r => setTimeout(r, 500));
+                                            msgEl = document.querySelector(`[data-id="${msgId}"]`);
+                                        }
+                                    }
+
+                                    if (!msgEl) return { error: 'msg_not_found' };
+
+                                    // 滚动到消息
+                                    msgEl.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                    await new Promise(r => setTimeout(r, 300));
+
+                                    // 检查是否有下载按钮（未下载状态）
+                                    const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
+                                        || msgEl.querySelector('[data-icon="audio-download"]')
+                                        || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
+
+                                    if (downloadBtn) {
+                                        // 点击下载
+                                        downloadBtn.click();
+                                        // 等待下载完成
+                                        await new Promise(r => setTimeout(r, 6000));
+                                    }
+
+                                    // ===== 提取图片数据 =====
+                                    if (msgType === 'image' || msgType === 'sticker') {
+                                        // 查找已加载的图片
+                                        const img = msgEl.querySelector('img[src^="blob:"]')
+                                            || msgEl.querySelector('img[src*="base64"]')
+                                            || msgEl.querySelector('[data-testid="media-canvas"] img')
+                                            || msgEl.querySelector('img[draggable="false"]');
+
+                                        if (img && img.src) {
+                                            if (img.src.startsWith('blob:')) {
+                                                // blob URL 转 base64
+                                                try {
+                                                    const response = await fetch(img.src);
+                                                    const blob = await response.blob();
+                                                    return new Promise((resolve) => {
+                                                        const reader = new FileReader();
+                                                        reader.onloadend = () => {
+                                                            const base64 = reader.result;
+                                                            const matches = base64.match(/^data:(.+);base64,(.+)$/);
+                                                            if (matches) {
+                                                                resolve({
+                                                                    mimetype: matches[1],
+                                                                    data: matches[2]
+                                                                });
+                                                            } else {
+                                                                resolve({ error: 'invalid_base64' });
+                                                            }
+                                                        };
+                                                        reader.onerror = () => resolve({ error: 'reader_error' });
+                                                        reader.readAsDataURL(blob);
+                                                    });
+                                                } catch (e) {
+                                                    return { error: 'blob_fetch_failed: ' + e.message };
+                                                }
+                                            } else if (img.src.startsWith('data:')) {
+                                                // 已经是 base64
+                                                const matches = img.src.match(/^data:(.+);base64,(.+)$/);
+                                                if (matches) {
+                                                    return { mimetype: matches[1], data: matches[2] };
+                                                }
+                                            }
+                                        }
+
+                                        // 尝试从 canvas 获取
+                                        const canvas = msgEl.querySelector('canvas');
+                                        if (canvas) {
+                                            try {
+                                                const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+                                                const matches = dataUrl.match(/^data:(.+);base64,(.+)$/);
+                                                if (matches) {
+                                                    return { mimetype: matches[1], data: matches[2] };
+                                                }
+                                            } catch (e) {}
+                                        }
+
+                                        return { error: 'image_not_found' };
+                                    }
+
+                                    // ===== 视频/音频暂时跳过 DOM 提取 =====
+                                    return { error: 'type_not_supported_for_dom_extract' };
+
+                                }, msg.id._serialized, msg.type);
+
+                                if (extracted?.data && extracted?.mimetype) {
+                                    media = {
+                                        mimetype: extracted.mimetype,
+                                        data: extracted.data,
+                                        filename: null
+                                    };
+                                    console.log(`[messages-sync] DOM extraction OK: ${extracted.mimetype}`);
+                                } else {
+                                    console.log(`[messages-sync] DOM extraction failed: ${extracted?.error || 'unknown'}`);
+
+                                    // 最后再尝试一次 API
+                                    await new Promise(r => setTimeout(r, 2000));
+                                    media = await msg.downloadMedia().catch(() => null);
+                                }
+                            } catch (extractErr) {
+                                console.log(`[messages-sync] Extract error: ${extractErr?.message}`);
+                            }
+                        }
+
                         if (media?.data) {
                             mediaCount++;
 
@@ -1360,10 +1547,14 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                             };
 
                             console.log(`[messages-sync] Media OK: ${idSer}, size=${item.media.bytes}`);
+                        } else {
+                            mediaErrorCount++;
+                            console.log(`[messages-sync] Media unavailable for ${idSer}`);
+                            item.media = { error: 'media_not_available' };
                         }
                     } catch (e) {
                         mediaErrorCount++;
-                        console.log(`[messages-sync] Media download failed for ${idSer}:`, e?.message);
+                        console.log(`[messages-sync] Media error for ${idSer}:`, e?.message);
                         item.media = { error: e?.message };
                     }
                 }

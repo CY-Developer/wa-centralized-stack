@@ -241,8 +241,8 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
     return match ? match[1] : '';
   };
 
-  // 1. 优先用rawPhone，空则直接替换为@lid纯数字
-  const finalPhone = rawPhone || getLidDigits(messageId);
+  // 1. 优先用rawPhone，其次用rawPhone_lid，最后从messageId提取
+  const finalPhone = rawPhone || rawPhone_lid || getLidDigits(messageId);
   // 归属主键：基于最终电话的纯数字 + sessionId
   const digits = (String(finalPhone || '').match(/\d+/g) || []).join('');
   const identifier = `wa:${sessionId || 'default'}:${digits}`;
@@ -267,15 +267,31 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
     } catch (e) {
       const msg = (e._cw?.error || e._cw?.message || e.message || '').toLowerCase();
       const dupPhone = msg.includes('phone number') && msg.includes('taken');
-      if (!dupPhone) throw e;
-      contact = await createContact({
-        account_id,
-        name: wantName,
-        identifier,
-        phone_e164: undefined,
-        custom_attributes: wantAttrs,
-        withPhone: false
-      });
+      const dupIdentifier = msg.includes('identifier') && msg.includes('taken');
+
+      // 【修复】如果 identifier 已存在（并发创建），重新搜索并返回
+      if (dupIdentifier) {
+        console.log(`[ensureContact] Identifier exists (concurrent), re-searching: ${identifier}`);
+        contact = await searchContact({ account_id, identifier });
+        if (contact) {
+          // 找到了，继续后面的更新逻辑
+        } else {
+          // 仍然找不到，抛出原错误
+          throw e;
+        }
+      } else if (dupPhone) {
+        // 电话号码重复，尝试不带电话创建
+        contact = await createContact({
+          account_id,
+          name: wantName,
+          identifier,
+          phone_e164: undefined,
+          custom_attributes: wantAttrs,
+          withPhone: false
+        });
+      } else {
+        throw e;
+      }
     }
   } else {
     const patch = {};

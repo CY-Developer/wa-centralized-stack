@@ -748,8 +748,18 @@ app.post('/ingest', async (req, res) => {
 
         res.json({ok: true, conversation_id, message_id: created.id || created.message?.id || null});
     } catch (e) {
-        console.error('[INGEST_ERROR]', e?.response?.data || e?.message || e);
-        res.status(500).json({ok: false, error: e?.message || String(e), cw: e?.response?.data});
+        const errMsg = e?.response?.data?.error || e?.response?.data?.message || e?.message || String(e);
+        const errData = e?.response?.data;
+
+        // 如果是"已存在"错误（并发或重复），返回200避免重试
+        if (/identifier.*already.*taken|already.*exists|duplicate/i.test(errMsg) ||
+            /identifier.*already.*taken|already.*exists|duplicate/i.test(JSON.stringify(errData || {}))) {
+            console.log('[INGEST] Already exists (concurrent/duplicate), skipping:', errMsg);
+            return res.json({ ok: true, skipped: 'duplicate', message: 'Already exists' });
+        }
+
+        console.error('[INGEST_ERROR]', errData || errMsg);
+        res.status(500).json({ok: false, error: errMsg, cw: errData});
     }
 });
 app.post('/message-status', async (req, res) => {
@@ -876,8 +886,18 @@ app.post('/ingest-outgoing', async (req, res) => {
         console.log(`[INGEST_OUT] Created: ${created?.id || 'unknown'}`);
         res.json({ ok: true, conversation_id, message_id: created?.id });
     } catch (e) {
-        console.error('[INGEST_OUT_ERROR]', e?.message);
-        res.status(500).json({ ok: false, error: e?.message });
+        const errMsg = e?.response?.data?.error || e?.response?.data?.message || e?.message || String(e);
+        const errData = e?.response?.data;
+
+        // 如果是"已存在"错误（并发或重复），返回200避免重试
+        if (/identifier.*already.*taken|already.*exists|duplicate/i.test(errMsg) ||
+            /identifier.*already.*taken|already.*exists|duplicate/i.test(JSON.stringify(errData || {}))) {
+            console.log('[INGEST_OUT] Already exists (concurrent/duplicate), skipping:', errMsg);
+            return res.json({ ok: true, skipped: 'duplicate', message: 'Already exists' });
+        }
+
+        console.error('[INGEST_OUT_ERROR]', errData || errMsg);
+        res.status(500).json({ ok: false, error: errMsg, cw: errData });
     }
 });
 
@@ -1472,8 +1492,8 @@ app.post('/sync-messages', async (req, res) => {
             skipped: skippedCount
         });
 
-        // 【v3】同步完成后等待 25 秒再释放锁，确保所有 webhook 都被阻止
-        syncLockManager.markComplete(conversation_id, 20000);
+        // 【v3】同步完成后等待 30 秒再释放锁，确保所有 webhook 都被阻止
+        syncLockManager.markComplete(conversation_id, 30000);
 
         res.json({
             ok: true,
