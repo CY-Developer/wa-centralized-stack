@@ -2140,7 +2140,8 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     sessionId: finalSession,
                     to: to || '',
                     to_lid: to_lid || '',
-                    caption: message.content || ''
+                    caption: message.content || '',
+                    message_id: message_id  // 用于纳管器去重
                 };
 
                 if (mediaList.length === 1) {

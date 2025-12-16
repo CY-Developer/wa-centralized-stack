@@ -60,10 +60,18 @@ async function postWithRetry(url, data, headers, tries = 6) {
 const sentMessageCache = new Map();
 const SENT_CACHE_TTL = 60000;
 
+// 【新增】发送媒体去重缓存（防止重试导致重复发送）
+const sendMediaCache = new Map();
+const SEND_MEDIA_CACHE_TTL = 300000;  // 5分钟
+
 setInterval(() => {
     const now = Date.now();
     for (const [key, ts] of sentMessageCache.entries()) {
         if (now - ts > SENT_CACHE_TTL) sentMessageCache.delete(key);
+    }
+    // 清理发送媒体缓存
+    for (const [key, data] of sendMediaCache.entries()) {
+        if (now - data.ts > SEND_MEDIA_CACHE_TTL) sendMediaCache.delete(key);
     }
 }, 30000);
 
@@ -1660,9 +1668,38 @@ app.post('/send/media', async (req, res) => {
     const bad = (code, msg)  => ok(code, { ok: false, error: msg });
 
     try {
-        const { sessionId, to, to_lid, url, b64, mimetype, filename, caption, attachments } = req.body || {};
+        const { sessionId, to, to_lid, url, b64, mimetype, filename, caption, attachments, message_id } = req.body || {};
 
-        console.log(`[send/media] START: to=${to || 'none'}, to_lid=${to_lid || 'none'}`);
+        console.log(`[send/media] START: to=${to || 'none'}, to_lid=${to_lid || 'none'}, msg_id=${message_id || 'none'}`);
+
+        // 【去重检查】如果有 message_id
+        if (message_id) {
+            const cached = sendMediaCache.get(message_id);
+            if (cached) {
+                // 如果已经有结果，直接返回
+                if (cached.result) {
+                    console.log(`[send/media] DEDUP: message_id=${message_id} already completed, returning cached result`);
+                    return ok(200, cached.result);
+                }
+                // 如果正在处理中，等待完成（最多等30秒）
+                if (cached.processing) {
+                    console.log(`[send/media] DEDUP: message_id=${message_id} is processing, waiting...`);
+                    for (let i = 0; i < 60; i++) {
+                        await new Promise(r => setTimeout(r, 500));
+                        const updated = sendMediaCache.get(message_id);
+                        if (updated?.result) {
+                            console.log(`[send/media] DEDUP: message_id=${message_id} completed while waiting`);
+                            return ok(200, updated.result);
+                        }
+                    }
+                    // 等待超时，返回处理中状态
+                    console.log(`[send/media] DEDUP: message_id=${message_id} wait timeout`);
+                    return ok(200, { ok: true, pending: true, message: 'Request is being processed' });
+                }
+            }
+            // 标记为"处理中"
+            sendMediaCache.set(message_id, { ts: Date.now(), processing: true, result: null });
+        }
 
         if (!sessionId) return bad(400, 'missing sessionId');
         if (!to && !to_lid) return bad(400, 'missing to or to_lid');
@@ -1828,15 +1865,28 @@ app.post('/send/media', async (req, res) => {
         const successCount = results.filter(r => r.ok).length;
         console.log(`[send/media] DONE: ${successCount}/${mediaItems.length}`);
 
-        return ok(200, {
+        const finalResult = {
             ok: successCount > 0,
             to: chat.id._serialized,
             results,
             total: mediaItems.length,
             success: successCount
-        });
+        };
+
+        // 【去重缓存】保存成功结果，防止重试时重复发送
+        if (message_id) {
+            sendMediaCache.set(message_id, { ts: Date.now(), processing: false, result: finalResult });
+            console.log(`[send/media] Cached result for message_id=${message_id}`);
+        }
+
+        return ok(200, finalResult);
     } catch (e) {
         console.error('[send/media] ERROR:', e);
+        // 【修复】失败时清除处理中标记，允许重试
+        const message_id = req.body?.message_id;
+        if (message_id) {
+            sendMediaCache.delete(message_id);
+        }
         return res.status(500).json({ ok: false, error: e?.message });
     }
 });
