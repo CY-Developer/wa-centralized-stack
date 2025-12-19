@@ -12,10 +12,37 @@ const axios = require('axios');
 const COLLECTOR_BASE  = process.env.COLLECTOR_BASE || `http://127.0.0.1:${process.env.COLLECTOR_PORT || 7001}`;
 const COLLECTOR_TOKEN = process.env.COLLECTOR_INGEST_TOKEN || process.env.API_TOKEN || '';
 
-const SESSIONS = (process.env.SESSIONS || '')
+const { sessionManager, SESSION_STATUS } = require('./session-manager');
+
+// SESSIONS 现在由 SessionManager 动态管理
+// 保留解析逻辑用于后备
+const SESSIONS_ENV = (process.env.SESSIONS || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
+
+// 创建 sessions Proxy 以保持向后兼容
+let _sessionsStore = {};
+const sessions = new Proxy(_sessionsStore, {
+    get(target, prop) {
+        // 优先从 sessionManager 获取
+        const smSession = sessionManager.getSession(prop);
+        if (smSession) {
+            return {
+                client: smSession.client,
+                status: smSession.sessionStatus,
+                chats: smSession.chats || [],
+                refreshTimer: target[prop]?.refreshTimer
+            };
+        }
+        return target[prop];
+    },
+    set(target, prop, value) {
+        target[prop] = value;
+        return true;
+    }
+});
+
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 function rnd(a,b){ return Math.floor(Math.random()*(b-a+1))+a; }
 
@@ -92,7 +119,7 @@ function parseRecipient(to) {
     const digits = raw.replace(/[^\d]/g, '');
     return digits ? { kind: 'user', digits, jid: '' } : { kind: 'invalid', digits: '', jid: '' };
 }
-// 估算“人类打字用时”计划（多段 typing）
+// 估算"人类打字用时"计划（多段 typing）
 function buildTypingSchedule(text, opts={}){
     const t = String(text||'');
     const wpm = Number(opts.wpm || (hasCJK(t) ? 180 : 140)); // CJK 更快（拼音输入）
@@ -106,7 +133,7 @@ function buildTypingSchedule(text, opts={}){
         const seg = Math.min(remain, rnd(1200, 4000));
         plan.push(seg); remain -= seg;
     }
-    // 标点/换行稍作停顿（加一些“犹豫”）
+    // 标点/换行稍作停顿（加一些"犹豫"）
     const hesitation = (t.match(/[.,!?;:，。？！；：\n]/g)||[]).length;
     for(let i=0;i<Math.min(plan.length, hesitation);i++) plan[i]+=rnd(200,600);
     return plan;
@@ -165,18 +192,18 @@ function guessMimeByExt(p){
 }
 function ensureFilenameByMime(name, mime) {
     const extFromMime =
-    mime?.includes('jpeg') ? '.jpg' :
-    mime?.includes('jpg')  ? '.jpg' :
-    mime?.includes('png')  ? '.png' :
-    mime?.includes('webp') ? '.webp' :
-    mime?.includes('gif')  ? '.gif' :
-    mime?.includes('mp4')  ? '.mp4' :
-    mime?.includes('webm') ? '.webm' :
-    mime?.includes('ogg')  ? '.ogg' :
-    mime?.includes('opus') ? '.ogg' :
-    mime?.includes('mp3')  ? '.mp3' :
-    mime?.includes('wav')  ? '.wav' :
-    mime?.includes('pdf')  ? '.pdf' : '';
+        mime?.includes('jpeg') ? '.jpg' :
+            mime?.includes('jpg')  ? '.jpg' :
+                mime?.includes('png')  ? '.png' :
+                    mime?.includes('webp') ? '.webp' :
+                        mime?.includes('gif')  ? '.gif' :
+                            mime?.includes('mp4')  ? '.mp4' :
+                                mime?.includes('webm') ? '.webm' :
+                                    mime?.includes('ogg')  ? '.ogg' :
+                                        mime?.includes('opus') ? '.ogg' :
+                                            mime?.includes('mp3')  ? '.mp3' :
+                                                mime?.includes('wav')  ? '.wav' :
+                                                    mime?.includes('pdf')  ? '.pdf' : '';
 
     const base = (name || 'upload').replace(/\.[a-z0-9]+$/i, '');
     return extFromMime ? `${base}${extFromMime}` : (name || 'upload.bin');
@@ -428,7 +455,7 @@ async function closeExtraWATabs(browser, keepPage) {
         const doClose = async () => {
             const pages = await browser.pages();
             const waPages = pages.filter(p => p.url().includes('web.whatsapp.com'));
-            // 优先保留：传入的 keepPage；若没有，则保留“最近创建的那一个”
+            // 优先保留：传入的 keepPage；若没有，则保留"最近创建的那一个"
             const keeper = keepPage || waPages[waPages.length - 1];
             for (const p of waPages) {
                 if (p !== keeper) {
@@ -466,15 +493,15 @@ async function closeExtraWATabs(browser, keepPage) {
 // AdsPower 连接参数
 const ADS_BASE = process.env.ADSPOWER_BASE || 'http://127.0.0.1:50325';
 const ADS_KEY = process.env.ADSPOWER_API_KEY || '';
-const AUTO_CLICK_USE_HERE = String(process.env.AUTO_CLICK_USE_HERE || '1') === '1'; // 1=自动点“Use here”
+const AUTO_CLICK_USE_HERE = String(process.env.AUTO_CLICK_USE_HERE || '1') === '1'; // 1=自动点"Use here"
 
 
 
 
-// 简单的参数检查
-if (!SESSIONS.length) {
-    console.error('[BOOT] No SESSIONS provided in .env.chatwoot');
-    process.exit(1);
+// SESSIONS 检查（仅警告）
+// ============================================================
+if (!SESSIONS_ENV.length) {
+    console.warn('[BOOT] No SESSIONS in env, will manage all AdsPower profiles');
 }
 async function stopProfile(user_id){
     const headers = ADS_KEY ? {'X-AdsPower-API-Key': ADS_KEY} : {};
@@ -494,8 +521,6 @@ async function startProfile(user_id){
 }
 
 
-// Store clients and their statuses
-const sessions = {};
 // [NEW] 统一获取 chats：优先实时从 webjs 拉，失败时回退到缓存
 async function listChatsLiveOrCache(sessionId) {
     const sess   = sessions[sessionId];
@@ -509,11 +534,15 @@ async function listChatsLiveOrCache(sessionId) {
     return Array.isArray(sess?.chats) ? sess.chats : [];
 }
 
-// Initialize each WhatsApp session
-// 使用 AdsPower 启动并“连接已登录浏览器”，避免扫码
-async function initSessionViaAdsPower(sessionId){
-    // 注意：这里假设 SESSIONS 即为 AdsPower 的 user_id；如果不是，请自行建立映射
+async function initSessionViaAdsPower(config) {
+    // 支持两种调用方式：字符串（向后兼容）或配置对象
+    const sessionId = typeof config === 'string' ? config : config.sessionId;
+    const sessionName = typeof config === 'object' ? config.sessionName : sessionId;
+
+    console.log(`[${sessionId}] Initializing session (name: ${sessionName})...`);
+
     const ws = await startProfile(sessionId);
+
     // 新增：配置 web 版本缓存策略
     const WWEB_CACHE = String(process.env.WWEB_CACHE || 'local').toLowerCase();
     let webVersionCache;
@@ -527,7 +556,7 @@ async function initSessionViaAdsPower(sessionId){
     }
 
     const client = new Client({
-        authStrategy: new NoAuth(),         // 复用 AdsPower 已登录会话，不扫码
+        authStrategy: new NoAuth(),
         puppeteer: {
             browserWSEndpoint: ws,
             headless: false,
@@ -539,11 +568,15 @@ async function initSessionViaAdsPower(sessionId){
                 '--disable-features=AutomationControlled'
             ]
         },
-        webVersionCache,                    // ★ 关键：按 .env.chatwoot 控制缓存策略（none=不落盘）
+        webVersionCache,
         takeoverOnConflict: true,
         takeoverTimeoutMs: 1000
     });
 
+    // 注册到 SessionManager
+    sessionManager.registerSession(sessionId, client);
+
+    // 本地 sessions 也保存一份（向后兼容）
     sessions[sessionId] = {
         client,
         status: 'initializing',
@@ -555,8 +588,7 @@ async function initSessionViaAdsPower(sessionId){
         console.log(`[${sessionId}] QR shown (should be ignored when using AdsPower).`);
     });
 
-// —— 只保留一套 guard & 预加载逻辑 ——
-// 等待真正连接到 WA 后再拉取，避免 getChats 早调用报错
+    // —— 只保留一套 guard & 预加载逻辑 ——
     async function waitConnected(client, sessionId, tries = 12) {
         for (let i = 0; i < tries; i++) {
             const st = await client.getState().catch(() => null);
@@ -570,8 +602,9 @@ async function initSessionViaAdsPower(sessionId){
     async function preloadChatsSafe(client, sessionId) {
         for (let i = 1; i <= 3; i++) {
             try {
-                const chats = await client.getChats();         // 只能用 webjs API
-                sessions[sessionId].chats = chats;             // 写入缓存，后续接口直接用
+                const chats = await client.getChats();
+                sessions[sessionId].chats = chats;
+                sessionManager.updateChats(sessionId, chats);
                 console.log(`[${sessionId}] Preloaded ${chats.length} chats.`);
                 return;
             } catch (e) {
@@ -579,17 +612,17 @@ async function initSessionViaAdsPower(sessionId){
                 await new Promise(r => setTimeout(r, 1200));
             }
         }
-        // 最后再尝试一次，仅日志
         try {
             const chats = await client.getChats();
             sessions[sessionId].chats = chats;
+            sessionManager.updateChats(sessionId, chats);
             console.log(`[${sessionId}] Preloaded ${chats.length} chats.`);
         } catch (e) {
             console.log(`[${sessionId}] preload failed: ${e?.message || e}`);
         }
     }
 
-// 统一的页面守护：自动点“Use here”+ 关掉多余 WA 标签
+    // 统一的页面守护
     const pageGuard = async () => {
         try {
             const page = client.pupPage;
@@ -601,13 +634,13 @@ async function initSessionViaAdsPower(sessionId){
         } catch (_) {}
     };
 
-// loading_screen 阶段：可能会弹“Use here”，先兜底处理一次
     client.on('loading_screen', pageGuard);
 
-// ready：只处理一次 → 设置状态、兜底处理、等待 CONNECTED、再安全预加载
     client.once('ready', async () => {
         sessions[sessionId].status = 'ready';
-        console.log(`[${sessionId}] Client is ready (AdsPower profile).`);
+        sessionManager.updateStatus(sessionId, 'ready');
+        console.log(`[${sessionId}] Client is ready (AdsPower profile: ${sessionName}).`);
+
         await pageGuard();
         try {
             if (client.pupPage) {
@@ -615,33 +648,47 @@ async function initSessionViaAdsPower(sessionId){
                 client.pupPage.setDefaultNavigationTimeout(PROTOCOL_TIMEOUT_MS);
             }
         } catch (_) {}
+
         await waitConnected(client, sessionId);
         await preloadChatsSafe(client, sessionId);
-        // === 追加：后台定时刷新缓存，避免其它接口滞后 ===
+
+        // === 后台定时刷新缓存 ===
         if (sessions[sessionId].refreshTimer) {
             clearInterval(sessions[sessionId].refreshTimer);
             delete sessions[sessionId].refreshTimer;
         }
         sessions[sessionId].refreshTimer = setInterval(async () => {
             try {
-                sessions[sessionId].chats = await listChatsLiveOrCache(sessionId);
+                const chats = await listChatsLiveOrCache(sessionId);
+                sessions[sessionId].chats = chats;
+                sessionManager.updateChats(sessionId, chats);
             } catch (_) {}
         }, 4000);
 
+        // === 新增：收集历史消息用于同步 ===
+        if (String(process.env.SYNC_ON_STARTUP || '1') === '1') {
+            try {
+                await sessionManager.collectHistoryForSync(sessionId, client);
+            } catch (e) {
+                console.warn(`[${sessionId}] History collection failed:`, e.message);
+            }
+        }
     });
 
-// 认证失败、断线重连
     client.on('auth_failure', msg => {
         sessions[sessionId].status = 'auth_failure';
+        sessionManager.updateStatus(sessionId, 'auth_failure');
         console.error(`[${sessionId}] Auth failure: ${msg}`);
     });
 
     client.on('disconnected', async (reason) => {
         sessions[sessionId].status = 'disconnected';
+        sessionManager.updateStatus(sessionId, 'disconnected');
         console.log(`[${sessionId}] Client disconnected: ${reason}`);
-        // 自动重连：重新拿 AdsPower 的 ws 再 init
-        try { await initSessionViaAdsPower(sessionId); }
+
+        try { await initSessionViaAdsPower({ sessionId, sessionName }); }
         catch(e){ console.error(`[${sessionId}] Reconnect failed:`, e?.message || e); }
+
         if (sessions[sessionId]?.refreshTimer) {
             clearInterval(sessions[sessionId].refreshTimer);
             delete sessions[sessionId].refreshTimer;
@@ -663,59 +710,175 @@ async function initSessionViaAdsPower(sessionId){
         } catch (_) {}
     });
 
-    // 我方消息同步
-    // client.on('message_create', async (message) => {
-    //     try {
-    //         if (!message.fromMe) return;
-    //
-    //         const msgId = message.id?._serialized || '';
-    //         if (isSentFromChatwoot(msgId)) return;
-    //
-    //         const toJid = message.to || '';
-    //         if (/@g\.us$/i.test(toJid) || /@broadcast/i.test(toJid)) return;
-    //
-    //         let phone = '', phone_lid = '';
-    //         if (/@c\.us$/i.test(toJid)) {
-    //             phone = toJid.replace(/@.*/, '').replace(/\D/g, '');
-    //         } else if (/@lid$/i.test(toJid)) {
-    //             phone_lid = toJid.replace(/@.*/, '').replace(/\D/g, '');
-    //         }
-    //
-    //         const chat = await message.getChat().catch(() => null);
-    //         const contact = await message.getContact().catch(() => null);
-    //
-    //         console.log(`[${sessionId}] OUTGOING: ${msgId.substring(0, 25)}..., type=${message.type}`);
-    //
-    //         const payload = {
-    //             sessionId, messageId: msgId,
-    //             phone, phone_lid,
-    //             name: contact?.pushname || contact?.name || chat?.name || '',
-    //             text: message.body || '',
-    //             type: message.type || 'chat',
-    //             timestamp: message.timestamp ? (message.timestamp * 1000) : Date.now(),
-    //             to: toJid,
-    //             chatId: chat?.id?._serialized || toJid,
-    //             fromMe: true, direction: 'outgoing'
-    //         };
-    //
-    //         if (message.hasMedia) {
-    //             try {
-    //                 const media = await message.downloadMedia();
-    //                 if (media?.data) {
-    //                     payload.attachment = {
-    //                         data_url: `data:${media.mimetype};base64,${media.data}`,
-    //                         mime: media.mimetype, name: media.filename
-    //                     };
-    //                 }
-    //             } catch (_) {}
-    //         }
-    //
-    //         await postWithRetry(`${COLLECTOR_BASE}/ingest-outgoing`, payload, { 'x-api-token': COLLECTOR_TOKEN }).catch(() => {});
-    //     } catch (e) {
-    //         console.error(`[${sessionId}] message_create error:`, e?.message);
-    //     }
-    // });
 
+    // === 监听 message_create 同步其他设备发送的消息（增强版）===
+    client.on('message_create', async (message) => {
+        try {
+            // 1. 只处理自己发送的消息
+            if (!message.fromMe) return;
+
+            const msgId = message.id?._serialized || '';
+            if (!msgId) return;
+
+            // 2. 检查是否是从 Chatwoot 发送的（避免循环）
+            if (isSentFromChatwoot(msgId)) {
+                // 静默跳过，不打印日志（太频繁）
+                return;
+            }
+
+            // 3. 跳过群组和广播消息
+            const toJid = message.to || '';
+            if (/@g\.us$/i.test(toJid) || /@broadcast/i.test(toJid)) {
+                return;
+            }
+
+            // 4. 提取收件人信息
+            let phone = '', phone_lid = '';
+            if (/@c\.us$/i.test(toJid)) {
+                phone = toJid.replace(/@.*/, '').replace(/\D/g, '');
+            } else if (/@lid$/i.test(toJid)) {
+                phone_lid = toJid.replace(/@.*/, '').replace(/\D/g, '');
+            }
+
+            // 5. 获取聊天和联系人信息
+            const chat = await message.getChat().catch(() => null);
+            const contact = await chat?.getContact().catch(() => null);
+
+            // 如果是 @lid，尝试从 chat 获取真实电话
+            if (phone_lid && !phone && chat?.id?._serialized) {
+                if (/@c\.us$/i.test(chat.id._serialized)) {
+                    phone = chat.id._serialized.replace(/@.*/, '').replace(/\D/g, '');
+                }
+            }
+
+            console.log(`[${sessionId}] OUTGOING (other device): ${msgId.substring(0, 30)}..., type=${message.type}, to=${phone || phone_lid || 'unknown'}`);
+
+            // 6. 构建同步 payload
+            const payload = {
+                sessionId,
+                sessionName: sessionManager.getSessionName(sessionId) || sessionId,  // ★ 新增：动态名称
+                messageId: msgId,
+                phone,
+                phone_lid,
+                name: contact?.pushname || contact?.name || chat?.name || '',
+                text: message.body || '',
+                type: message.type || 'chat',
+                timestamp: message.timestamp ? (message.timestamp * 1000) : Date.now(),
+                to: toJid,
+                chatId: chat?.id?._serialized || toJid,
+                fromMe: true,
+                direction: 'outgoing'
+            };
+
+            // 7. 媒体处理（复用入站消息的逻辑，包括 DOM 提取备选）
+            const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
+            if (message.hasMedia || MEDIA_TYPES.has(message.type)) {
+                try {
+                    let media = null;
+
+                    // 方法1：使用 API 下载
+                    try {
+                        const mediaPromise = message.downloadMedia();
+                        const timeoutPromise = new Promise((_, reject) =>
+                            setTimeout(() => reject(new Error('timeout')), 8000)
+                        );
+                        media = await Promise.race([mediaPromise, timeoutPromise]);
+                    } catch (e1) {
+                        console.log(`[${sessionId}] Media API failed: ${e1?.message}`);
+                    }
+
+                    // 方法2：DOM 提取备选（仅图片/贴纸）
+                    if (!media?.data && (message.type === 'image' || message.type === 'sticker')) {
+                        console.log(`[${sessionId}] Trying DOM extraction for outgoing media...`);
+
+                        try {
+                            const clientRef = sessions[sessionId]?.client;
+                            if (clientRef?.pupPage) {
+                                const extracted = await clientRef.pupPage.evaluate(async (msgId) => {
+                                    const msgEl = document.querySelector(`[data-id="${msgId}"]`);
+                                    if (!msgEl) return { error: 'msg_not_found' };
+
+                                    const img = msgEl.querySelector('img[src^="blob:"]')
+                                        || msgEl.querySelector('img[draggable="false"]');
+
+                                    if (img?.src?.startsWith('blob:')) {
+                                        try {
+                                            const response = await fetch(img.src);
+                                            const blob = await response.blob();
+                                            return new Promise((resolve) => {
+                                                const reader = new FileReader();
+                                                reader.onloadend = () => {
+                                                    const base64 = reader.result;
+                                                    const matches = base64.match(/^data:(.+);base64,(.+)$/);
+                                                    if (matches) {
+                                                        resolve({ mimetype: matches[1], data: matches[2] });
+                                                    } else {
+                                                        resolve({ error: 'invalid_base64' });
+                                                    }
+                                                };
+                                                reader.readAsDataURL(blob);
+                                            });
+                                        } catch (e) {
+                                            return { error: 'blob_fetch_failed' };
+                                        }
+                                    }
+                                    return { error: 'no_image_src' };
+                                }, message.id._serialized);
+
+                                if (extracted?.data) {
+                                    media = extracted;
+                                    console.log(`[${sessionId}] DOM extraction OK for outgoing`);
+                                }
+                            }
+                        } catch (domErr) {
+                            console.log(`[${sessionId}] DOM extraction failed: ${domErr?.message}`);
+                        }
+                    }
+
+                    // 构建附件
+                    if (media && media.mimetype && media.data) {
+                        let filename = media.filename;
+                        if (!filename) {
+                            const ext = media.mimetype?.split('/')[1]?.split(';')[0] || 'bin';
+                            filename = `${message.type || 'file'}_${Date.now()}.${ext}`;
+                        }
+
+                        payload.attachment = {
+                            data_url: `data:${media.mimetype};base64,${media.data}`,
+                            mime: media.mimetype,
+                            filename: filename,
+                            size: media.data.length
+                        };
+
+                        console.log(`[${sessionId}] Media ready: ${media.mimetype}, ${(media.data.length / 1024).toFixed(1)}KB`);
+                    } else {
+                        console.log(`[${sessionId}] Media unavailable for outgoing message`);
+                    }
+
+                } catch (mediaErr) {
+                    console.error(`[${sessionId}] Media processing error:`, mediaErr?.message);
+                }
+            }
+
+            // 8. 发送到 collector
+            try {
+                await postWithRetry(
+                    `${COLLECTOR_BASE}/ingest-outgoing`,
+                    payload,
+                    { 'x-api-token': COLLECTOR_TOKEN }
+                );
+                console.log(`[${sessionId}] Outgoing sync OK: ${msgId.substring(0, 25)}...`);
+            } catch (pushErr) {
+                console.error(`[${sessionId}] Outgoing sync FAIL:`, pushErr?.message);
+            }
+
+        } catch (e) {
+            console.error(`[${sessionId}] message_create error:`, e?.message || e);
+        }
+    });
+
+
+    // 原有的 message 事件处理（入站消息）- 保持不变
     client.on('message', async (message) => {
         try {
             const sess = sessions[sessionId] || (sessions[sessionId] = {});
@@ -735,8 +898,7 @@ async function initSessionViaAdsPower(sessionId){
             }
 
             // 轻量补齐一些常用字段，便于接口直接读取
-            // （不改变 webjs 内部对象结构，仅在缓存上冗余记录）
-            const rec = arr[arr.length - 1]; // 刚 push 的或刚更新的
+            const rec = arr[arr.length - 1];
             rec.__lastMessage = {
                 id: message.id?._serialized || message.id,
                 fromMe: !!message.fromMe,
@@ -748,13 +910,11 @@ async function initSessionViaAdsPower(sessionId){
             if (AUTO_SAVE_MEDIA) {
                 try {
                     const chatIdSer = chat.id?._serialized;
-                    // 这些类型我们认为是“有媒体”的（wweb.js 的 message.hasMedia 也可以先判断）
                     const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
                     if (message.hasMedia || MEDIA_TYPES.has(message.type)) {
                         const media = await message.downloadMedia().catch(()=>null);
                         if (media && media.data) {
                             const saved = saveBase64ToFile(sessionId, chatIdSer, (message.id?._serialized || message.id), media);
-                            // 记一份到最近消息上，方便接口直接拿 URL
                             rec.__lastMessage.media = {
                                 mimetype: saved.mimetype,
                                 fileUrl: saved.fileUrl,
@@ -770,21 +930,17 @@ async function initSessionViaAdsPower(sessionId){
 
             // ===== 区分真实电话(@c.us)和隐私号(@lid) =====
             const fromJidRaw = message.from || '';
-            let phone = '';      // 真实电话
-            let phone_lid = '';  // 隐私号
+            let phone = '';
+            let phone_lid = '';
 
             if (/@c\.us$/i.test(fromJidRaw)) {
-                // 是真实电话
                 phone = fromJidRaw.replace(/@.*/, '').replace(/\D/g, '');
             } else if (/@lid$/i.test(fromJidRaw)) {
-                // 是隐私号
                 phone_lid = fromJidRaw.replace(/@.*/, '').replace(/\D/g, '');
-                // 尝试从 chat.id 获取真实电话
                 if (chat?.id?._serialized && /@c\.us$/i.test(chat.id._serialized)) {
                     phone = chat.id._serialized.replace(/@.*/, '').replace(/\D/g, '');
                 }
             } else {
-                // 未知格式，尝试从 chat.id 获取
                 if (chat?.id?._serialized) {
                     if (/@c\.us$/i.test(chat.id._serialized)) {
                         phone = chat.id._serialized.replace(/@.*/, '').replace(/\D/g, '');
@@ -811,12 +967,13 @@ async function initSessionViaAdsPower(sessionId){
 
             if (isGroup || isStatus) {
                 console.log(`[${sessionId}] skip group/status message: ${message.id?._serialized || message.id}`);
-                return; // 直接丢弃，不转发到 collector
+                return;
             }
-            //数据保障直线通达方法
+
             try {
                 const payload = {
                     sessionId: sessionId,
+                    sessionName: sessionManager.getSessionName(sessionId) || sessionId,  // ★ 新增：动态名称
                     phone: rec.__phone || '',
                     phone_lid: rec.__phone_lid || '',
                     name: rec.__name || '',
@@ -832,7 +989,6 @@ async function initSessionViaAdsPower(sessionId){
                 // 媒体处理（API + DOM提取备选）
                 if (message.hasMedia === true && typeof message.downloadMedia === 'function') {
                     try {
-                        // ===== 第一次尝试 API 下载 =====
                         let media = null;
                         try {
                             const mediaPromise = message.downloadMedia();
@@ -844,18 +1000,16 @@ async function initSessionViaAdsPower(sessionId){
                             // API 失败
                         }
 
-                        // ===== 如果 API 失败，从 DOM 提取 =====
                         if (!media?.data && (message.type === 'image' || message.type === 'sticker')) {
                             console.log(`[${sessionId}] API failed, extracting from DOM...`);
 
                             try {
-                                const client = sessions[sessionId]?.client;
-                                if (client?.pupPage) {
-                                    const extracted = await client.pupPage.evaluate(async (msgId) => {
+                                const clientRef = sessions[sessionId]?.client;
+                                if (clientRef?.pupPage) {
+                                    const extracted = await clientRef.pupPage.evaluate(async (msgId) => {
                                         const msgEl = document.querySelector(`[data-id="${msgId}"]`);
                                         if (!msgEl) return { error: 'msg_not_found' };
 
-                                        // 检查下载按钮
                                         const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
                                             || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
 
@@ -864,7 +1018,6 @@ async function initSessionViaAdsPower(sessionId){
                                             await new Promise(r => setTimeout(r, 5000));
                                         }
 
-                                        // 提取图片
                                         const img = msgEl.querySelector('img[src^="blob:"]')
                                             || msgEl.querySelector('img[draggable="false"]');
 
@@ -915,19 +1068,16 @@ async function initSessionViaAdsPower(sessionId){
                     }
                 }
 
-                // ★ 推送前日志
                 console.log(`[${sessionId}] >>> PUSH: phone=${payload.phone}, text="${(payload.text || '').slice(0, 30)}..."`);
 
                 await postWithRetry(`${COLLECTOR_BASE}/ingest`, payload, { 'x-api-token': COLLECTOR_TOKEN });
 
-                // ★ 推送成功日志
                 console.log(`[${sessionId}] <<< PUSH OK`);
 
             } catch (e) {
                 console.error(`[${sessionId}] <<< PUSH FAIL: ${e?.response?.status || ''} ${e?.message || e}`);
             }
 
-            //（已在 ready 里有周期性刷新，这里再加一次短延迟刷新，让“已读/新来”更快反映到缓存）
             sess.__debounced = sess.__debounced || {};
             clearTimeout(sess.__debounced.msgUpdate);
             sess.__debounced.msgUpdate = setTimeout(async () => {
@@ -941,7 +1091,7 @@ async function initSessionViaAdsPower(sessionId){
         }
     });
 
-// 实时跟踪会话属性变化（unreadCount/lastMessage/timestamp 等）
+    // 实时跟踪会话属性变化
     client.on('chat_update', (chat) => {
         try {
             const sess = sessions[sessionId] || (sessions[sessionId] = {});
@@ -954,6 +1104,7 @@ async function initSessionViaAdsPower(sessionId){
     });
 
     await client.initialize();
+
     setTimeout(() => {
         try {
             const page = sessions[sessionId]?.client?.pupPage;
@@ -967,32 +1118,81 @@ async function initSessionViaAdsPower(sessionId){
             }
         } catch (_) {}
     }, 500);
-    // 初始化后再兜底点一次（如果页面此刻正好停在弹框）
+
     setTimeout(() => {
         const page = sessions[sessionId]?.client?.pupPage;
         if (page) autoTakeover(page, sessionId).catch(()=>{});
     }, 1200);
-
 }
 
-// 启动所有会话（AdsPower）
-(async ()=>{
-    for (const sessionId of SESSIONS){
-        try{
-            await initSessionViaAdsPower(sessionId);
-        }catch(e){
-            console.error(`[${sessionId}] init failed:`, e?.message || e);
+// 重写启动逻辑
+(async () => {
+    try {
+        // 初始化 SessionManager，获取要管理的会话配置
+        const sessionConfigs = await sessionManager.initialize(process.env.SESSIONS);
+
+        // ★ 注册会话初始化函数（用于自动恢复）
+        sessionManager.setInitSessionFunction(initSessionViaAdsPower);
+
+        if (sessionConfigs.length === 0) {
+            console.error('[BOOT] No sessions to manage. Check AdsPower connection or SESSIONS env.');
+            process.exit(1);
         }
+
+        console.log(`[BOOT] Initializing ${sessionConfigs.length} sessions...`);
+
+        // 依次初始化每个会话
+        for (const config of sessionConfigs) {
+            try {
+                await initSessionViaAdsPower(config);
+                // 间隔 2 秒，避免同时启动太多浏览器
+                await new Promise(r => setTimeout(r, 2000));
+            } catch (e) {
+                console.error(`[${config.sessionId}] init failed:`, e?.message || e);
+            }
+        }
+
+        console.log('[BOOT] All sessions initialized');
+
+        // 触发历史同步
+        if (String(process.env.SYNC_ON_STARTUP || '1') === '1') {
+            setTimeout(async () => {
+                try {
+                    const pending = sessionManager.getAllPendingHistory();
+                    if (pending.length > 0) {
+                        console.log(`[BOOT] Triggering history sync for ${pending.length} sessions...`);
+
+                        await axios.post(`${COLLECTOR_BASE}/batch-sync-history`, {
+                            sessions: pending
+                        }, {
+                            headers: { 'x-api-token': COLLECTOR_TOKEN },
+                            timeout: 120000
+                        }).catch(e => {
+                            console.warn('[BOOT] History sync request failed:', e.message);
+                        });
+                    }
+                } catch (e) {
+                    console.error('[BOOT] History sync error:', e.message);
+                }
+            }, 10000);
+        }
+
+        // 启动心跳监控
+        sessionManager.startHeartbeat();
+
+    } catch (e) {
+        console.error('[BOOT] Fatal error:', e.message);
+        process.exit(1);
     }
 })();
+
 // 让浏览器能直接访问已保存的媒体文件
-// 例如 http://127.0.0.1:5010/files/k165wa1x/4475.../msgid.jpg
 const app = express();
 app.use('/files', express.static(MEDIA_DIR));
 app.use(express.json());
 app.use((req, res, next) => {
     const need = process.env.BRIDGE_TOKEN || process.env.MANAGER_TOKEN || '';
-    if (!need) return next(); // 未设置则不校验
+    if (!need) return next();
 
     const got = req.headers['x-api-token'] || req.query.token || '';
     if (got === need) return next();
@@ -1004,27 +1204,156 @@ app.use((req, res, next) => {
     });
     return res.status(401).json({ ok:false, error:'bad token' });
 });
+
 // Helper: get chat's contact name or ID and phone
 function formatChat(chat) {
     return {
         id: chat.id._serialized,
         name: chat.name || chat.formattedTitle || chat.id.user || '',
-        phone: chat.id.user, // for personal chats, chat.id.user is the phone number (without '+')
+        phone: chat.id.user,
     };
 }
 
-// Endpoint: list sessions
+// sessions 端点
 app.get('/sessions', (req, res) => {
-    const info = {};
-    for (const sessionId of SESSIONS) {
-        const session = sessions[sessionId] || {};
-        info[sessionId] = {
-            status: session.status || 'unknown',
-            chatsCached: (session.chats || []).length,
-            via: 'adspower-ws' // 告知是通过 AdsPower DevTools 连接
-        };
+    res.json(sessionManager.getStatusSummary());
+});
+
+// 新增：获取单个会话详情
+app.get('/sessions/:id', (req, res) => {
+    const { id } = req.params;
+    const session = sessionManager.getSession(id);
+    if (!session) {
+        return res.status(404).json({ ok: false, error: 'Session not found' });
     }
-    res.json(info);
+    res.json({
+        ok: true,
+        session: {
+            sessionId: session.sessionId,
+            sessionName: session.sessionName,
+            status: session.sessionStatus,
+            chatsCached: (session.chats || []).length,
+            lastHeartbeat: session.lastHeartbeat,
+            profileInfo: session.profileInfo,
+            // ★ 新增：恢复相关信息
+            restartCount: session.restartCount || 0,
+            maxRetries: sessionManager.maxRestartRetries,
+            lastRestartTime: session.lastRestartTime || null,
+            lastError: session.lastError || null
+        }
+    });
+});
+
+// 新增：手动触发心跳检查
+app.get('/heartbeat', async (req, res) => {
+    try {
+        const results = await sessionManager.performHeartbeatCheck();
+        res.json({ ok: true, results });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+// ★ 新增：手动重启会话
+app.post('/sessions/:id/restart', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const session = sessionManager.getSession(id);
+        if (!session) {
+            return res.status(404).json({ ok: false, error: 'Session not found' });
+        }
+
+        console.log(`[API] Manual restart requested for session ${id}`);
+        const result = await sessionManager.restartSession(id);
+
+        if (result.success) {
+            res.json({
+                ok: true,
+                message: `Session ${id} restart initiated`,
+                restartCount: session.restartCount
+            });
+        } else {
+            res.status(400).json({
+                ok: false,
+                error: result.error,
+                restartCount: session.restartCount,
+                maxRetries: sessionManager.maxRestartRetries
+            });
+        }
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+// ★ 新增：重置会话状态（从 error 状态恢复）
+app.post('/sessions/:id/reset', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const session = sessionManager.getSession(id);
+        if (!session) {
+            return res.status(404).json({ ok: false, error: 'Session not found' });
+        }
+
+        const previousStatus = session.sessionStatus;
+        const success = sessionManager.resetSession(id);
+
+        if (success) {
+            res.json({
+                ok: true,
+                message: `Session ${id} reset successfully`,
+                previousStatus,
+                newStatus: 'disconnected',
+                restartCount: 0
+            });
+        } else {
+            res.status(400).json({ ok: false, error: 'Failed to reset session' });
+        }
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+// ★ 新增：获取健康检查配置
+app.get('/health-config', (req, res) => {
+    res.json({
+        ok: true,
+        config: {
+            healthCheckEnabled: sessionManager.healthCheckEnabled,
+            healthCheckIntervalMs: sessionManager.healthCheckInterval,
+            autoRestartEnabled: sessionManager.autoRestartEnabled,
+            maxRestartRetries: sessionManager.maxRestartRetries,
+            restartCooldownMs: sessionManager.restartCooldown
+        }
+    });
+});
+
+// 新增：获取会话的联系人列表
+app.get('/contacts/:sessionId', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const count = parseInt(req.query.count) || 20;
+
+        const session = sessionManager.getSession(sessionId);
+        if (!session?.client) {
+            return res.status(400).json({ ok: false, error: 'Session not found or not ready' });
+        }
+
+        const chats = await session.client.getChats();
+        const privateChats = chats
+            .filter(c => !c.isGroup)
+            .slice(0, count)
+            .map(c => ({
+                id: c.id?._serialized,
+                name: c.name || c.pushname || '',
+                phone: c.id?.user || '',
+                unreadCount: c.unreadCount || 0,
+                timestamp: c.timestamp || null
+            }));
+
+        res.json({ ok: true, contacts: privateChats });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
 });
 
 
@@ -1040,7 +1369,7 @@ app.get('/chats/:sessionId', async (req, res) => {
         return res.status(400).json({ error: 'Session not ready.' });
     }
     try {
-        const chats = session.chats.filter(c => !c.isGroup); // filter out groups
+        const chats = session.chats.filter(c => !c.isGroup);
         const score = c => (c.timestamp || c.lastMessage?.timestamp || 0);
         const sortedChats = chats.sort((a, b) => score(b) - score(a));
         const limited = sortedChats.slice(0, count).map(formatChat);
@@ -1051,7 +1380,7 @@ app.get('/chats/:sessionId', async (req, res) => {
     }
 });
 
-// 未读列表（实时）——每次调用都从 webjs 现状拉最近 N 个
+// 未读列表（实时）
 app.get('/unread/:sessionId', async (req, res) => {
     try {
         const { sessionId } = req.params;
@@ -1061,18 +1390,15 @@ app.get('/unread/:sessionId', async (req, res) => {
         const client = sess?.client;
         if (!client) return res.status(400).json({ ok:false, error:'session not found' });
 
-        // 关键：实时拉取，而不是看启动时缓存
-        const chats = await listChatsLiveOrCache(sessionId);                // 最新状态
-        // getChats() 默认按最近活跃排序（最新在前），我们只看前 N
+        const chats = await listChatsLiveOrCache(sessionId);
         const recent = chats.slice(0, count);
 
-        // 过滤：非群组 + 有未读
         const unread = recent
             .filter(c => !c.isGroup)
             .filter(c => (c.unreadCount || 0) > 0)
             .map(c => ({
                 id: c.id?._serialized,
-                phone: c.id?.user || '',        // 私聊：这里就是手机号（@c.us 前缀部分）
+                phone: c.id?.user || '',
                 name: c.name || c.pushname || c.formattedTitle || '',
                 unreadCount: c.unreadCount || 0,
                 isGroup: !!c.isGroup,
@@ -1085,7 +1411,7 @@ app.get('/unread/:sessionId', async (req, res) => {
     }
 });
 
-// === 拉取会话消息（支持 includeMedia=1 保存并返回 URL；caption 兜底） ===
+// === 拉取会话消息 ===
 app.get('/messages/:sessionId/:chatId', async (req, res) => {
     const { sessionId, chatId } = req.params;
     const limit = parseInt(req.query.limit) || 50;
@@ -1102,7 +1428,6 @@ app.get('/messages/:sessionId/:chatId', async (req, res) => {
         const out = [];
         for (const msg of messages) {
             const idSer = msg.id?._serialized || msg.id;
-            // “说明文字/字幕”的兜底：优先 body，其次 _data.caption（某些版本可用）
             const caption = (msg.body && msg.body.trim().length > 0)
                 ? msg.body
                 : ((msg._data && msg._data.caption) ? String(msg._data.caption) : '');
@@ -1110,13 +1435,12 @@ app.get('/messages/:sessionId/:chatId', async (req, res) => {
             const item = {
                 id: idSer,
                 fromMe: !!msg.fromMe,
-                type: msg.type,            // 'chat' | 'image' | 'video' | 'audio' | 'ptt' | 'sticker' | 'document' ...
-                body: caption || (msg.type === 'chat' ? msg.body : ''), // 纯文本才保留 body，否则给 caption 兜底
+                type: msg.type,
+                body: caption || (msg.type === 'chat' ? msg.body : ''),
                 timestamp: msg.timestamp || Date.now()
             };
 
             if (includeMedia) {
-                // 附件保存（无 caption 也会下载）
                 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
                 if (msg.hasMedia || MEDIA_TYPES.has(msg.type)) {
                     try {
@@ -1150,12 +1474,8 @@ app.get('/messages/:sessionId/:chatId', async (req, res) => {
 function wait(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
-// ====== [routes] 拟人文本发送 插入开始 ======
-/**
- * POST /send-text/:sessionId
- * body: { chatIdOrPhone: "4477...@c.us" 或 "4477...", text: "hello", wpm?:140 }
- * 拟人输出：先维持 typing 再一次性发送最终文本（不分多条，降低风控）
- */
+
+// ====== [routes] 拟人文本发送 ======
 app.post('/send-text/:sessionId', async (req,res)=>{
     try{
         const { sessionId } = req.params;
@@ -1164,7 +1484,6 @@ app.post('/send-text/:sessionId', async (req,res)=>{
 
         const chat = await getChat(sessionId, chatIdOrPhone);
 
-        // 限流 + 同会话冷却
         await takeSendToken();
         await ensureChatCooldown(sessionId, chat.id._serialized);
 
@@ -1174,50 +1493,43 @@ app.post('/send-text/:sessionId', async (req,res)=>{
         res.status(400).json({ ok:false, error: e.message || String(e) });
     }
 });
-// ====== [routes] 拟人文本发送 插入结束 ======
-// === 替换这个路由：发送媒体（图片/视频/音频/文档），支持本地 filePath，拟人化 + 可选“文档方式” ===
-// === 发送媒体：图片/视频/音频/文档。支持本地 filePath，默认发“黄框大图”，并触发清晰化 ===
+
+// === 发送媒体 ===
 app.post('/send-media/:sessionId', async (req,res)=>{
     try{
         const { sessionId } = req.params;
         let {
             chatIdOrPhone,
-            mediaType,                 // "image" | "video" | "audio" | "document"
+            mediaType,
             filePath, url, b64, mimetype, filename,
             caption,
-            asVoice,                   // audio -> 语音(PTT)
-            sendAsDocument,            // 可选：true 则走文档卡片（不会“糊”，但无大图预览）
-            forceOwnDownload           // 可选：true 发送后拉一遍，促使本端从“糊图”变清晰
+            asVoice,
+            sendAsDocument,
+            forceOwnDownload
         } = req.body || {};
 
         if (!chatIdOrPhone) throw new Error('need chatIdOrPhone');
         if (!mediaType)      throw new Error('need mediaType');
 
-        // 若误把本地盘符路径放在 url 中，loadMedia 会自动矫正
         const chat  = await getChat(sessionId, chatIdOrPhone);
         const media = await loadMedia({ filePath, url, b64, mimetype, filename });
 
-        // —— 拟人：限速 + 同会话冷却 + 打字中
         await takeSendToken();
         await ensureChatCooldown(sessionId, chat.id._serialized);
         const plan = [ rnd(800, 2000), rnd(600, 1400) ];
         for (const seg of plan){ await chat.sendStateTyping(); await sleep(seg); }
         await chat.clearState();
 
-        // —— 参数：默认就是“图片方式”发送（黄框大图预览）
         const opts = {};
         if (caption) opts.caption = String(caption);
         if (mediaType === 'audio' && asVoice) opts.sendAudioAsVoice = true;
 
-        // 只有显式要求时才走“文档方式”（红框那种）
         if (sendAsDocument === true && ALLOW_DOC) {
             opts.sendMediaAsDocument = true;
         }
 
         const msg = await chat.sendMessage(media, opts);
 
-        // —— 关键：为了让发送端尽快从“糊图”变清晰，默认触发一次自下载
-        // 若想全局默认可改成：const FORCE = true;
         const FORCE = (forceOwnDownload !== false);
         if (FORCE) {
             setTimeout(async ()=>{ try { await msg.downloadMedia(); } catch(_){ } }, 600);
@@ -1241,11 +1553,9 @@ app.post('/send', async (req, res) => {
         return res.status(400).json({ error: 'Session not ready.' });
     }
     try {
-        // Determine chat or contact
         const normalized = to.includes('@') ? to : `${to}@c.us`;
         const chat = await session.client.getChatById(normalized).catch(() => null);
 
-        // Type simulation
         const toChat = chat || await session.client.getNumberId(to).then(r => r._serialized).catch(() => null);
 
 
@@ -1254,7 +1564,6 @@ app.post('/send', async (req, res) => {
         }
         const chatObj = chat || await session.client.getChatById(toChat);
         await chatObj.sendStateTyping();
-        // Simulate typing delay
         const delay = 500 + Math.random() * 1000;
         await wait(delay);
         await session.client.sendMessage(toChat, message);
@@ -1301,21 +1610,16 @@ app.post('/send/text', async (req, res) => {
 
         if (!targetJid) return bad(400, 'recipient not found');
 
-        // ===== 新增：转义 WhatsApp Markdown 特殊字符 =====
         const escapeWhatsAppMarkdown = (str) => {
             if (!str) return str;
-            // 在特殊字符前插入零宽空格，防止 WhatsApp 将其识别为格式标记
-            // * 粗体, _ 斜体, ~ 删除线, ``` 代码块, ` 行内代码
             return str.replace(/([*_~`])/g, '\u200B$1');
         };
 
         const safeText = escapeWhatsAppMarkdown(String(text));
 
-        // 发送消息
         const msg = await session.client.sendMessage(targetJid, safeText);
         const msgId = msg?.id?._serialized || null;
 
-        // 标记为从 Chatwoot 发送
         markSentFromChatwoot(msgId);
 
         return ok(200, { ok: true, to: targetJid, msgId });
@@ -1323,7 +1627,6 @@ app.post('/send/text', async (req, res) => {
         return res.status(500).json({ ok: false, error: e?.message });
     }
 });
-
 
 
 
@@ -1347,15 +1650,12 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
     const includeBase64 = String(req.query.includeBase64 || '0') === '1';
     const timezoneOffset = parseInt(req.query.timezone || '0') * 3600;
 
-    // 时间参数（支持秒和毫秒）
     let afterTs = req.query.after ? parseInt(req.query.after) : null;
     let beforeTs = req.query.before ? parseInt(req.query.before) : null;
 
-    // 自动识别毫秒并转换为秒
     if (afterTs && afterTs > 9999999999) afterTs = Math.floor(afterTs / 1000);
     if (beforeTs && beforeTs > 9999999999) beforeTs = Math.floor(beforeTs / 1000);
 
-    // 默认：最近 12 小时
     const now = Math.floor(Date.now() / 1000);
     if (!afterTs) afterTs = now - 12 * 3600;
     if (!beforeTs) beforeTs = now;
@@ -1366,12 +1666,10 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
 
     try {
         console.log(`[messages-sync] session=${sessionId}, chat=${chatId}`);
-        console.log(`[messages-sync] includeMedia=${includeMedia}, includeBase64=${includeBase64}`);
         console.log(`[messages-sync] time: ${new Date(afterTs * 1000).toISOString()} ~ ${new Date(beforeTs * 1000).toISOString()}`);
 
         const chat = await session.client.getChatById(chatId);
 
-        // 获取更多消息用于过滤（因为 WhatsApp 返回的是最近的消息）
         const fetchLimit = Math.min(limit * 5, 500);
         const rawMessages = await chat.fetchMessages({ limit: fetchLimit });
 
@@ -1384,13 +1682,11 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
         for (const msg of rawMessages) {
             const msgTs = msg.timestamp || 0;
 
-            // 时间过滤
             if (msgTs < afterTs || msgTs > beforeTs) continue;
             if (out.length >= limit) break;
 
             const idSer = msg.id?._serialized || msg.id;
 
-            // 获取消息内容
             let body = '';
             if (msg.type === 'chat') {
                 body = msg.body || '';
@@ -1411,25 +1707,20 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                 ack: msg.ack
             };
 
-            // 处理媒体
             if (includeMedia || includeBase64) {
                 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
                 if (msg.hasMedia || MEDIA_TYPES.has(msg.type)) {
                     try {
-                        // ===== 第一次尝试用 API 下载 =====
                         let media = await msg.downloadMedia().catch(() => null);
 
-                        // ===== 如果 API 失败，从 DOM 提取媒体 =====
                         if (!media?.data) {
                             console.log(`[messages-sync] API failed, extracting from DOM for ${idSer}...`);
 
                             try {
                                 const extracted = await session.client.pupPage.evaluate(async (msgId, msgType) => {
-                                    // 查找消息元素
                                     let msgEl = document.querySelector(`[data-id="${msgId}"]`);
 
                                     if (!msgEl) {
-                                        // 滚动查找
                                         const container = document.querySelector('[data-testid="conversation-panel-messages"]')
                                             || document.querySelector('._ajyl');
                                         if (container) {
@@ -1441,25 +1732,19 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
 
                                     if (!msgEl) return { error: 'msg_not_found' };
 
-                                    // 滚动到消息
                                     msgEl.scrollIntoView({ behavior: 'instant', block: 'center' });
                                     await new Promise(r => setTimeout(r, 300));
 
-                                    // 检查是否有下载按钮（未下载状态）
                                     const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
                                         || msgEl.querySelector('[data-icon="audio-download"]')
                                         || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
 
                                     if (downloadBtn) {
-                                        // 点击下载
                                         downloadBtn.click();
-                                        // 等待下载完成
                                         await new Promise(r => setTimeout(r, 6000));
                                     }
 
-                                    // ===== 提取图片数据 =====
                                     if (msgType === 'image' || msgType === 'sticker') {
-                                        // 查找已加载的图片
                                         const img = msgEl.querySelector('img[src^="blob:"]')
                                             || msgEl.querySelector('img[src*="base64"]')
                                             || msgEl.querySelector('[data-testid="media-canvas"] img')
@@ -1467,7 +1752,6 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
 
                                         if (img && img.src) {
                                             if (img.src.startsWith('blob:')) {
-                                                // blob URL 转 base64
                                                 try {
                                                     const response = await fetch(img.src);
                                                     const blob = await response.blob();
@@ -1492,7 +1776,6 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                                                     return { error: 'blob_fetch_failed: ' + e.message };
                                                 }
                                             } else if (img.src.startsWith('data:')) {
-                                                // 已经是 base64
                                                 const matches = img.src.match(/^data:(.+);base64,(.+)$/);
                                                 if (matches) {
                                                     return { mimetype: matches[1], data: matches[2] };
@@ -1500,7 +1783,6 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                                             }
                                         }
 
-                                        // 尝试从 canvas 获取
                                         const canvas = msgEl.querySelector('canvas');
                                         if (canvas) {
                                             try {
@@ -1515,7 +1797,6 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                                         return { error: 'image_not_found' };
                                     }
 
-                                    // ===== 视频/音频暂时跳过 DOM 提取 =====
                                     return { error: 'type_not_supported_for_dom_extract' };
 
                                 }, msg.id._serialized, msg.type);
@@ -1530,7 +1811,6 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                                 } else {
                                     console.log(`[messages-sync] DOM extraction failed: ${extracted?.error || 'unknown'}`);
 
-                                    // 最后再尝试一次 API
                                     await new Promise(r => setTimeout(r, 2000));
                                     media = await msg.downloadMedia().catch(() => null);
                                 }
@@ -1542,7 +1822,6 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                         if (media?.data) {
                             mediaCount++;
 
-                            // 获取文件扩展名
                             const ext = mimeToExt(media.mimetype) || '';
                             const filename = media.filename || `${idSer}${ext}`;
 
@@ -1550,7 +1829,6 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                                 mimetype: media.mimetype,
                                 filename: filename,
                                 bytes: Buffer.from(media.data, 'base64').length,
-                                // ===== 关键：直接返回 data_url =====
                                 data_url: `data:${media.mimetype};base64,${media.data}`
                             };
 
@@ -1571,7 +1849,6 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
             out.push(item);
         }
 
-        // 按时间排序（旧到新）
         out.sort((a, b) => a.timestamp - b.timestamp);
 
         console.log(`[messages-sync] Returning ${out.length} messages, media: ${mediaCount} ok, ${mediaErrorCount} failed`);
@@ -1672,32 +1949,26 @@ app.post('/send/media', async (req, res) => {
 
         console.log(`[send/media] START: to=${to || 'none'}, to_lid=${to_lid || 'none'}, msg_id=${message_id || 'none'}`);
 
-        // 【去重检查】如果有 message_id
+        // 【去重检查】
         if (message_id) {
             const cached = sendMediaCache.get(message_id);
             if (cached) {
-                // 如果已经有结果，直接返回
                 if (cached.result) {
-                    console.log(`[send/media] DEDUP: message_id=${message_id} already completed, returning cached result`);
+                    console.log(`[send/media] DEDUP: message_id=${message_id} already completed`);
                     return ok(200, cached.result);
                 }
-                // 如果正在处理中，等待完成（最多等30秒）
                 if (cached.processing) {
                     console.log(`[send/media] DEDUP: message_id=${message_id} is processing, waiting...`);
                     for (let i = 0; i < 60; i++) {
                         await new Promise(r => setTimeout(r, 500));
                         const updated = sendMediaCache.get(message_id);
                         if (updated?.result) {
-                            console.log(`[send/media] DEDUP: message_id=${message_id} completed while waiting`);
                             return ok(200, updated.result);
                         }
                     }
-                    // 等待超时，返回处理中状态
-                    console.log(`[send/media] DEDUP: message_id=${message_id} wait timeout`);
                     return ok(200, { ok: true, pending: true, message: 'Request is being processed' });
                 }
             }
-            // 标记为"处理中"
             sendMediaCache.set(message_id, { ts: Date.now(), processing: true, result: null });
         }
 
@@ -1707,7 +1978,6 @@ app.post('/send/media', async (req, res) => {
         const session = sessions[sessionId];
         if (!session || !session.client) return bad(400, 'session not ready');
 
-        // ===== 关键：确定 chatIdOrPhone =====
         let chatIdOrPhone = null;
 
         if (to) {
@@ -1715,13 +1985,11 @@ app.post('/send/media', async (req, res) => {
             if (kind === 'group') {
                 chatIdOrPhone = jid;
             } else if (kind === 'user' && digits) {
-                // 尝试获取真实 JID
                 const r = await session.client.getNumberId(digits).catch(() => null);
                 chatIdOrPhone = r?._serialized || (digits.length >= 7 ? `${digits}@c.us` : null);
             }
         }
 
-        // 如果没有真实电话，使用隐私号
         if (!chatIdOrPhone && to_lid) {
             chatIdOrPhone = `${to_lid.replace(/\D/g, '')}@lid`;
             console.log(`[send/media] Using LID: ${chatIdOrPhone}`);
@@ -1729,14 +1997,12 @@ app.post('/send/media', async (req, res) => {
 
         if (!chatIdOrPhone) return bad(400, 'recipient not found');
 
-        // ===== 关键修复：获取 Chat 对象（和成功版本一样）=====
         let chat = null;
         try {
             chat = await session.client.getChatById(chatIdOrPhone);
             console.log(`[send/media] Got chat: ${chat?.id?._serialized}`);
         } catch (e) {
             console.log(`[send/media] getChatById failed: ${e?.message}`);
-            // 尝试从缓存获取
             const cached = (session.chats || []).find(c => c?.id?._serialized === chatIdOrPhone);
             if (cached) {
                 chat = cached;
@@ -1748,7 +2014,6 @@ app.post('/send/media', async (req, res) => {
             return bad(400, `Cannot get chat for ${chatIdOrPhone}`);
         }
 
-        // 收集媒体
         const mediaItems = [];
         if (url || b64) mediaItems.push({ url, b64, mimetype, filename, caption });
         if (Array.isArray(attachments)) {
@@ -1777,7 +2042,6 @@ app.post('/send/media', async (req, res) => {
             try {
                 const itemMime = normalizeMime(item.mimetype, item.filename);
 
-                // 确保文件名
                 let itemFilename = item.filename;
                 if (!itemFilename) {
                     if (item.url) {
@@ -1790,7 +2054,6 @@ app.post('/send/media', async (req, res) => {
 
                 console.log(`[send/media] Item ${i}: ${itemMime}, ${itemFilename}`);
 
-                // 加载媒体
                 let media;
                 if (item.b64) {
                     media = new MessageMedia(itemMime, item.b64, itemFilename);
@@ -1800,7 +2063,6 @@ app.post('/send/media', async (req, res) => {
                     continue;
                 }
 
-                // 判断类型
                 const mime = normalizeMime(media.mimetype || itemMime, itemFilename);
                 const isVideo = mime.startsWith('video/');
                 const isAudio = mime.startsWith('audio/');
@@ -1811,13 +2073,11 @@ app.post('/send/media', async (req, res) => {
                 let msg = null;
                 let method = 'standard';
 
-                // ===== 关键修复：统一使用 chat.sendMessage =====
                 const opts = {};
                 if (itemCaption) opts.caption = itemCaption;
                 if (isVoice) opts.sendAudioAsVoice = true;
 
                 if (isVideo) {
-                    // 视频：使用修复后的 sendVideo 函数
                     const r = await sendVideo(chat, media, itemCaption);
                     if (r.ok) {
                         msg = r.msg;
@@ -1827,7 +2087,6 @@ app.post('/send/media', async (req, res) => {
                         continue;
                     }
                 } else {
-                    // 非视频：直接用 chat.sendMessage
                     try {
                         msg = await chat.sendMessage(media, opts);
                         method = 'chat.sendMessage';
@@ -1842,12 +2101,10 @@ app.post('/send/media', async (req, res) => {
                     const msgId = msg.id?._serialized || null;
                     console.log(`[send/media] Item ${i} OK: method=${method}`);
 
-                    // 标记为从 Chatwoot 发送
                     if (typeof markSentFromChatwoot === 'function') {
                         markSentFromChatwoot(msgId);
                     }
 
-                    // 触发清晰化
                     setTimeout(async () => {
                         try { await msg.downloadMedia(); } catch (_) {}
                     }, 600);
@@ -1873,7 +2130,6 @@ app.post('/send/media', async (req, res) => {
             success: successCount
         };
 
-        // 【去重缓存】保存成功结果，防止重试时重复发送
         if (message_id) {
             sendMediaCache.set(message_id, { ts: Date.now(), processing: false, result: finalResult });
             console.log(`[send/media] Cached result for message_id=${message_id}`);
@@ -1882,7 +2138,6 @@ app.post('/send/media', async (req, res) => {
         return ok(200, finalResult);
     } catch (e) {
         console.error('[send/media] ERROR:', e);
-        // 【修复】失败时清除处理中标记，允许重试
         const message_id = req.body?.message_id;
         if (message_id) {
             sendMediaCache.delete(message_id);
@@ -1899,14 +2154,28 @@ app.post('/mark-read/:sessionId/:chatId', async (req, res) => {
 
         const chat = await sess.client.getChatById(chatId);
         await chat.markSeen();
-        // 立即刷新缓存
         sess.chats = await listChatsLiveOrCache(sessionId);
         res.json({ ok:true });
     } catch (e) {
         res.status(500).json({ ok:false, error: e?.message || String(e) });
     }
 });
-const PORT = process.env.BRIDGE_PORT; // 统一用 BRIDGE_PORT
+
+const PORT = process.env.BRIDGE_PORT;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[manager] up on 0.0.0.0:${PORT}`);
+});
+
+// 优雅关闭处理
+// ============================================================
+process.on('SIGTERM', async () => {
+    console.log('[SHUTDOWN] SIGTERM received, cleaning up...');
+    await sessionManager.shutdown();
+    process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+    console.log('[SHUTDOWN] SIGINT received, cleaning up...');
+    await sessionManager.shutdown();
+    process.exit(0);
 });

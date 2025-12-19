@@ -1,7 +1,7 @@
 ######## Core ########
 BRIDGE_PORT=5010
 BRIDGE_BASE=http://192.168.11.45:5010
-SESSIONS=k16hf6nn
+SESSIONS=k16f9wid,k17se6o0
 #SESSIONS=k165wa1x,k165w8k8,k16hf6nn
 BRIDGE_API_TOKEN=your-generated-token
 # —— 令 whatsapp-manager 能把消息推给 192.168.11.45
@@ -33,10 +33,10 @@ API_TOKEN=your-generated-token
 ######## Chatwoot / Queue ########
 # Chatwoot 接入（按 tools/chatwoot_setup.md 配置）
 CHATWOOT_BASE_URL=http://192.168.11.45:3000
-CHATWOOT_API_TOKEN=Sq9DXZzX1g2foAxVe8qf2CeG
+CHATWOOT_API_TOKEN=2CPNT65cjMrFxUZYLtiJujzX
 CHATWOOT_ACCOUNT_ID=1
-CHATWOOT_INBOX_ID=2
-CHATWOOT_INBOX_IDENTIFIER=eAStZ2hNkFcQgNYNeSWmCWcx
+CHATWOOT_INBOX_ID=1
+CHATWOOT_INBOX_IDENTIFIER=jmbrP5XTAiBoVmTWYUeN7i1G
 CHATWOOT_WEBHOOK_VERIFY=true
 # Collector（接收 manager 入站，转发到 Chatwoot）
 COLLECTOR_PORT=7001

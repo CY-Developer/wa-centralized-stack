@@ -3,6 +3,31 @@ const FormData = require('form-data');
 const path = require('path');
 const { CFG } = require('./config');
 
+// 尝试导入 SessionManager（可选依赖）
+let sessionManager = null;
+try {
+  const sm = require('./session-manager');
+  sessionManager = sm.sessionManager;
+  console.log('[chatwoot] SessionManager loaded for dynamic name mapping');
+} catch (e) {
+  console.log('[chatwoot] SessionManager not available, using fallback names');
+}
+
+// 后备的静态名称映射（当 SessionManager 不可用时使用）
+const FALLBACK_SESSION_NAMES = {
+};
+
+// 从环境变量加载额外的后备映射
+try {
+  const fallbackEnv = process.env.FALLBACK_SESSION_NAMES || '';
+  if (fallbackEnv) {
+    fallbackEnv.split(',').forEach(pair => {
+      const [id, name] = pair.split(':').map(s => s.trim());
+      if (id && name) FALLBACK_SESSION_NAMES[id] = name;
+    });
+  }
+} catch (_) {}
+
 const CW_BASE = (CFG.chatwoot.baseURL || '').replace(/\/$/, '');
 const CW_TOKEN = CFG.chatwoot.token;
 const DEFAULT_ACCOUNT_ID = CFG.chatwoot.accountId;
@@ -142,16 +167,30 @@ async function fetchAsBuffer(url) {
 
 
 // 根据 sessionId 和原始 name/phone 生成联系人显示名
-function buildDisplayName(sessionId, rawName, phone_e164, identifier) {
+function buildDisplayName(sessionId, rawName, phone_e164, identifier, sessionName = null) {
   const rhs = (rawName && rawName.trim()) || phone_e164 || identifier || 'WA User';
 
-  if (sessionId === 'k17se6o0') return `Briana>${rhs}`;
-  if (sessionId === 'k17sdxph') return `Abby>${rhs}`;
-  if (sessionId === 'k16f9wid') return `Chloe>${rhs}`;
-  if (sessionId === 'k16hf6nn') return `Ivor>${rhs}`;
+  // ★ 优先使用传入的 sessionName（来自 bridge payload）
+  if (sessionName && sessionName !== sessionId) {
+    return `${sessionName}>${rhs}`;
+  }
+
+  // 其次从 SessionManager 获取动态名称
+  if (sessionManager) {
+    const dynamicName = sessionManager.getSessionName(sessionId);
+    if (dynamicName) {
+      return `${dynamicName}>${rhs}`;
+    }
+  }
+
+  // 再次使用后备静态映射
+  if (FALLBACK_SESSION_NAMES[sessionId]) {
+    return `${FALLBACK_SESSION_NAMES[sessionId]}>${rhs}`;
+  }
+
+  // 最后使用 sessionId 本身
   return `${sessionId || 'unknown'}>${rhs}`;
 }
-
 function normalizeE164(rawPhone, rawName) {
   const pick = (s) => {
     if (!s) return null;
@@ -232,7 +271,7 @@ async function updateContact({ account_id = DEFAULT_ACCOUNT_ID, contact_id, patc
   return cwRequest('patch', `/api/v1/accounts/${account_id}/contacts/${contact_id}`, { data: patch });
 }
 
-async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPhone_lid, rawName, sessionId, messageId }) {
+async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPhone_lid, rawName, sessionId, sessionName, messageId }) {
   // 核心：从messageId提取@lid前的纯数字（适配格式：false_67894943707296@lid_xxx）
   const getLidDigits = (mid) => {
     if (!mid) return '';
@@ -251,7 +290,8 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
 
   // 以下逻辑完全保留，仅替换了finalPhone作为电话来源
   let contact = await searchContact({ account_id, identifier });
-  const wantName = buildDisplayName(sessionId, rawName, phone_e164, identifier);
+  // ★ 使用传入的 sessionName
+  const wantName = buildDisplayName(sessionId, rawName, phone_e164, identifier, sessionName);
   const wantAttrs = { session_id: sessionId || null };
 
   if (!contact) {
@@ -1075,6 +1115,103 @@ async function syncMessagesInBatches({
   };
 }
 
+
+// ============================================================
+// 消息去重检查函数（用于多端同步）
+// ============================================================
+
+/**
+ * 检查消息是否已存在（通过 source_id / wa_message_id）
+ * @param {Object} options
+ * @param {string} options.account_id
+ * @param {string} options.conversation_id
+ * @param {string} options.source_id - WhatsApp 消息ID
+ * @param {number} options.limit - 检查最近多少条消息，默认50
+ * @returns {Promise<boolean>}
+ */
+async function checkMessageExists({ account_id, conversation_id, source_id, limit = 50 }) {
+  if (!source_id || !conversation_id) return false;
+
+  try {
+    const res = await cwRequest('get',
+        `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`
+    );
+
+    const messages = res?.payload || res || [];
+
+    for (const m of messages.slice(0, limit)) {
+      if (m.source_id === source_id) return true;
+      if (m.content_attributes?.wa_message_id === source_id) return true;
+    }
+
+    return false;
+  } catch (e) {
+    console.warn('[checkMessageExists] Error:', e.message);
+    return false;
+  }
+}
+
+/**
+ * 通过 source_id 查找消息详情
+ * @param {Object} options
+ * @returns {Promise<Object|null>}
+ */
+async function findMessageBySourceId({ account_id, conversation_id, source_id }) {
+  if (!source_id || !conversation_id) return null;
+
+  try {
+    const res = await cwRequest('get',
+        `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`
+    );
+
+    const messages = res?.payload || res || [];
+
+    return messages.find(m =>
+        m.source_id === source_id ||
+        m.content_attributes?.wa_message_id === source_id
+    ) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 批量检查多个消息是否存在
+ * @param {Object} options
+ * @returns {Promise<Set<string>>} 已存在的消息ID集合
+ */
+async function checkMessagesExist({ account_id, conversation_id, source_ids }) {
+  if (!source_ids?.length || !conversation_id) return new Set();
+
+  const existingIds = new Set();
+
+  try {
+    const res = await cwRequest('get',
+        `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`
+    );
+
+    const messages = res?.payload || res || [];
+    const existingSourceIds = new Set();
+
+    for (const m of messages) {
+      if (m.source_id) existingSourceIds.add(m.source_id);
+      if (m.content_attributes?.wa_message_id) {
+        existingSourceIds.add(m.content_attributes.wa_message_id);
+      }
+    }
+
+    for (const sourceId of source_ids) {
+      if (existingSourceIds.has(sourceId)) {
+        existingIds.add(sourceId);
+      }
+    }
+  } catch (e) {
+    console.warn('[checkMessagesExist] Error:', e.message);
+  }
+
+  return existingIds;
+}
+
 module.exports = {
   listAccounts,
   listInboxes,
@@ -1088,7 +1225,6 @@ module.exports = {
   getConversationDetails,
   request,
   createIncomingMessage,
-
   batchQueryMessages,
   batchDeleteMessages,
   findMessageByContentAndTime,
@@ -1096,4 +1232,8 @@ module.exports = {
   getConversationMessages,
   createOutgoingMessage,
   deleteMessage,
+  // 新增：去重检查函数
+  checkMessageExists,
+  findMessageBySourceId,
+  checkMessagesExist,
 };

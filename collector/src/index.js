@@ -598,6 +598,7 @@ app.post('/ingest', async (req, res) => {
     try {
         const {
             sessionId,
+            sessionName,  // ★ 新增：从 bridge 传入的动态名称
             phone,
             phone_lid,
             name,
@@ -613,8 +614,19 @@ app.post('/ingest', async (req, res) => {
         if (isGroup || isStatus) {
             return res.json({ok: true, skipped: 'ignored group/status message'});
         }
+
+        // ★★★ 入站消息 Redis 去重 ★★★
+        if (redis && messageId) {
+            const redisKey = `wa:synced:incoming:${messageId}`;
+            const exists = await redis.get(redisKey);
+            if (exists) {
+                console.log('[INGEST] Skip (Redis dedup):', messageId?.substring(0, 30));
+                return res.json({ ok: true, skipped: 'duplicate_redis' });
+            }
+        }
+
         console.log('Received webhook:', {
-            sessionId, phone, name, text, type, messageId,
+            sessionId, sessionName, phone, name, text, type, messageId,
             hasAttachment: !!attachment, hasMedia: !!media
         });
 
@@ -627,7 +639,8 @@ app.post('/ingest', async (req, res) => {
             rawPhone: phone,
             rawPhone_lid: phone_lid,
             rawName: name,
-            sessionId
+            sessionId,
+            sessionName  // ★ 传递动态名称
         });
 
 // 2) 会话（按联系人 + inbox 复用；不再传 source_id）
@@ -746,6 +759,11 @@ app.post('/ingest', async (req, res) => {
         }
 
 
+        // ★★★ 标记入站消息已同步 ★★★
+        if (redis && messageId) {
+            await redis.set(`wa:synced:incoming:${messageId}`, '1', 'EX', 7 * 24 * 3600).catch(() => {});
+        }
+
         res.json({ok: true, conversation_id, message_id: created.id || created.message?.id || null});
     } catch (e) {
         const errMsg = e?.response?.data?.error || e?.response?.data?.message || e?.message || String(e);
@@ -780,68 +798,135 @@ app.post('/message-status', async (req, res) => {
 /**
  * 接口2：我方发送消息入站（同步 WhatsApp 端发送的消息到 Chatwoot）
  */
+/**
+ * 接口：同步手机端发送的消息到 Chatwoot（增强版）
+ *
+ * 去重机制：
+ * 1. Redis 快速检查（7天TTL）
+ * 2. Chatwoot API 检查（source_id）
+ */
 app.post('/ingest-outgoing', async (req, res) => {
+    const startTime = Date.now();
+
     try {
         const {
-            sessionId, messageId, phone, phone_lid, name,
-            text, type, timestamp, to, chatId,
-            fromMe, direction, attachment
+            sessionId,
+            sessionName,    // ★ 新增：从 bridge 传入的动态名称
+            messageId,      // WhatsApp 消息ID（关键去重字段）
+            phone,
+            phone_lid,
+            name,
+            text,
+            type,
+            timestamp,
+            to,
+            chatId,
+            fromMe,
+            direction,
+            attachment
         } = req.body || {};
 
-        console.log(`[INGEST_OUT] msgId=${messageId?.substring(0, 25)}..., to=${to?.substring(0, 20)}`);
-
+        // 1. 基本验证
         if (!fromMe || direction !== 'outgoing') {
             return res.json({ ok: true, skipped: 'not outgoing' });
         }
 
+        if (!messageId) {
+            logToCollector('[INGEST_OUT] No messageId', { to });
+            return res.json({ ok: true, skipped: 'no messageId' });
+        }
+
+        logToCollector('[INGEST_OUT] Received', {
+            sessionId,
+            sessionName,  // ★ 添加到日志
+            messageId: messageId.substring(0, 35),
+            phone: phone || phone_lid || 'unknown',
+            type,
+            hasAttachment: !!attachment
+        });
+
+        // 2. 跳过群组/广播
         if (/@g\.us$/i.test(to) || /@broadcast/i.test(to)) {
             return res.json({ ok: true, skipped: 'group/broadcast' });
         }
 
-        // 去重
+        // 3. Redis 快速去重（第一层，7天TTL）
+        const redisKey = `wa:synced:outgoing:${messageId}`;
         if (redis) {
-            const key = `wa:outgoing:${messageId}`;
-            if (await redis.get(key)) {
-                return res.json({ ok: true, skipped: 'duplicate' });
+            const exists = await redis.get(redisKey);
+            if (exists) {
+                logToCollector('[INGEST_OUT] Skip (Redis)', { messageId: messageId.substring(0, 35) });
+                return res.json({ ok: true, skipped: 'duplicate_redis' });
             }
-            await redis.set(key, '1');
-            await redis.expire(key, 300);
         }
 
+        // 4. 确定目标电话
         const targetPhone = phone || phone_lid || to?.replace(/@.*/, '').replace(/\D/g, '');
         if (!targetPhone) {
             return res.json({ ok: true, skipped: 'no phone' });
         }
 
-        const inbox_id = await resolveInboxId();
-
+        // 5. 确保联系人存在
         const contact = await cw.ensureContact({
             account_id: CHATWOOT_ACCOUNT_ID,
             rawPhone: targetPhone,
+            rawPhone_lid: phone_lid,
             rawName: name || targetPhone,
-            sessionId
+            sessionId,
+            sessionName,  // ★ 传递动态名称
+            messageId
         });
 
+        if (!contact?.id) {
+            logToCollector('[INGEST_OUT] Contact failed', { targetPhone });
+            return res.status(400).json({ ok: false, error: 'Failed to create contact' });
+        }
+
+        // 6. 确保会话存在
+        const inbox_id = await resolveInboxId();
         const conv = await cw.ensureConversation({
             account_id: CHATWOOT_ACCOUNT_ID,
             inbox_id,
-            contact_id: contact.id
+            contact_id: contact.id,
+            custom_attributes: {
+                wa_chat_id: chatId || to,
+                session_id: sessionId
+            }
         });
-        const conversation_id = conv.id || conv;
 
-        // 处理附件
+        const conversation_id = conv?.id || conv;
+        if (!conversation_id) {
+            logToCollector('[INGEST_OUT] Conversation failed', { contact_id: contact.id });
+            return res.status(400).json({ ok: false, error: 'Failed to create conversation' });
+        }
+
+        // 7. Chatwoot API 去重检查（第二层）
+        if (typeof cw.checkMessageExists === 'function') {
+            const existsInCW = await cw.checkMessageExists({
+                account_id: CHATWOOT_ACCOUNT_ID,
+                conversation_id,
+                source_id: messageId
+            });
+
+            if (existsInCW) {
+                logToCollector('[INGEST_OUT] Skip (Chatwoot)', {
+                    messageId: messageId.substring(0, 35),
+                    conversation_id
+                });
+                // 标记到 Redis 避免下次再查
+                if (redis) {
+                    await redis.set(redisKey, '1', 'EX', 7 * 24 * 3600);
+                }
+                return res.json({ ok: true, skipped: 'duplicate_chatwoot' });
+            }
+        }
+
+        // 8. 处理附件
         const attachments = normalizeAttachments({ attachment, messageId });
 
-        // 创建消息
+        // 9. 创建消息
         let created;
         try {
-            // 尝试用 Chatwoot API 创建 outgoing 消息
-            const msgPayload = {
-                content: text || '',
-                message_type: 'outgoing',
-                private: false
-            };
-
             if (attachments.length > 0) {
                 // 有附件：使用 FormData
                 const FormData = require('form-data');
@@ -849,6 +934,7 @@ app.post('/ingest-outgoing', async (req, res) => {
                 form.append('content', text || '');
                 form.append('message_type', 'outgoing');
                 form.append('private', 'false');
+                form.append('source_id', messageId);  // ← 关键：保存 WA 消息ID
 
                 for (const att of attachments) {
                     if (att.data_url) {
@@ -874,30 +960,83 @@ app.post('/ingest-outgoing', async (req, res) => {
                 created = await cw.request(
                     'POST',
                     `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversation_id}/messages`,
-                    msgPayload
+                    {
+                        content: text || '',
+                        message_type: 'outgoing',
+                        private: false,
+                        source_id: messageId,  // ← 关键：保存 WA 消息ID
+                        content_attributes: {
+                            wa_message_id: messageId,
+                            wa_timestamp: timestamp,
+                            wa_type: type,
+                            synced_from_device: true
+                        }
+                    }
                 );
             }
         } catch (e) {
-            console.log(`[INGEST_OUT] Create message error:`, e?.message);
-            // 降级：尝试简单的消息创建
-            created = { id: null };
+            const errMsg = e?.message || '';
+
+            // 检查是否是重复消息错误
+            if (/source_id|duplicate/i.test(errMsg)) {
+                logToCollector('[INGEST_OUT] Duplicate detected', { messageId: messageId.substring(0, 35) });
+                if (redis) {
+                    await redis.set(redisKey, '1', 'EX', 7 * 24 * 3600);
+                }
+                return res.json({ ok: true, skipped: 'duplicate_source_id' });
+            }
+
+            throw e;
         }
 
-        console.log(`[INGEST_OUT] Created: ${created?.id || 'unknown'}`);
-        res.json({ ok: true, conversation_id, message_id: created?.id });
+        // 10. 标记到 Redis（7天TTL）
+        if (redis) {
+            await redis.set(redisKey, '1', 'EX', 7 * 24 * 3600);
+
+            // 保存映射关系
+            const mappingData = {
+                sessionId,
+                phone: phone || '',
+                phone_lid: phone_lid || '',
+                chatId: chatId || to,
+                contact_id: contact.id,
+                conversation_id,
+                updatedAt: Date.now()
+            };
+            await redis.set(
+                `cw:mapping:conv:${conversation_id}`,
+                JSON.stringify(mappingData),
+                'EX', 86400 * 30
+            ).catch(() => {});
+        }
+
+        const duration = Date.now() - startTime;
+        logToCollector('[INGEST_OUT] Created', {
+            conversation_id,
+            message_id: created?.id,
+            duration
+        });
+
+        res.json({
+            ok: true,
+            conversation_id,
+            message_id: created?.id,
+            duration
+        });
+
     } catch (e) {
         const errMsg = e?.response?.data?.error || e?.response?.data?.message || e?.message || String(e);
         const errData = e?.response?.data;
 
-        // 如果是"已存在"错误（并发或重复），返回200避免重试
+        // 处理"已存在"错误
         if (/identifier.*already.*taken|already.*exists|duplicate/i.test(errMsg) ||
             /identifier.*already.*taken|already.*exists|duplicate/i.test(JSON.stringify(errData || {}))) {
-            console.log('[INGEST_OUT] Already exists (concurrent/duplicate), skipping:', errMsg);
-            return res.json({ ok: true, skipped: 'duplicate', message: 'Already exists' });
+            logToCollector('[INGEST_OUT] Already exists', { error: errMsg });
+            return res.json({ ok: true, skipped: 'already_exists' });
         }
 
-        console.error('[INGEST_OUT_ERROR]', errData || errMsg);
-        res.status(500).json({ ok: false, error: errMsg, cw: errData });
+        logToCollector('[INGEST_OUT] Error', { error: errMsg });
+        res.status(500).json({ ok: false, error: errMsg, details: errData });
     }
 });
 
@@ -2305,6 +2444,329 @@ app.delete('/sync-lock/:conversation_id', (req, res) => {
     syncLockManager.forceRelease(Number(conversation_id));
     res.json({ ok: true, released: true });
 });
+
+
+// 功能：接收 manager 发来的历史消息数据，批量同步到 Chatwoot
+app.post('/batch-sync-history', async (req, res) => {
+    const startTime = Date.now();
+    logToCollector('[BATCH_SYNC] Start', { timestamp: startTime });
+
+    try {
+        const { sessions } = req.body;
+
+        if (!sessions || !Array.isArray(sessions)) {
+            return res.status(400).json({ ok: false, error: 'Missing sessions array' });
+        }
+
+        const results = {
+            totalSessions: sessions.length,
+            totalContacts: 0,
+            totalMessages: 0,
+            created: 0,
+            skipped: 0,
+            failed: 0,
+            errors: []
+        };
+
+        const inbox_id = await resolveInboxId();
+
+        for (const sessionData of sessions) {
+            const { sessionId, sessionName, contacts } = sessionData;
+
+            if (!contacts || contacts.length === 0) continue;
+
+            logToCollector('[BATCH_SYNC] Processing session', {
+                sessionId,
+                sessionName,
+                contactCount: contacts.length
+            });
+
+            for (const contact of contacts) {
+                try {
+                    const { chatId, phone, phone_lid, name, messages } = contact;
+
+                    if (!messages || messages.length === 0) continue;
+
+                    results.totalContacts++;
+                    results.totalMessages += messages.length;
+
+                    // 确保联系人存在
+                    const contactResult = await cw.ensureContact({
+                        account_id: CHATWOOT_ACCOUNT_ID,
+                        rawPhone: phone,
+                        rawPhone_lid: phone_lid,
+                        rawName: name,
+                        sessionId
+                    });
+
+                    if (!contactResult?.id) {
+                        results.failed += messages.length;
+                        results.errors.push({ chatId, error: 'Failed to create contact' });
+                        continue;
+                    }
+
+                    // 确保会话存在
+                    const convResult = await cw.ensureConversation({
+                        account_id: CHATWOOT_ACCOUNT_ID,
+                        inbox_id,
+                        contact_id: contactResult.id,
+                        custom_attributes: {
+                            wa_chat_id: chatId,
+                            session_id: sessionId
+                        }
+                    });
+
+                    if (!convResult?.id) {
+                        results.failed += messages.length;
+                        results.errors.push({ chatId, error: 'Failed to create conversation' });
+                        continue;
+                    }
+
+                    // 保存 Redis 映射
+                    if (redis) {
+                        const mappingData = {
+                            sessionId,
+                            phone: phone || '',
+                            phone_lid: phone_lid || '',
+                            chatId,
+                            contact_id: contactResult.id,
+                            conversation_id: convResult.id,
+                            updatedAt: Date.now()
+                        };
+
+                        await redis.set(
+                            `cw:mapping:conv:${convResult.id}`,
+                            JSON.stringify(mappingData),
+                            'EX', 86400 * 30
+                        ).catch(() => {});
+
+                        await redis.set(
+                            `cw:mapping:contact:${contactResult.id}`,
+                            JSON.stringify(mappingData),
+                            'EX', 86400 * 30
+                        ).catch(() => {});
+                    }
+
+                    // 转换消息格式
+                    const cwMessages = messages.map(m => ({
+                        content: m.body || '',
+                        message_type: m.fromMe ? 1 : 0, // 1=outgoing, 0=incoming
+                        source_id: m.id,
+                        private: false,
+                        content_attributes: {
+                            wa_timestamp: m.timestamp,
+                            wa_type: m.type,
+                            synced_from_history: true
+                        }
+                    }));
+
+                    // 批量创建消息
+                    const batchResult = await cw.syncMessagesInBatches({
+                        account_id: CHATWOOT_ACCOUNT_ID,
+                        conversation_id: convResult.id,
+                        messages: cwMessages,
+                        batchSize: 50,
+                        delayMs: 100
+                    });
+
+                    results.created += batchResult.created || 0;
+                    results.skipped += batchResult.skipped || 0;
+                    results.failed += batchResult.failed || 0;
+
+                    if (batchResult.errors && batchResult.errors.length > 0) {
+                        results.errors.push(...batchResult.errors.slice(0, 5)); // 只保留前5个错误
+                    }
+
+                } catch (e) {
+                    logToCollector('[BATCH_SYNC] Contact error', {
+                        chatId: contact.chatId,
+                        error: e.message
+                    });
+                    results.failed += (contact.messages?.length || 0);
+                    results.errors.push({ chatId: contact.chatId, error: e.message });
+                }
+            }
+        }
+
+        const duration = Date.now() - startTime;
+        logToCollector('[BATCH_SYNC] Complete', {
+            duration,
+            ...results,
+            errorCount: results.errors.length
+        });
+
+        res.json({
+            ok: true,
+            ...results,
+            duration,
+            errors: results.errors.slice(0, 20) // 只返回前20个错误
+        });
+
+    } catch (e) {
+        logToCollector('[BATCH_SYNC] Fatal error', { error: e.message });
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+
+// 功能：比较 WA 最新消息与 Chatwoot 中的消息，找出差异
+app.post('/compare-messages', async (req, res) => {
+    try {
+        const { sessionId, contacts } = req.body;
+
+        if (!contacts || !Array.isArray(contacts)) {
+            return res.status(400).json({ ok: false, error: 'Missing contacts array' });
+        }
+
+        const results = [];
+
+        for (const contact of contacts) {
+            const { chatId, phone, phone_lid, lastMessage } = contact;
+
+            try {
+                // 查找 Chatwoot 中的联系人
+                const identifier = `wa:${sessionId}:${phone || phone_lid}`;
+                const cwContact = await cw.searchContact({
+                    account_id: CHATWOOT_ACCOUNT_ID,
+                    identifier
+                });
+
+                if (!cwContact) {
+                    results.push({
+                        chatId,
+                        status: 'contact_not_found',
+                        needsSync: true
+                    });
+                    continue;
+                }
+
+                // 获取会话
+                // 注：需要根据你的实现获取 conversation_id
+                // 这里假设你有一个方法可以通过 contact_id 获取最近的会话
+
+                results.push({
+                    chatId,
+                    contactId: cwContact.id,
+                    status: 'found',
+                    waLastMessage: lastMessage,
+                    needsSync: false // 需要进一步比较来确定
+                });
+
+            } catch (e) {
+                results.push({
+                    chatId,
+                    status: 'error',
+                    error: e.message,
+                    needsSync: true
+                });
+            }
+        }
+
+        res.json({ ok: true, results });
+
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+
+// 功能：同步指定聊天中缺失的消息
+app.post('/sync-missing-messages', async (req, res) => {
+    try {
+        const { sessionId, chatId, messages, conversation_id } = req.body;
+
+        if (!messages || !Array.isArray(messages) || !conversation_id) {
+            return res.status(400).json({
+                ok: false,
+                error: 'Missing messages array or conversation_id'
+            });
+        }
+
+        logToCollector('[SYNC_MISSING] Start', {
+            sessionId,
+            chatId,
+            messageCount: messages.length
+        });
+
+        // 转换消息格式
+        const cwMessages = messages.map(m => ({
+            content: m.body || m.text || '',
+            message_type: m.fromMe ? 1 : 0,
+            source_id: m.id || m.messageId,
+            private: false,
+            content_attributes: {
+                wa_timestamp: m.timestamp,
+                wa_type: m.type,
+                synced_from_other_device: true
+            }
+        }));
+
+        // 批量创建
+        const result = await cw.syncMessagesInBatches({
+            account_id: CHATWOOT_ACCOUNT_ID,
+            conversation_id,
+            messages: cwMessages,
+            batchSize: 20,
+            delayMs: 50
+        });
+
+        logToCollector('[SYNC_MISSING] Complete', {
+            sessionId,
+            chatId,
+            created: result.created,
+            skipped: result.skipped,
+            failed: result.failed
+        });
+
+        res.json({ ok: true, ...result });
+
+    } catch (e) {
+        logToCollector('[SYNC_MISSING] Error', { error: e.message });
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+
+// 功能：调试 Redis 映射数据
+app.get('/debug/mapping/:identifier', async (req, res) => {
+    try {
+        const { identifier } = req.params;
+
+        if (!redis) {
+            return res.status(400).json({ ok: false, error: 'Redis not configured' });
+        }
+
+        const results = {};
+
+        // 尝试不同的键格式
+        const keys = [
+            `cw:mapping:conv:${identifier}`,
+            `cw:mapping:contact:${identifier}`,
+            `cw:mapping:phone:${identifier}`,
+            `cw:contact:wa:*:${identifier}`
+        ];
+
+        for (const key of keys) {
+            if (key.includes('*')) {
+                // 模式匹配
+                const matchedKeys = await redis.keys(key);
+                for (const mk of matchedKeys.slice(0, 5)) {
+                    const val = await redis.get(mk);
+                    results[mk] = val ? JSON.parse(val) : null;
+                }
+            } else {
+                const val = await redis.get(key);
+                results[key] = val ? JSON.parse(val) : null;
+            }
+        }
+
+        res.json({ ok: true, identifier, mappings: results });
+
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[collector] up on 0.0.0.0:${PORT}`);

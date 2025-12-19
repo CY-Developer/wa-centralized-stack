@@ -1,4 +1,4 @@
-# WA 集中化栈（AdsPower + CDP + 可接 Chatwoot）
+  # WA 集中化栈（AdsPower + CDP + 可接 Chatwoot）
 
 一个面向生产的最小骨架，用于基于 **AdsPower + Puppeteer/CDP** 的 **WhatsApp Web 消息聚合**，
 并实现**读/写解耦**与**可接入 Chatwoot** 的集成。
