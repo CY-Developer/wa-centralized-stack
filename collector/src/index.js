@@ -16,6 +16,24 @@ const MEDIA_DIR = path.resolve(CFG.chatwoot.MEDIA_DIR || 'data/media');
 const CHATWOOT_ACCOUNT_ID = CFG.chatwoot.accountId || '';
 const CHATWOOT_INBOX_ID = CFG.chatwoot.inboxId || null;
 const CHATWOOT_INBOX_IDENTIFIER = CFG.chatwoot.inboxIdentifier || null;
+
+// ★★★ 新增：Session -> Inbox 映射 ★★★
+// 格式: CHATWOOT_INBOX_MAP=sessionId1:inboxId1,sessionId2:inboxId2
+// 例如: CHATWOOT_INBOX_MAP=k17se6o0:3,k16f9wid:4
+const CHATWOOT_INBOX_MAP_RAW = process.env.CHATWOOT_INBOX_MAP || '';
+const CHATWOOT_INBOX_MAP = new Map();
+if (CHATWOOT_INBOX_MAP_RAW) {
+    CHATWOOT_INBOX_MAP_RAW.split(',').forEach(pair => {
+        const [sessionId, inboxId] = pair.trim().split(':');
+        if (sessionId && inboxId && /^\d+$/.test(inboxId)) {
+            CHATWOOT_INBOX_MAP.set(sessionId.trim(), Number(inboxId));
+        }
+    });
+    if (CHATWOOT_INBOX_MAP.size > 0) {
+        console.log('[CONFIG] Session->Inbox mapping:', Object.fromEntries(CHATWOOT_INBOX_MAP));
+    }
+}
+
 // ★★★ 支持多种环境变量名称 ★★★
 const CHATWOOT_TOKEN = process.env.CHATWOOT_API_ACCESS_TOKEN || process.env.CHATWOOT_API_TOKEN || CFG.chatwoot.token || '';
 
@@ -279,10 +297,27 @@ async function resolveWaTarget({redis, conversation_id, sender, fallback, WA_DEF
     // 2) 再退到联系人映射
     if (!m && sender?.id) m = await getJSON(`cw:mapping:contact:${sender.id}`);
 
-    // 3) 再退到 Chatwoot 的 identifier: wa:<sessionId>:<digits>
+    // 3) 再退到 Chatwoot 的 identifier
+    // ★★★ 支持新格式: wa:sessionId:phone:123456 或 wa:sessionId:lid:123456 ★★★
+    // ★★★ 也支持旧格式: wa:sessionId:123456 ★★★
     const idParts = String(sender?.identifier || '').split(':');
-    const idSess = idParts[1] || null;
-    const idDigits = idParts[2] || null;
+    let idSess = null;
+    let idType = null;  // 'phone' 或 'lid'
+    let idDigits = null;
+
+    if (idParts[0] === 'wa') {
+        if (idParts.length === 4) {
+            // 新格式: wa:sessionId:phone:123456 或 wa:sessionId:lid:123456
+            idSess = idParts[1] || null;
+            idType = idParts[2] || null;  // 'phone' 或 'lid'
+            idDigits = idParts[3] || null;
+        } else if (idParts.length === 3) {
+            // 旧格式: wa:sessionId:123456
+            idSess = idParts[1] || null;
+            idDigits = idParts[2] || null;
+            idType = 'phone';  // 旧格式默认当作 phone
+        }
+    }
 
     // 4) 选 sessionId
     const sessionId = m?.sessionId
@@ -306,8 +341,12 @@ async function resolveWaTarget({redis, conversation_id, sender, fallback, WA_DEF
     if (!to && !to_lid) {
         const digits = idDigits || String(fallback || '').replace(/\D/g, '');
         if (digits) {
-            // 无法判断是电话还是 LID，假设是电话
-            to = digits;
+            // ★★★ 根据 identifier 类型判断是电话还是 LID ★★★
+            if (idType === 'lid') {
+                to_lid = digits;
+            } else {
+                to = digits;
+            }
         }
     }
 
@@ -371,13 +410,13 @@ function normalizeWaTo(input) {
     return digits ? `${digits}@c.us` : null;
 }
 
-async function postWithRetry(url, data, headers = {}, tries = 2) {
+async function postWithRetry(url, data, headers = {}, tries = 2, timeout = 120000) {
     const cfg = {
         method: 'post',
         url,
         data,
         headers: {'Content-Type': 'application/json', ...headers},
-        timeout: 120000,
+        timeout,
         httpAgent: keepAliveHttp,
         httpsAgent: keepAliveHttps,
         maxBodyLength: 30 * 1024 * 1024,
@@ -490,8 +529,34 @@ function normalizeAttachments({attachment, media, messageId}) {
 }
 
 let CACHED_INBOX_ID = CHATWOOT_INBOX_ID || null;
+const CACHED_SESSION_INBOX = new Map();  // session -> inbox 缓存
 
-async function resolveInboxId() {
+// ★★★ 修改：支持 sessionId 参数 ★★★
+async function resolveInboxId(sessionId = null) {
+    // 1. 如果有 session -> inbox 映射，优先使用
+    if (sessionId && CHATWOOT_INBOX_MAP.size > 0) {
+        // 检查缓存
+        if (CACHED_SESSION_INBOX.has(sessionId)) {
+            return CACHED_SESSION_INBOX.get(sessionId);
+        }
+
+        const mappedInboxId = CHATWOOT_INBOX_MAP.get(sessionId);
+        if (mappedInboxId) {
+            // 验证 inbox 存在
+            const list = await cw.listInboxes(CHATWOOT_ACCOUNT_ID);
+            const arr = (list && list.payload) || list || [];
+            const hit = arr.find(x => Number(x.id) === mappedInboxId);
+            if (hit) {
+                CACHED_SESSION_INBOX.set(sessionId, mappedInboxId);
+                console.log(`[resolveInboxId] Session ${sessionId} -> Inbox ${mappedInboxId}`);
+                return mappedInboxId;
+            } else {
+                console.warn(`[resolveInboxId] Mapped inbox ${mappedInboxId} not found for session ${sessionId}, falling back`);
+            }
+        }
+    }
+
+    // 2. 没有映射或映射失败，使用默认逻辑
     if (CACHED_INBOX_ID) return CACHED_INBOX_ID;
 
     if (CHATWOOT_INBOX_ID && /^\d+$/.test(String(CHATWOOT_INBOX_ID))) {
@@ -659,8 +724,8 @@ app.post('/ingest', async (req, res) => {
     const {
         sessionId,
         sessionName,
-        phone,
-        phone_lid,
+        phone: rawPhone,
+        phone_lid: rawPhoneLid,
         name,
         text,
         type,
@@ -669,6 +734,27 @@ app.post('/ingest', async (req, res) => {
         attachment,
         media
     } = req.body || {};
+
+    // ★★★ 关键修复：从 messageId 提取 phone/phone_lid ★★★
+    let phone = rawPhone;
+    let phone_lid = rawPhoneLid;
+
+    // 如果 phone 为空，尝试从 messageId 提取
+    if (!phone && messageId) {
+        // 检查是否是 LID 格式: false_27153387237439@lid_xxx
+        const lidMatch = messageId.match(/(\d+)@lid/);
+        if (lidMatch) {
+            phone_lid = lidMatch[1];
+            console.log(`[INGEST] Extracted phone_lid from messageId: ${phone_lid}`);
+        } else {
+            // 检查是否是普通格式: false_85270360156@c.us_xxx
+            const phoneMatch = messageId.match(/(\d+)@c\.us/);
+            if (phoneMatch) {
+                phone = phoneMatch[1];
+                console.log(`[INGEST] Extracted phone from messageId: ${phone}`);
+            }
+        }
+    }
 
     let retryAttempted = false;
     let contact, conv, conversation_id, inbox_id;
@@ -691,12 +777,12 @@ app.post('/ingest', async (req, res) => {
         }
 
         console.log('Received webhook:', {
-            sessionId, sessionName, phone, name, text, type, messageId,
+            sessionId, sessionName, phone, phone_lid, name, text, type, messageId,
             hasAttachment: !!attachment, hasMedia: !!media
         });
 
-        inbox_id = await resolveInboxId();
-        const phoneE164 = toE164(phone);
+        inbox_id = await resolveInboxId(sessionId);  // ★ 传入 sessionId
+        const phoneE164 = toE164(phone || phone_lid);
 
         // 1) 联系人（稳定复用：identifier=wa:<原始phone>，并尽量提取 E.164）
         contact = await cw.ensureContact({
@@ -705,7 +791,8 @@ app.post('/ingest', async (req, res) => {
             rawPhone_lid: phone_lid,
             rawName: name,
             sessionId,
-            sessionName  // ★ 传递动态名称
+            sessionName,  // ★ 传递动态名称
+            messageId     // ★ 传递 messageId 以便提取 digits
         });
 
 // 2) 会话（按联系人 + inbox 复用；不再传 source_id）
@@ -893,9 +980,9 @@ app.post('/ingest', async (req, res) => {
         if (is404 && !retryAttempted) {
             console.log('[INGEST] 404 detected, clearing cache and retrying');
 
-            // 清除缓存
+            // 清除缓存（包含 sessionId）
             const digits = (String(phone || phone_lid || '').match(/\d+/g) || []).join('');
-            cw.clearAllCacheForDigits(digits);
+            cw.clearAllCacheForDigits(digits, sessionId);
 
             retryAttempted = true;
 
@@ -1099,7 +1186,7 @@ app.post('/ingest-outgoing', async (req, res) => {
         }
 
         // 6. 确保会话存在
-        const inbox_id = await resolveInboxId();
+        const inbox_id = await resolveInboxId(sessionId);  // ★ 传入 sessionId
         const conv = await cw.ensureConversation({
             account_id: CHATWOOT_ACCOUNT_ID,
             inbox_id,
@@ -1282,9 +1369,9 @@ app.post('/ingest-outgoing', async (req, res) => {
                     contact_id: contact?.id
                 });
 
-                // 清除缓存
+                // 清除缓存（包含 sessionId）
                 const digits = (String(phone || phone_lid || '').match(/\d+/g) || []).join('');
-                cw.clearAllCacheForDigits(digits);
+                cw.clearAllCacheForDigits(digits, sessionId);
 
                 // 标记已重试
                 retryAttempted = true;
@@ -1300,7 +1387,7 @@ app.post('/ingest-outgoing', async (req, res) => {
                     messageId
                 });
 
-                const inbox_id = await resolveInboxId();
+                const inbox_id = await resolveInboxId(sessionId);  // ★ 传入 sessionId
                 const newConv = await cw.ensureConversation({
                     account_id: CHATWOOT_ACCOUNT_ID,
                     inbox_id,
@@ -1573,7 +1660,7 @@ app.post('/sync-messages', async (req, res) => {
             });
 
             try {
-                const inbox_id = await resolveInboxId();
+                const inbox_id = await resolveInboxId(inputSessionId);  // ★ 传入 sessionId
 
                 // ★★★ 简化：直接调用 ensureContact/ensureConversation ★★★
                 // 它们内部已经有查找已存在联系人/会话的逻辑，不需要 Redis 缓存查找
@@ -1706,6 +1793,17 @@ app.post('/sync-messages', async (req, res) => {
         // ★★★ 修改：启动同步模式优先使用传入的参数 ★★★
         let waMapping = startupSyncMapping;
 
+        // ★★★ 关键修复：如果传入了 chatId/sessionId 参数，直接使用 ★★★
+        if (!waMapping && inputChatId && inputSessionId) {
+            waMapping = {
+                sessionId: inputSessionId,
+                chatId: inputChatId,
+                phone: inputPhone,
+                phone_lid: inputPhoneLid
+            };
+            logToCollector('[SYNC] Using provided chatId/sessionId', waMapping);
+        }
+
         if (!waMapping && redis) {
             const keys = [
                 `cw:mapping:conv:${conversation_id}`,
@@ -1731,10 +1829,16 @@ app.post('/sync-messages', async (req, res) => {
                 sender.identifier?.replace(/[^\d]/g, '');
 
             if (phone) {
+                // ★★★ 修复：检查 identifier 是否包含 @lid 来决定格式 ★★★
+                const isLid = sender.identifier?.includes('@lid') ||
+                    sender.identifier?.includes(':lid:') ||
+                    (inputChatId && inputChatId.includes('@lid'));
+
                 waMapping = {
-                    sessionId: WA_DEFAULT_SESSION.split(',')[0]?.trim(),
-                    phone: phone,
-                    chatId: `${phone}@c.us`
+                    sessionId: inputSessionId || WA_DEFAULT_SESSION.split(',')[0]?.trim(),
+                    phone: isLid ? null : phone,
+                    phone_lid: isLid ? phone : null,
+                    chatId: isLid ? `${phone}@lid` : `${phone}@c.us`
                 };
                 logToCollector('[SYNC] Inferred mapping from phone', waMapping);
             }
@@ -2309,7 +2413,8 @@ app.post('/startup-sync', async (req, res) => {
             markRecentAsUnread
         });
 
-        const inbox_id = await resolveInboxId();
+        // ★★★ 移除：不再在这里预先解析 inbox_id ★★★
+        // const inbox_id = await resolveInboxId();
 
         const results = {
             processed: 0,
@@ -2368,6 +2473,9 @@ app.post('/startup-sync', async (req, res) => {
                     sessionId,
                     sessionName
                 });
+
+                // ★★★ 新增：每个联系人根据 sessionId 解析 inbox ★★★
+                const inbox_id = await resolveInboxId(sessionId);
 
                 // 2. 确保会话存在
                 const conv = await cw.ensureConversation({
@@ -3284,54 +3392,64 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     payload.attachments = mediaList;
                 }
 
-                // 【Bug 1 修复】同步发送，等待结果
-                try {
-                    const result = await postWithRetry(`${WA_BRIDGE_URL}/send/media`, payload, headers);
+                // ★★★ 异步发送媒体：先返回成功，后台发送 ★★★
+                // 这样即使发送40张图片需要1分钟，Chatwoot 也不会超时
+                logToCollector('[CW->WA] MEDIA_ASYNC_START', {
+                    message_id,
+                    count: mediaList.length,
+                    session: finalSession
+                });
 
-                    const success = result?.ok || result?.success;
-                    const failedItems = (result?.results || []).filter(r => !r.ok);
+                // 立即返回成功给 Chatwoot
+                res.json({
+                    ok: true,
+                    sent: true,
+                    async: true,
+                    mediaCount: mediaList.length,
+                    message_id
+                });
 
-                    logToCollector('[CW->WA] MEDIA_RESULT', {
-                        success,
-                        total: result?.total,
-                        failed: failedItems.length,
-                        message_id
-                    });
+                // 后台异步发送（不阻塞响应）
+                setImmediate(async () => {
+                    const startTime = Date.now();
+                    try {
+                        const result = await postWithRetry(`${WA_BRIDGE_URL}/send/media`, payload, headers, 3, 180000); // 3分钟超时
 
-                    if (!success || failedItems.length > 0) {
-                        const errorMsg = failedItems.map(f => f.error).join('; ') || 'media send failed';
-                        await markMessageAsFailed(account_id, conversation_id, message_id, errorMsg);
-                        return res.json({
-                            ok: false,
-                            error: errorMsg,
+                        const success = result?.ok || result?.success;
+                        const failedItems = (result?.results || []).filter(r => !r.ok);
+                        const duration = Date.now() - startTime;
+
+                        if (success && failedItems.length === 0) {
+                            logToCollector('[CW->WA] MEDIA_ASYNC_OK', {
+                                message_id,
+                                total: result?.total || mediaList.length,
+                                duration: `${duration}ms`
+                            });
+                            console.log(`[MEDIA_ASYNC] ✓ 发送成功: message_id=${message_id}, count=${mediaList.length}, duration=${duration}ms`);
+                        } else {
+                            const errorMsg = failedItems.map(f => f.error).join('; ') || 'partial failure';
+                            logToCollector('[CW->WA] MEDIA_ASYNC_PARTIAL', {
+                                message_id,
+                                total: result?.total,
+                                failed: failedItems.length,
+                                error: errorMsg,
+                                duration: `${duration}ms`
+                            });
+                            console.error(`[MEDIA_ASYNC] ⚠ 部分失败: message_id=${message_id}, failed=${failedItems.length}/${mediaList.length}, error=${errorMsg}`);
+                        }
+                    } catch (err) {
+                        const duration = Date.now() - startTime;
+                        const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
+                        logToCollector('[CW->WA] MEDIA_ASYNC_ERROR', {
                             message_id,
-                            failed_items: failedItems
+                            error: errorMsg,
+                            duration: `${duration}ms`
                         });
+                        console.error(`[MEDIA_ASYNC] ✗ 发送失败: message_id=${message_id}, error=${errorMsg}, duration=${duration}ms`);
                     }
+                });
 
-                    return res.json({
-                        ok: true,
-                        sent: true,
-                        mediaCount: mediaList.length,
-                        message_id
-                    });
-
-                } catch (err) {
-                    const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
-                    console.error('[CW->WA] MEDIA_ERROR', errorMsg);
-                    logToCollector('[CW->WA] MEDIA_ERROR', {
-                        error: errorMsg,
-                        message_id
-                    });
-
-                    await markMessageAsFailed(account_id, conversation_id, message_id, errorMsg);
-
-                    return res.json({
-                        ok: false,
-                        error: errorMsg,
-                        message_id
-                    });
-                }
+                return; // 已经返回响应，直接退出
             }
         }
 
@@ -3458,17 +3576,22 @@ app.post('/batch-sync-history', async (req, res) => {
             errors: []
         };
 
-        const inbox_id = await resolveInboxId();
+        // ★★★ 移除：不再在这里预先解析 inbox_id ★★★
+        // const inbox_id = await resolveInboxId();
 
         for (const sessionData of sessions) {
             const { sessionId, sessionName, contacts } = sessionData;
 
             if (!contacts || contacts.length === 0) continue;
 
+            // ★★★ 新增：每个 session 解析自己的 inbox ★★★
+            const inbox_id = await resolveInboxId(sessionId);
+
             logToCollector('[BATCH_SYNC] Processing session', {
                 sessionId,
                 sessionName,
-                contactCount: contacts.length
+                contactCount: contacts.length,
+                inbox_id
             });
 
             for (const contact of contacts) {

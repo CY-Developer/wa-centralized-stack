@@ -8,29 +8,79 @@ const contactCache = new Map();  // key: digits -> value: { contact, timestamp }
 const conversationCache = new Map();  // key: contact_id:inbox_id -> value: { conversation, timestamp }
 const CACHE_TTL = 5 * 60 * 1000; // 5 分钟过期
 
-function cacheContact(digits, contact) {
-  if (!digits || !contact?.id) return;
-  contactCache.set(digits, { contact, timestamp: Date.now() });
-  console.log(`[contactCache] Cached contact ${contact.id} for digits ${digits}`);
+// ★★★ 新增：锁机制（防止并发创建多个联系人/会话） ★★★
+const contactLocks = new Map();      // key: digits -> value: Promise
+const conversationLocks = new Map();  // key: contact_id:inbox_id -> value: Promise
+
+async function withContactLock(digits, fn) {
+  if (!digits) return fn();
+
+  // 等待之前的操作完成
+  while (contactLocks.has(digits)) {
+    await contactLocks.get(digits).catch(() => {});
+  }
+
+  // 创建新的 Promise 并设置锁
+  let resolve;
+  const lockPromise = new Promise(r => { resolve = r; });
+  contactLocks.set(digits, lockPromise);
+
+  try {
+    return await fn();
+  } finally {
+    contactLocks.delete(digits);
+    resolve();
+  }
 }
 
-function getCachedContact(digits) {
+async function withConversationLock(contact_id, inbox_id, fn) {
+  const key = `${contact_id}:${inbox_id}`;
+
+  // 等待之前的操作完成
+  while (conversationLocks.has(key)) {
+    await conversationLocks.get(key).catch(() => {});
+  }
+
+  // 创建新的 Promise 并设置锁
+  let resolve;
+  const lockPromise = new Promise(r => { resolve = r; });
+  conversationLocks.set(key, lockPromise);
+
+  try {
+    return await fn();
+  } finally {
+    conversationLocks.delete(key);
+    resolve();
+  }
+}
+
+// ★★★ 修改：缓存 key 改为 digits:sessionId，区分不同 WhatsApp 账号 ★★★
+function cacheContact(digits, sessionId, contact) {
+  if (!digits || !contact?.id) return;
+  const key = sessionId ? `${digits}:${sessionId}` : digits;
+  contactCache.set(key, { contact, timestamp: Date.now() });
+  console.log(`[contactCache] Cached contact ${contact.id} for key ${key}`);
+}
+
+function getCachedContact(digits, sessionId) {
   if (!digits) return null;
-  const cached = contactCache.get(digits);
+  const key = sessionId ? `${digits}:${sessionId}` : digits;
+  const cached = contactCache.get(key);
   if (!cached) return null;
   if (Date.now() - cached.timestamp > CACHE_TTL) {
-    contactCache.delete(digits);
+    contactCache.delete(key);
     return null;
   }
-  console.log(`[contactCache] Hit! contact ${cached.contact.id} for digits ${digits}`);
+  console.log(`[contactCache] Hit! contact ${cached.contact.id} for key ${key}`);
   return cached.contact;
 }
 
 // ★★★ 新增：清除联系人缓存 ★★★
-function clearContactCache(digits) {
+function clearContactCache(digits, sessionId) {
   if (!digits) return;
-  contactCache.delete(digits);
-  console.log(`[contactCache] Cleared cache for digits ${digits}`);
+  const key = sessionId ? `${digits}:${sessionId}` : digits;
+  contactCache.delete(key);
+  console.log(`[contactCache] Cleared cache for key ${key}`);
 }
 
 // ★★★ 新增：会话缓存 ★★★
@@ -62,21 +112,22 @@ function clearConversationCache(contact_id, inbox_id) {
   console.log(`[conversationCache] Cleared cache for contact ${contact_id} inbox ${inbox_id}`);
 }
 
-// ★★★ 新增：清除所有与联系人相关的缓存 ★★★
-function clearAllCacheForDigits(digits) {
+// ★★★ 修改：清除所有与联系人相关的缓存（需要 sessionId） ★★★
+function clearAllCacheForDigits(digits, sessionId) {
   if (!digits) return;
-  const cached = contactCache.get(digits);
+  const key = sessionId ? `${digits}:${sessionId}` : digits;
+  const cached = contactCache.get(key);
   if (cached?.contact?.id) {
     // 清除该联系人的所有会话缓存
-    for (const key of conversationCache.keys()) {
-      if (key.startsWith(`${cached.contact.id}:`)) {
-        conversationCache.delete(key);
-        console.log(`[conversationCache] Cleared related cache: ${key}`);
+    for (const cacheKey of conversationCache.keys()) {
+      if (cacheKey.startsWith(`${cached.contact.id}:`)) {
+        conversationCache.delete(cacheKey);
+        console.log(`[conversationCache] Cleared related cache: ${cacheKey}`);
       }
     }
   }
-  contactCache.delete(digits);
-  console.log(`[cache] Cleared all cache for digits ${digits}`);
+  contactCache.delete(key);
+  console.log(`[cache] Cleared all cache for key ${key}`);
 }
 
 // 尝试导入 SessionManager（可选依赖）
@@ -377,13 +428,19 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
     return match ? match[1] : '';
   };
 
+  // ★★★ 判断是 phone 还是 lid ★★★
+  const isLid = !rawPhone && (rawPhone_lid || getLidDigits(messageId));
   const finalPhone = rawPhone || rawPhone_lid || getLidDigits(messageId);
   const digits = (String(finalPhone || '').match(/\d+/g) || []).join('');
-  const identifier = `wa:${sessionId || 'default'}:${digits}`;
+
+  // ★★★ 修改 identifier 格式，区分 phone 和 lid ★★★
+  // 新格式: wa:sessionId:phone:123456 或 wa:sessionId:lid:123456
+  const identifierType = isLid ? 'lid' : 'phone';
+  const identifier = `wa:${sessionId || 'default'}:${identifierType}:${digits}`;
   const phone_e164 = normalizeE164(finalPhone, rawName);
 
-  // ★★★ 新增：先查内存缓存（解决 Chatwoot 搜索 API 索引延迟） ★★★
-  let contact = getCachedContact(digits);
+  // ★★★ 缓存 key 改为 digits:sessionId，区分不同 WhatsApp 账号 ★★★
+  let contact = getCachedContact(digits, sessionId);
   if (contact) {
     console.log(`[ensureContact] Found in cache: id=${contact.id}, name=${contact.name}`);
     // 缓存命中，但还是更新一下信息
@@ -394,108 +451,143 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
     if (contact.name !== wantName) {
       try {
         contact = await updateContact({ account_id, contact_id: contact.id, patch: { name: wantName } });
-        cacheContact(digits, contact);  // 更新缓存
+        cacheContact(digits, sessionId, contact);  // 更新缓存
       } catch (_) {}
     }
     return contact;
   }
 
-  // ★★★ 原有搜索逻辑 ★★★
-
-  // 1. 按 identifier 搜索
-  contact = await searchContact({ account_id, identifier });
-  if (contact) {
-    console.log(`[ensureContact] Found by identifier: id=${contact.id}, name=${contact.name}`);
-  }
-
-  // 2. 如果找不到，按电话号码精确搜索
-  if (!contact && phone_e164) {
-    contact = await findContactByPhone({ account_id, phone_e164 });
+  // ★★★ 使用锁防止并发创建多个联系人（锁 key 也要包含 sessionId）★★★
+  const lockKey = sessionId ? `${digits}:${sessionId}` : digits;
+  return withContactLock(lockKey, async () => {
+    // 再次检查缓存（可能在等待锁期间被其他请求创建了）
+    let contact = getCachedContact(digits, sessionId);
     if (contact) {
-      console.log(`[ensureContact] Found by phone_e164: id=${contact.id}, name=${contact.name}`);
+      console.log(`[ensureContact] Found in cache after lock: id=${contact.id}, name=${contact.name}`);
+      return contact;
     }
-  }
 
-  // 3. 如果还找不到，按纯数字搜索（更广泛）
-  if (!contact && digits) {
-    console.log(`[ensureContact] Searching by digits: ${digits}`);
-    const searchResult = await findContactByDigits({ account_id, digits });
-    if (searchResult) {
-      console.log(`[ensureContact] Found by digits: id=${searchResult.id}, name=${searchResult.name}`);
-      contact = searchResult;
+    // ★★★ 原有搜索逻辑 ★★★
+
+    // 1. 按新格式 identifier 搜索
+    contact = await searchContact({ account_id, identifier });
+    if (contact) {
+      console.log(`[ensureContact] Found by identifier: id=${contact.id}, name=${contact.name}`);
     }
-  }
 
-  const wantName = buildDisplayName(sessionId, rawName, phone_e164, identifier, sessionName);
-  const wantAttrs = { session_id: sessionId || null };
+    // 1.5 ★★★ 兼容旧格式 identifier 搜索 ★★★
+    if (!contact && digits && sessionId) {
+      const oldIdentifier = `wa:${sessionId}:${digits}`;
+      contact = await searchContact({ account_id, identifier: oldIdentifier });
+      if (contact) {
+        console.log(`[ensureContact] Found by old identifier: id=${contact.id}, name=${contact.name}`);
+      }
+    }
 
-  if (!contact) {
-    console.log(`[ensureContact] No existing contact found, creating new: ${wantName}`);
-    try {
-      contact = await createContact({
-        account_id,
-        name: wantName,
-        identifier,
-        phone_e164,
-        custom_attributes: wantAttrs,
-        withPhone: true
-      });
-    } catch (e) {
-      const msg = (e._cw?.error || e._cw?.message || e.message || '').toLowerCase();
-      if (msg.includes('identifier') && msg.includes('taken')) {
-        await new Promise(r => setTimeout(r, 500));
-        contact = await searchContact({ account_id, identifier });
-        if (!contact) throw e;
-      } else if (msg.includes('phone number') && msg.includes('taken')) {
+    // 2. 如果找不到，按电话号码精确搜索
+    // ★★★ 修复：LID 不是真实电话号码，不应该用 phone_e164 搜索 ★★★
+    if (!contact && phone_e164 && !isLid) {
+      contact = await findContactByPhone({ account_id, phone_e164 });
+      if (contact) {
+        // ★★★ 检查找到的联系人是否属于当前 session ★★★
+        const contactSessionId = contact.identifier?.split(':')[1];
+        if (sessionId && contactSessionId && contactSessionId !== sessionId) {
+          console.log(`[ensureContact] Found by phone_e164 but different session: ${contactSessionId} vs ${sessionId}, skipping`);
+          contact = null;
+        } else {
+          console.log(`[ensureContact] Found by phone_e164: id=${contact.id}, name=${contact.name}`);
+        }
+      }
+    }
+
+    // 3. 如果还找不到，按纯数字搜索（更广泛）
+    if (!contact && digits) {
+      console.log(`[ensureContact] Searching by digits: ${digits}`);
+      const searchResult = await findContactByDigits({ account_id, digits });
+      if (searchResult) {
+        // ★★★ 检查找到的联系人是否属于当前 session ★★★
+        const contactSessionId = searchResult.identifier?.split(':')[1];
+        if (sessionId && contactSessionId && contactSessionId !== sessionId) {
+          console.log(`[ensureContact] Found by digits but different session: ${contactSessionId} vs ${sessionId}, skipping`);
+          // 不使用这个联系人
+        } else {
+          console.log(`[ensureContact] Found by digits: id=${searchResult.id}, name=${searchResult.name}`);
+          contact = searchResult;
+        }
+      }
+    }
+
+    const wantName = buildDisplayName(sessionId, rawName, phone_e164, identifier, sessionName);
+    const wantAttrs = { session_id: sessionId || null };
+
+    if (!contact) {
+      console.log(`[ensureContact] No existing contact found, creating new: ${wantName}`);
+      try {
         contact = await createContact({
           account_id,
           name: wantName,
           identifier,
-          phone_e164: undefined,
+          phone_e164,
           custom_attributes: wantAttrs,
-          withPhone: false
+          withPhone: true
         });
-      } else {
-        throw e;
-      }
-    }
-  } else {
-    // 更新联系人信息（更新 identifier 确保统一）
-    const patch = {};
-    const pure = (s) => (s || '').replace(/[^\+\d]/g, '');
-
-    // ★★★ 关键：如果找到的联系人 identifier 不同，更新它 ★★★
-    if (contact.identifier !== identifier) {
-      console.log(`[ensureContact] Updating identifier: ${contact.identifier} -> ${identifier}`);
-      patch.identifier = identifier;
-    }
-
-    if (contact.name !== wantName) patch.name = wantName;
-    if (phone_e164) {
-      const owner = await findContactByPhone({ account_id, phone_e164 });
-      if (!owner || owner.id === contact.id) {
-        if (pure(contact.phone_number) !== pure(phone_e164)) patch.phone_number = phone_e164;
-      }
-    }
-    if ((contact.custom_attributes?.session_id || null) !== (sessionId || null)) {
-      patch.custom_attributes = { ...(contact.custom_attributes || {}), session_id: sessionId || null };
-    }
-    if (Object.keys(patch).length) {
-      try {
-        contact = await updateContact({ account_id, contact_id: contact.id, patch });
-        console.log(`[ensureContact] Updated contact: id=${contact.id}`);
       } catch (e) {
-        console.warn(`[ensureContact] Update failed:`, e.message);
+        const msg = (e._cw?.error || e._cw?.message || e.message || '').toLowerCase();
+        if (msg.includes('identifier') && msg.includes('taken')) {
+          await new Promise(r => setTimeout(r, 500));
+          contact = await searchContact({ account_id, identifier });
+          if (!contact) throw e;
+        } else if (msg.includes('phone number') && msg.includes('taken')) {
+          contact = await createContact({
+            account_id,
+            name: wantName,
+            identifier,
+            phone_e164: undefined,
+            custom_attributes: wantAttrs,
+            withPhone: false
+          });
+        } else {
+          throw e;
+        }
+      }
+    } else {
+      // 更新联系人信息（更新 identifier 确保统一）
+      const patch = {};
+      const pure = (s) => (s || '').replace(/[^\+\d]/g, '');
+
+      // ★★★ 关键：如果找到的联系人 identifier 不同，更新它 ★★★
+      if (contact.identifier !== identifier) {
+        console.log(`[ensureContact] Updating identifier: ${contact.identifier} -> ${identifier}`);
+        patch.identifier = identifier;
+      }
+
+      if (contact.name !== wantName) patch.name = wantName;
+      if (phone_e164) {
+        const owner = await findContactByPhone({ account_id, phone_e164 });
+        if (!owner || owner.id === contact.id) {
+          if (pure(contact.phone_number) !== pure(phone_e164)) patch.phone_number = phone_e164;
+        }
+      }
+      if ((contact.custom_attributes?.session_id || null) !== (sessionId || null)) {
+        patch.custom_attributes = { ...(contact.custom_attributes || {}), session_id: sessionId || null };
+      }
+      if (Object.keys(patch).length) {
+        try {
+          contact = await updateContact({ account_id, contact_id: contact.id, patch });
+          console.log(`[ensureContact] Updated contact: id=${contact.id}`);
+        } catch (e) {
+          console.warn(`[ensureContact] Update failed:`, e.message);
+        }
       }
     }
-  }
 
-  // ★★★ 新增：将联系人添加到缓存 ★★★
-  if (contact && digits) {
-    cacheContact(digits, contact);
-  }
+    // ★★★ 新增：将联系人添加到缓存（包含 sessionId）★★★
+    if (contact && digits) {
+      cacheContact(digits, sessionId, contact);
+    }
 
-  return contact;
+    return contact;
+  });
 }
 
 
@@ -574,40 +666,51 @@ async function ensureConversation({ account_id = DEFAULT_ACCOUNT_ID, contact_id,
     return cachedConv;
   }
 
-  const list = await getContactConversations({ account_id, contact_id });
-  const items = Array.isArray(list?.payload) ? list.payload : (list || []);
-
-  // 1. 优先复用未解决的会话
-  const openConv = items.find(c => Number(c.inbox_id) === Number(inbox_id) && c.status !== 'resolved');
-  if (openConv) {
-    console.log(`[ensureConversation] Reusing open conversation: ${openConv.id}`);
-    openConv._isNew = false;
-    cacheConversation(contact_id, inbox_id, openConv);  // 缓存
-    return openConv;
-  }
-
-  // 2. 复用任何该 inbox 下的会话
-  const anyConv = items.find(c => Number(c.inbox_id) === Number(inbox_id));
-  if (anyConv) {
-    console.log(`[ensureConversation] Reusing existing conversation (was ${anyConv.status}): ${anyConv.id}`);
-    try {
-      await cwRequest('post', `/api/v1/accounts/${account_id}/conversations/${anyConv.id}/toggle_status`, {
-        data: { status: 'open' }
-      });
-    } catch (e) {
-      console.warn(`[ensureConversation] Failed to reopen:`, e.message);
+  // ★★★ 使用锁防止并发创建多个会话 ★★★
+  return withConversationLock(contact_id, inbox_id, async () => {
+    // 再次检查缓存（可能在等待锁期间被其他请求创建了）
+    const cachedConv2 = getCachedConversation(contact_id, inbox_id);
+    if (cachedConv2) {
+      console.log(`[ensureConversation] Found in cache after lock: ${cachedConv2.id}`);
+      cachedConv2._isNew = false;
+      return cachedConv2;
     }
-    anyConv._isNew = false;
-    cacheConversation(contact_id, inbox_id, anyConv);  // 缓存
-    return anyConv;
-  }
 
-  // 3. 创建新会话
-  console.log(`[ensureConversation] Creating new conversation for contact ${contact_id} in inbox ${inbox_id}`);
-  const newConv = await createConversation({ account_id, inbox_id, contact_id });
-  newConv._isNew = true;
-  cacheConversation(contact_id, inbox_id, newConv);  // 缓存
-  return newConv;
+    const list = await getContactConversations({ account_id, contact_id });
+    const items = Array.isArray(list?.payload) ? list.payload : (list || []);
+
+    // 1. 优先复用未解决的会话
+    const openConv = items.find(c => Number(c.inbox_id) === Number(inbox_id) && c.status !== 'resolved');
+    if (openConv) {
+      console.log(`[ensureConversation] Reusing open conversation: ${openConv.id}`);
+      openConv._isNew = false;
+      cacheConversation(contact_id, inbox_id, openConv);  // 缓存
+      return openConv;
+    }
+
+    // 2. 复用任何该 inbox 下的会话
+    const anyConv = items.find(c => Number(c.inbox_id) === Number(inbox_id));
+    if (anyConv) {
+      console.log(`[ensureConversation] Reusing existing conversation (was ${anyConv.status}): ${anyConv.id}`);
+      try {
+        await cwRequest('post', `/api/v1/accounts/${account_id}/conversations/${anyConv.id}/toggle_status`, {
+          data: { status: 'open' }
+        });
+      } catch (e) {
+        console.warn(`[ensureConversation] Failed to reopen:`, e.message);
+      }
+      anyConv._isNew = false;
+      cacheConversation(contact_id, inbox_id, anyConv);  // 缓存
+      return anyConv;
+    }
+
+    // 3. 创建新会话
+    console.log(`[ensureConversation] Creating new conversation for contact ${contact_id} in inbox ${inbox_id}`);
+    const newConv = await createConversation({ account_id, inbox_id, contact_id });
+    newConv._isNew = true;
+    cacheConversation(contact_id, inbox_id, newConv);  // 缓存
+    return newConv;
+  });
 }
 
 
