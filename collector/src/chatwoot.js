@@ -449,10 +449,18 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
 
     // 检查是否需要更新名称
     if (contact.name !== wantName) {
+      const originalContact = contact;
       try {
-        contact = await updateContact({ account_id, contact_id: contact.id, patch: { name: wantName } });
-        cacheContact(digits, sessionId, contact);  // 更新缓存
-      } catch (_) {}
+        const updated = await updateContact({ account_id, contact_id: contact.id, patch: { name: wantName } });
+        if (updated && updated.id) {
+          contact = updated;
+          cacheContact(digits, sessionId, contact);  // 更新缓存
+        } else {
+          contact = originalContact;  // 恢复原来的 contact
+        }
+      } catch (_) {
+        contact = originalContact;  // 恢复原来的 contact
+      }
     }
     return contact;
   }
@@ -572,11 +580,21 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
         patch.custom_attributes = { ...(contact.custom_attributes || {}), session_id: sessionId || null };
       }
       if (Object.keys(patch).length) {
+        // ★★★ 关键修复：保存原来的 contact，防止 updateContact 返回 undefined ★★★
+        const originalContact = contact;
         try {
-          contact = await updateContact({ account_id, contact_id: contact.id, patch });
-          console.log(`[ensureContact] Updated contact: id=${contact.id}`);
+          const updated = await updateContact({ account_id, contact_id: contact.id, patch });
+          // 只有返回有效的联系人对象时才更新
+          if (updated && updated.id) {
+            contact = updated;
+            console.log(`[ensureContact] Updated contact: id=${contact.id}`);
+          } else {
+            console.warn(`[ensureContact] Update returned invalid data, keeping original contact: id=${originalContact.id}`);
+            contact = originalContact;
+          }
         } catch (e) {
           console.warn(`[ensureContact] Update failed:`, e.message);
+          contact = originalContact;  // 恢复原来的 contact
         }
       }
     }

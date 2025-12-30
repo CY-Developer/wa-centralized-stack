@@ -818,7 +818,20 @@ class SessionManager extends EventEmitter {
                 // ★★★ 修复：OPENING 状态视为正在连接，不触发重启 ★★★
                 const waState = checkResult.checks.waState;
                 const isConnectedOrOpening = waState === 'CONNECTED' || waState === 'OPENING';
-                const isHealthy = browserStatus.status === 'active' && waState === 'CONNECTED';
+
+                // ★★★ 关键修复：只要 WhatsApp 状态是 CONNECTED，就认为是健康的 ★★★
+                // AdsPower 的 browser/active API 不可靠，经常在浏览器正常运行时返回 inactive
+                // 真正重要的是 WhatsApp 客户端是否能正常工作
+                const isHealthy = waState === 'CONNECTED';
+
+                // 记录浏览器状态仅供参考，不作为健康判断依据
+                if (browserStatus.status !== 'active' && waState === 'CONNECTED') {
+                    // 仅记录日志，不触发重启（限制日志频率）
+                    if (!session._lastBrowserInactiveLog || Date.now() - session._lastBrowserInactiveLog > 60000) {
+                        console.log(`[SessionManager] Session ${sessionId}: AdsPower reports browser inactive, but WA is CONNECTED - ignoring`);
+                        session._lastBrowserInactiveLog = Date.now();
+                    }
+                }
 
                 checkResult.isHealthy = isHealthy;
 

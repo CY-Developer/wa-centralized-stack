@@ -410,7 +410,7 @@ function normalizeWaTo(input) {
     return digits ? `${digits}@c.us` : null;
 }
 
-async function postWithRetry(url, data, headers = {}, tries = 2, timeout = 120000) {
+async function postWithRetry(url, data, headers = {}, tries = 3, timeout = 120000) {
     const cfg = {
         method: 'post',
         url,
@@ -422,28 +422,44 @@ async function postWithRetry(url, data, headers = {}, tries = 2, timeout = 12000
         maxBodyLength: 30 * 1024 * 1024,
     };
 
-    let backoff = 300; // 初始退避
+    let backoff = 500; // 初始退避 500ms
     for (let i = 1; i <= tries; i++) {
         try {
             const r = await axios(cfg);
             return r.data;
         } catch (err) {
+            const errCode = err.code || '';
+            const isConnectionError = ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ECONNABORTED', 'ENOTFOUND'].includes(errCode);
+
             logToCollector('[BRIDGE_POST_ERROR]', {
                 url,
                 try: i,
+                maxTries: tries,
                 status: err.response?.status,
-                code: err.code,
+                code: errCode,
                 errno: err.errno,
                 address: err.address,
-                port: err.port
+                port: err.port,
+                willRetry: i < tries && isConnectionError
             });
 
             // 最后一轮直接抛出
             if (i === tries) throw err;
 
-            const transient = ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE'].includes(err.code || '') || !err.response?.status;
-            await new Promise(r => setTimeout(r, transient ? 400 : backoff));
-            backoff = Math.min(4000, backoff * 2);
+            // 对于连接错误，使用更长的退避时间
+            if (isConnectionError) {
+                const waitTime = errCode === 'ECONNREFUSED' ? Math.min(5000, backoff * 2) : Math.min(3000, backoff);
+                console.log(`[BRIDGE_RETRY] Connection error (${errCode}), waiting ${waitTime}ms before retry ${i+1}/${tries}`);
+                await new Promise(r => setTimeout(r, waitTime));
+                backoff = Math.min(8000, backoff * 2);
+            } else if (!err.response?.status) {
+                // 其他网络错误
+                await new Promise(r => setTimeout(r, backoff));
+                backoff = Math.min(4000, backoff * 2);
+            } else {
+                // HTTP 错误，短暂等待后重试
+                await new Promise(r => setTimeout(r, 300));
+            }
         }
     }
 }
@@ -1902,8 +1918,12 @@ app.post('/sync-messages', async (req, res) => {
             waMessages = waResp.data?.messages || [];
             logToCollector('[SYNC] WA messages', { count: waMessages.length });
         } catch (e) {
-            logToCollector('[SYNC] WA fetch error', { error: e?.message });
-            return res.status(500).json({ ok: false, error: `Failed to fetch WA messages: ${e?.message}` });
+            // ★★★ 修复：WA fetch 失败时不再返回 500，而是继续同步流程 ★★★
+            logToCollector('[SYNC] WA fetch error', { error: e?.message, chatId: waChatId });
+            // 对于 LID 类型的聊天或其他无法访问的聊天，返回空结果继续流程
+            // 而不是直接失败，这样至少可以同步 Chatwoot 端的消息
+            waMessages = [];
+            logToCollector('[SYNC] Continuing with empty WA messages');
         }
 
         // 5. 获取 Chatwoot 现有消息（使用批量查询 API）

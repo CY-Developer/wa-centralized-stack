@@ -90,15 +90,9 @@ REDIS_URL=redis://192.168.11.45:6379
 DEFAULT_SESSION_ID=
 CW_INTERNAL_BASE=http://192.168.11.45:3000
 
-
-
-
-
-
 ######## 健康检查与自动恢复配置 ########
 # 健康检查间隔（毫秒），默认 300000 = 5分钟
 HEALTH_CHECK_INTERVAL_MS=3000
-
 
 # 是否启用自动重启（1=是，0=否），默认 1
 AUTO_RESTART_ENABLED=1
