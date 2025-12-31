@@ -344,6 +344,54 @@ function normalizeE164(rawPhone, rawName) {
   return pick(rawPhone);
 }
 
+/**
+ * ★★★ 新增：检查字符串是否看起来像 WhatsApp 电话号码 ★★★
+ * WhatsApp 电话号码格式规则：
+ * - E.164 国际格式：+国家代码 + 区号 + 本地号码
+ * - 纯数字：7-15 位
+ * - 可能包含空格、横杠、括号等分隔符
+ *
+ * @param {string} str - 要检查的字符串
+ * @returns {{ isPhone: boolean, digits: string, e164: string|null }}
+ */
+function extractPhoneFromName(str) {
+  if (!str || typeof str !== 'string') {
+    return { isPhone: false, digits: '', e164: null };
+  }
+
+  const trimmed = str.trim();
+
+  // 1. 检查是否主要由数字和电话分隔符组成
+  // 允许的字符：数字、+、-、空格、括号、点
+  const phoneCharsOnly = /^[\d\s\-\+\(\)\.]+$/;
+
+  // 2. 提取所有数字
+  const digits = trimmed.replace(/[^\d]/g, '');
+
+  // 3. 检查条件
+  // - 字符串主要是电话字符
+  // - 纯数字长度在 7-15 位之间（国际电话号码标准）
+  // - 原始字符串中数字占比超过 50%（避免误判普通文本）
+  const isPhoneFormat = phoneCharsOnly.test(trimmed);
+  const validLength = digits.length >= 7 && digits.length <= 15;
+  const digitRatio = digits.length / trimmed.replace(/\s/g, '').length;
+
+  if (isPhoneFormat && validLength && digitRatio >= 0.5) {
+    // 构建 E.164 格式
+    let e164 = null;
+    if (trimmed.startsWith('+')) {
+      e164 = '+' + digits;
+    } else if (digits.length >= 10) {
+      // 假设是国际号码，加上 + 前缀
+      e164 = '+' + digits;
+    }
+
+    return { isPhone: true, digits, e164 };
+  }
+
+  return { isPhone: false, digits: '', e164: null };
+}
+
 // ---------- 通用请求 ----------
 async function cwRequest(method, pathOrUrl, { data, params, headers } = {}) {
   const url = /^https?:\/\//i.test(pathOrUrl) ? pathOrUrl : `${CW_BASE}${pathOrUrl}`;
@@ -428,16 +476,36 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
     return match ? match[1] : '';
   };
 
+  // ★★★ 新增：当没有电话号码时，检查联系人名称是否看起来像电话号码 ★★★
+  // WhatsApp 在没有保存联系人时会显示电话号码作为名称
+  let extractedPhoneFromName = null;
+  if (!rawPhone && rawPhone_lid && rawName) {
+    const phoneCheck = extractPhoneFromName(rawName);
+    if (phoneCheck.isPhone && phoneCheck.digits) {
+      console.log(`[ensureContact] Name "${rawName}" looks like phone number, extracted: ${phoneCheck.digits}`);
+      extractedPhoneFromName = phoneCheck.digits;
+    }
+  }
+
   // ★★★ 判断是 phone 还是 lid ★★★
-  const isLid = !rawPhone && (rawPhone_lid || getLidDigits(messageId));
-  const finalPhone = rawPhone || rawPhone_lid || getLidDigits(messageId);
+  // 如果从名称中提取到电话号码，优先使用它
+  const effectivePhone = rawPhone || extractedPhoneFromName;
+  const isLid = !effectivePhone && (rawPhone_lid || getLidDigits(messageId));
+  const finalPhone = effectivePhone || rawPhone_lid || getLidDigits(messageId);
   const digits = (String(finalPhone || '').match(/\d+/g) || []).join('');
 
   // ★★★ 修改 identifier 格式，区分 phone 和 lid ★★★
   // 新格式: wa:sessionId:phone:123456 或 wa:sessionId:lid:123456
+  // 如果从名称中提取到电话，使用 phone 类型
   const identifierType = isLid ? 'lid' : 'phone';
   const identifier = `wa:${sessionId || 'default'}:${identifierType}:${digits}`;
-  const phone_e164 = normalizeE164(finalPhone, rawName);
+
+  // ★★★ 电话号码规范化：优先使用提取的电话，其次从名称提取 ★★★
+  let phone_e164 = normalizeE164(effectivePhone, rawName);
+  // 如果从名称提取到电话号码，确保使用它
+  if (extractedPhoneFromName && !phone_e164) {
+    phone_e164 = '+' + extractedPhoneFromName;
+  }
 
   // ★★★ 缓存 key 改为 digits:sessionId，区分不同 WhatsApp 账号 ★★★
   let contact = getCachedContact(digits, sessionId);

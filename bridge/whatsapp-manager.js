@@ -7,12 +7,34 @@ const PROTOCOL_TIMEOUT_MS = Number(process.env.PROTOCOL_TIMEOUT_MS || 120000);
 
 // 关键：一次性正确引入 Client 和 NoAuth（还有 MessageMedia）
 const { Client, NoAuth, MessageMedia } = require('whatsapp-web.js');
-
+function withTimeout(promise, ms, errorMsg = 'Timeout') {
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(errorMsg)), ms);
+    });
+    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
+}
 const axios = require('axios');
 const COLLECTOR_BASE  = process.env.COLLECTOR_BASE || `http://127.0.0.1:${process.env.COLLECTOR_PORT || 7001}`;
 const COLLECTOR_TOKEN = process.env.COLLECTOR_INGEST_TOKEN || process.env.API_TOKEN || '';
 
 const { sessionManager, SESSION_STATUS } = require('./session-manager');
+const { syncSessionOnStartup, SYNC_ON_STARTUP } = require('./startup-sync');
+
+
+// 用于追踪所有会话是否都已就绪，以便触发启动同步
+
+const sessionReadyTracker = {
+    expectedSessions: new Set(),
+    readySessions: new Set(),
+    syncTriggered: false,
+    setExpectedSessions() {},
+    markReady() {},
+    checkAllReady() {},
+    triggerStartupSync() {}
+};
+
+
 
 // SESSIONS 现在由 SessionManager 动态管理
 // 保留解析逻辑用于后备
@@ -102,12 +124,64 @@ setInterval(() => {
     }
 }, 30000);
 
+// ★★★ 修复竞态条件：发送前标记机制 ★★★
+// 问题：message_create 事件可能在 sendMessage 返回前触发
+// 解决：在发送前标记 targetJid，发送后标记 msgId
+const sendingToCache = new Map();  // targetJid -> timestamp
+
+function markSendingTo(targetJid) {
+    if (targetJid) {
+        sendingToCache.set(targetJid, Date.now());
+        // 10秒后自动清理（防止泄漏）
+        setTimeout(() => sendingToCache.delete(targetJid), 10000);
+    }
+}
+
+function isSendingTo(targetJid) {
+    if (!targetJid) return false;
+    const ts = sendingToCache.get(targetJid);
+    if (!ts) return false;
+    // 只在 10 秒内有效
+    return (Date.now() - ts) < 10000;
+}
+
+function clearSendingTo(targetJid) {
+    sendingToCache.delete(targetJid);
+}
+
+// ★★★ 修复：使用前缀匹配解决 WhatsApp ID 截断问题 ★★★
+// 问题：发送返回 'true_xxx@c.us_3EB029E1E9F8BF76A63771'
+//       但 message_create 事件收到 'true_xxx@c.us_3EB029E1E9F8' (截断)
+function extractMsgIdPrefix(msgId) {
+    if (!msgId) return '';
+    // 提取 true/false_xxx@xxx_HASH 中的 HASH 前12位作为唯一标识
+    const parts = String(msgId).split('_');
+    if (parts.length >= 3) {
+        const hash = parts[parts.length - 1];
+        // 返回: to + hash前12位，确保唯一性
+        const to = parts.slice(0, -1).join('_');
+        return `${to}_${hash.substring(0, 12)}`;
+    }
+    return msgId.substring(0, 40);  // fallback
+}
+
 function markSentFromChatwoot(msgId) {
-    if (msgId) sentMessageCache.set(msgId, Date.now());
+    if (!msgId) return;
+    // 存储完整 ID 和前缀版本
+    sentMessageCache.set(msgId, Date.now());
+    const prefix = extractMsgIdPrefix(msgId);
+    if (prefix && prefix !== msgId) {
+        sentMessageCache.set(prefix, Date.now());
+    }
 }
 
 function isSentFromChatwoot(msgId) {
-    return sentMessageCache.has(msgId);
+    if (!msgId) return false;
+    // 先检查完整 ID
+    if (sentMessageCache.has(msgId)) return true;
+    // 再检查前缀版本
+    const prefix = extractMsgIdPrefix(msgId);
+    return sentMessageCache.has(prefix);
 }
 
 function parseRecipient(to) {
@@ -600,26 +674,40 @@ async function initSessionViaAdsPower(config) {
     }
 
     async function preloadChatsSafe(client, sessionId) {
-        for (let i = 1; i <= 3; i++) {
+        // ★★★ 等待页面完全稳定 ★★★
+        console.log(`[${sessionId}] Waiting 3s for page to stabilize...`);
+        await new Promise(r => setTimeout(r, 3000));
+
+        for (let i = 1; i <= 5; i++) {
             try {
+                // 检查 client 是否还有效
+                if (!client.pupPage || client.pupPage.isClosed()) {
+                    console.log(`[${sessionId}] preload skip: page closed`);
+                    return false;
+                }
+
                 const chats = await client.getChats();
                 sessions[sessionId].chats = chats;
                 sessionManager.updateChats(sessionId, chats);
                 console.log(`[${sessionId}] Preloaded ${chats.length} chats.`);
-                return;
+
+                // ★★★ preload 成功后触发同步 ★★★
+                if (SYNC_ON_STARTUP) {
+                    // 使用外层已定义的 sessionName（来自 AdsPower profile）
+                    syncSessionOnStartup(sessionId, sessionName, client, chats).catch(e => {
+                        console.error(`[${sessionId}] Startup sync error:`, e.message);
+                    });
+                }
+
+                return true;
             } catch (e) {
                 console.log(`[${sessionId}] preload retry(${i}): ${e?.message || e}`);
-                await new Promise(r => setTimeout(r, 1200));
+                await new Promise(r => setTimeout(r, 2000));
             }
         }
-        try {
-            const chats = await client.getChats();
-            sessions[sessionId].chats = chats;
-            sessionManager.updateChats(sessionId, chats);
-            console.log(`[${sessionId}] Preloaded ${chats.length} chats.`);
-        } catch (e) {
-            console.log(`[${sessionId}] preload failed: ${e?.message || e}`);
-        }
+
+        console.log(`[${sessionId}] preload failed after 5 retries`);
+        return false;
     }
 
     // 统一的页面守护
@@ -649,6 +737,10 @@ async function initSessionViaAdsPower(config) {
             }
         } catch (_) {}
 
+        // ★★★ 等待页面完全稳定后再执行操作 ★★★
+        console.log(`[${sessionId}] Waiting 5s for WhatsApp to fully load...`);
+        await new Promise(r => setTimeout(r, 5000));
+
         await waitConnected(client, sessionId);
         await preloadChatsSafe(client, sessionId);
 
@@ -665,14 +757,7 @@ async function initSessionViaAdsPower(config) {
             } catch (_) {}
         }, 4000);
 
-        // === 新增：收集历史消息用于同步 ===
-        if (String(process.env.SYNC_ON_STARTUP || '1') === '1') {
-            try {
-                await sessionManager.collectHistoryForSync(sessionId, client);
-            } catch (e) {
-                console.warn(`[${sessionId}] History collection failed:`, e.message);
-            }
-        }
+        // 同步已经在 preloadChatsSafe 成功后触发，这里不需要再调用
     });
 
     client.on('auth_failure', msg => {
@@ -720,11 +805,6 @@ async function initSessionViaAdsPower(config) {
             const msgId = message.id?._serialized || '';
             if (!msgId) return;
 
-            // ★★★ 修复竞态条件：延迟检查，给 markSentFromChatwoot 足够时间执行 ★★★
-            // sendMessage() 和 message_create 事件可能在同一个事件循环中触发
-            // 导致 isSentFromChatwoot 检查时 msgId 还未被标记
-            await new Promise(r => setTimeout(r, 100));
-
             // 2. 检查是否是从 Chatwoot 发送的（避免循环）
             if (isSentFromChatwoot(msgId)) {
                 // 静默跳过，不打印日志（太频繁）
@@ -734,6 +814,14 @@ async function initSessionViaAdsPower(config) {
             // 3. 跳过群组和广播消息
             const toJid = message.to || '';
             if (/@g\.us$/i.test(toJid) || /@broadcast/i.test(toJid)) {
+                return;
+            }
+
+            // ★★★ 关键修复：检查是否正在通过 Chatwoot 发送到此目标 ★★★
+            // 解决竞态条件：message_create 在 sendMessage 返回前触发
+            if (isSendingTo(toJid)) {
+                // 正在发送中，等待 markSentFromChatwoot 完成后的标记
+                // 静默跳过
                 return;
             }
 
@@ -886,6 +974,22 @@ async function initSessionViaAdsPower(config) {
     // 原有的 message 事件处理（入站消息）- 保持不变
     client.on('message', async (message) => {
         try {
+            // ★★★ 调试日志：打印所有入站消息 ★★★
+            console.log(`[${sessionId}] INCOMING RAW:`, {
+                id: message.id?._serialized,
+                from: message.from,
+                to: message.to,
+                fromMe: message.fromMe,
+                type: message.type,
+                body: (message.body || '').slice(0, 50)
+            });
+
+            // ★★★ 跳过自己发送的消息（由 message_create 处理）★★★
+            if (message.fromMe) {
+                console.log(`[${sessionId}] Skip fromMe message (handled by message_create)`);
+                return;
+            }
+
             const sess = sessions[sessionId] || (sessions[sessionId] = {});
 
             const chat = await message.getChat();
@@ -1130,27 +1234,25 @@ async function initSessionViaAdsPower(config) {
     }, 1200);
 }
 
-// 重写启动逻辑
 (async () => {
     try {
-        // 初始化 SessionManager，获取要管理的会话配置
         const sessionConfigs = await sessionManager.initialize(process.env.SESSIONS);
-
-        // ★ 注册会话初始化函数（用于自动恢复）
         sessionManager.setInitSessionFunction(initSessionViaAdsPower);
 
         if (sessionConfigs.length === 0) {
-            console.error('[BOOT] No sessions to manage. Check AdsPower connection or SESSIONS env.');
+            console.error('[BOOT] No sessions to manage.');
             process.exit(1);
         }
 
         console.log(`[BOOT] Initializing ${sessionConfigs.length} sessions...`);
 
-        // 依次初始化每个会话
+        if (SYNC_ON_STARTUP) {
+            sessionReadyTracker.setExpectedSessions(sessionConfigs.map(c => c.sessionId));
+        }
+
         for (const config of sessionConfigs) {
             try {
                 await initSessionViaAdsPower(config);
-                // 间隔 2 秒，避免同时启动太多浏览器
                 await new Promise(r => setTimeout(r, 2000));
             } catch (e) {
                 console.error(`[${config.sessionId}] init failed:`, e?.message || e);
@@ -1159,30 +1261,9 @@ async function initSessionViaAdsPower(config) {
 
         console.log('[BOOT] All sessions initialized');
 
-        // 触发历史同步
-        if (String(process.env.SYNC_ON_STARTUP || '1') === '1') {
-            setTimeout(async () => {
-                try {
-                    const pending = sessionManager.getAllPendingHistory();
-                    if (pending.length > 0) {
-                        console.log(`[BOOT] Triggering history sync for ${pending.length} sessions...`);
+        // ★★★ 删除旧的历史同步代码 ★★★
+        // 现在由 sessionReadyTracker 自动触发
 
-                        await axios.post(`${COLLECTOR_BASE}/batch-sync-history`, {
-                            sessions: pending
-                        }, {
-                            headers: { 'x-api-token': COLLECTOR_TOKEN },
-                            timeout: 120000
-                        }).catch(e => {
-                            console.warn('[BOOT] History sync request failed:', e.message);
-                        });
-                    }
-                } catch (e) {
-                    console.error('[BOOT] History sync error:', e.message);
-                }
-            }, 10000);
-        }
-
-        // 启动心跳监控
         sessionManager.startHeartbeat();
 
     } catch (e) {
@@ -1190,7 +1271,6 @@ async function initSessionViaAdsPower(config) {
         process.exit(1);
     }
 })();
-
 // 让浏览器能直接访问已保存的媒体文件
 const app = express();
 app.use('/files', express.static(MEDIA_DIR));
@@ -1361,6 +1441,40 @@ app.get('/contacts/:sessionId', async (req, res) => {
     }
 });
 
+
+
+
+
+app.post('/trigger-startup-sync', async (req, res) => {
+    try {
+        console.log('[API] Manual startup sync triggered');
+
+        // 强制触发同步
+        const result = await executeStartupSync(sessionManager);
+
+        res.json({
+            ok: true,
+            message: 'Startup sync triggered',
+            result
+        });
+    } catch (e) {
+        res.status(500).json({
+            ok: false,
+            error: e?.message
+        });
+    }
+});
+
+// 获取同步状态
+app.get('/startup-sync/tracker', (req, res) => {
+    res.json({
+        ok: true,
+        expected: Array.from(sessionReadyTracker.expectedSessions),
+        ready: Array.from(sessionReadyTracker.readySessions),
+        syncTriggered: sessionReadyTracker.syncTriggered,
+        pendingCount: sessionReadyTracker.expectedSessions.size - sessionReadyTracker.readySessions.size
+    });
+});
 
 // Endpoint: list chats for a session
 app.get('/chats/:sessionId', async (req, res) => {
@@ -1622,54 +1736,17 @@ app.post('/send/text', async (req, res) => {
 
         const safeText = escapeWhatsAppMarkdown(String(text));
 
-        // ★★★ 修复：添加重试机制处理 getChat undefined 错误 ★★★
-        const MAX_RETRIES = 2;
-        let lastError = null;
+        // ★★★ 关键修复：发送前标记，防止 message_create 事件误判 ★★★
+        markSendingTo(targetJid);
 
-        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-            try {
-                const msg = await session.client.sendMessage(targetJid, safeText);
-                const msgId = msg?.id?._serialized || null;
+        const msg = await session.client.sendMessage(targetJid, safeText);
+        const msgId = msg?.id?._serialized || null;
 
-                markSentFromChatwoot(msgId);
+        // 清除发送中标记，添加已发送标记
+        clearSendingTo(targetJid);
+        markSentFromChatwoot(msgId);
 
-                return ok(200, { ok: true, to: targetJid, msgId });
-            } catch (sendErr) {
-                lastError = sendErr;
-                const errMsg = sendErr?.message || '';
-
-                // 检查是否是 getChat undefined 错误
-                if (errMsg.includes('getChat') || errMsg.includes('undefined')) {
-                    console.warn(`[send/text] Attempt ${attempt}/${MAX_RETRIES} failed: ${errMsg}`);
-
-                    if (attempt < MAX_RETRIES) {
-                        // 尝试刷新 WWebJS 状态
-                        try {
-                            console.log(`[send/text] Trying to recover session ${sessionId}...`);
-                            // 等待一小段时间让页面稳定
-                            await new Promise(r => setTimeout(r, 1000));
-
-                            // 验证 client 是否仍然可用
-                            const state = await session.client.getState().catch(() => null);
-                            console.log(`[send/text] Session state after wait: ${state}`);
-
-                            if (state !== 'CONNECTED') {
-                                console.warn(`[send/text] Session ${sessionId} not connected, state: ${state}`);
-                                break; // 退出重试
-                            }
-                        } catch (recoverErr) {
-                            console.error(`[send/text] Recovery failed: ${recoverErr.message}`);
-                        }
-                    }
-                } else {
-                    // 其他错误直接抛出
-                    throw sendErr;
-                }
-            }
-        }
-
-        // 所有重试都失败
-        throw lastError || new Error('send failed after retries');
+        return ok(200, { ok: true, to: targetJid, msgId });
     } catch (e) {
         return res.status(500).json({ ok: false, error: e?.message });
     }
@@ -1690,6 +1767,63 @@ app.post('/send/text', async (req, res) => {
  * - includeBase64: 是否包含 base64 数据，1=是（返回 data_url，用于同步）
  * - timezone: 时区偏移（小时），默认 0
  */
+
+/**
+ * ★★★ 需求3：获取联系人消息数量接口 ★★★
+ *
+ * 用于检查新联系人是否有历史消息，决定是否需要同步
+ *
+ * POST /messages-count
+ * Body: { sessionId, chatId, limit?, hours? }
+ * Response: { ok: true, count: number, chatId: string }
+ */
+app.post('/messages-count', async (req, res) => {
+    try {
+        const { sessionId, chatId, limit = 10, hours = 12 } = req.body || {};
+
+        if (!sessionId || !chatId) {
+            return res.status(400).json({ ok: false, error: 'Missing sessionId or chatId' });
+        }
+
+        const session = sessions[sessionId];
+        if (!session) {
+            return res.status(400).json({ ok: false, error: 'Session not found' });
+        }
+        if (session.status !== 'ready') {
+            return res.status(400).json({ ok: false, error: 'Session not ready' });
+        }
+
+        console.log(`[messages-count] session=${sessionId}, chat=${chatId}`);
+
+        const chat = await session.client.getChatById(chatId);
+        const now = Math.floor(Date.now() / 1000);
+        const afterTs = now - hours * 3600;
+
+        // 获取最近的消息
+        const rawMessages = await chat.fetchMessages({ limit: Math.min(limit * 2, 50) });
+
+        // 过滤时间范围内的消息
+        const filtered = rawMessages.filter(m => {
+            const ts = m.timestamp || 0;
+            return ts >= afterTs;
+        });
+
+        console.log(`[messages-count] ${chatId}: found ${filtered.length} messages in last ${hours}h`);
+
+        res.json({
+            ok: true,
+            count: filtered.length,
+            total: rawMessages.length,
+            chatId,
+            hours
+        });
+
+    } catch (e) {
+        console.error('[messages-count] Error:', e.message);
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
 app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
     const { sessionId, chatId } = req.params;
     const limit = parseInt(req.query.limit) || 100;
@@ -1715,27 +1849,7 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
         console.log(`[messages-sync] session=${sessionId}, chat=${chatId}`);
         console.log(`[messages-sync] time: ${new Date(afterTs * 1000).toISOString()} ~ ${new Date(beforeTs * 1000).toISOString()}`);
 
-        // ★★★ 修复：增强 getChatById 错误处理，支持 LID 类型聊天 ★★★
-        let chat = null;
-        try {
-            chat = await session.client.getChatById(chatId);
-        } catch (e) {
-            console.log(`[messages-sync] getChatById failed: ${e?.message}`);
-
-            // 尝试从缓存的 chats 中查找
-            if (session.chats && Array.isArray(session.chats)) {
-                chat = session.chats.find(c => c?.id?._serialized === chatId);
-                if (chat) {
-                    console.log(`[messages-sync] Using cached chat for ${chatId}`);
-                }
-            }
-
-            // 如果仍然找不到，返回空结果而不是错误
-            if (!chat) {
-                console.log(`[messages-sync] Chat not found, returning empty result for ${chatId}`);
-                return res.json({ ok: true, messages: [], note: 'Chat not accessible' });
-            }
-        }
+        const chat = await session.client.getChatById(chatId);
 
         const fetchLimit = Math.min(limit * 5, 500);
         const rawMessages = await chat.fetchMessages({ limit: fetchLimit });
@@ -1777,128 +1891,135 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
             if (includeMedia || includeBase64) {
                 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
                 if (msg.hasMedia || MEDIA_TYPES.has(msg.type)) {
+                    const MEDIA_TIMEOUT_MS = 60000; // ★★★ 单条媒体60秒超时 ★★★
+
                     try {
-                        let media = await msg.downloadMedia().catch(() => null);
+                        // ★★★ 包装整个媒体处理流程，超时60秒则跳过 ★★★
+                        const mediaResult = await withTimeout(
+                            (async () => {
+                                let media = await msg.downloadMedia().catch(() => null);
 
-                        if (!media?.data) {
-                            console.log(`[messages-sync] API failed, extracting from DOM for ${idSer}...`);
+                                if (!media?.data) {
+                                    console.log(`[messages-sync] API failed, extracting from DOM for ${idSer}...`);
 
-                            try {
-                                const extracted = await session.client.pupPage.evaluate(async (msgId, msgType) => {
-                                    let msgEl = document.querySelector(`[data-id="${msgId}"]`);
+                                    try {
+                                        const extracted = await session.client.pupPage.evaluate(async (msgId, msgType) => {
+                                            let msgEl = document.querySelector(`[data-id="${msgId}"]`);
 
-                                    if (!msgEl) {
-                                        const container = document.querySelector('[data-testid="conversation-panel-messages"]')
-                                            || document.querySelector('._ajyl');
-                                        if (container) {
-                                            container.scrollTop = 0;
-                                            await new Promise(r => setTimeout(r, 500));
-                                            msgEl = document.querySelector(`[data-id="${msgId}"]`);
-                                        }
-                                    }
-
-                                    if (!msgEl) return { error: 'msg_not_found' };
-
-                                    msgEl.scrollIntoView({ behavior: 'instant', block: 'center' });
-                                    await new Promise(r => setTimeout(r, 300));
-
-                                    const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
-                                        || msgEl.querySelector('[data-icon="audio-download"]')
-                                        || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
-
-                                    if (downloadBtn) {
-                                        downloadBtn.click();
-                                        await new Promise(r => setTimeout(r, 6000));
-                                    }
-
-                                    if (msgType === 'image' || msgType === 'sticker') {
-                                        const img = msgEl.querySelector('img[src^="blob:"]')
-                                            || msgEl.querySelector('img[src*="base64"]')
-                                            || msgEl.querySelector('[data-testid="media-canvas"] img')
-                                            || msgEl.querySelector('img[draggable="false"]');
-
-                                        if (img && img.src) {
-                                            if (img.src.startsWith('blob:')) {
-                                                try {
-                                                    const response = await fetch(img.src);
-                                                    const blob = await response.blob();
-                                                    return new Promise((resolve) => {
-                                                        const reader = new FileReader();
-                                                        reader.onloadend = () => {
-                                                            const base64 = reader.result;
-                                                            const matches = base64.match(/^data:(.+);base64,(.+)$/);
-                                                            if (matches) {
-                                                                resolve({
-                                                                    mimetype: matches[1],
-                                                                    data: matches[2]
-                                                                });
-                                                            } else {
-                                                                resolve({ error: 'invalid_base64' });
-                                                            }
-                                                        };
-                                                        reader.onerror = () => resolve({ error: 'reader_error' });
-                                                        reader.readAsDataURL(blob);
-                                                    });
-                                                } catch (e) {
-                                                    return { error: 'blob_fetch_failed: ' + e.message };
-                                                }
-                                            } else if (img.src.startsWith('data:')) {
-                                                const matches = img.src.match(/^data:(.+);base64,(.+)$/);
-                                                if (matches) {
-                                                    return { mimetype: matches[1], data: matches[2] };
+                                            if (!msgEl) {
+                                                const container = document.querySelector('[data-testid="conversation-panel-messages"]')
+                                                    || document.querySelector('._ajyl');
+                                                if (container) {
+                                                    container.scrollTop = 0;
+                                                    await new Promise(r => setTimeout(r, 500));
+                                                    msgEl = document.querySelector(`[data-id="${msgId}"]`);
                                                 }
                                             }
-                                        }
 
-                                        const canvas = msgEl.querySelector('canvas');
-                                        if (canvas) {
-                                            try {
-                                                const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
-                                                const matches = dataUrl.match(/^data:(.+);base64,(.+)$/);
-                                                if (matches) {
-                                                    return { mimetype: matches[1], data: matches[2] };
+                                            if (!msgEl) return { error: 'msg_not_found' };
+
+                                            msgEl.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                            await new Promise(r => setTimeout(r, 300));
+
+                                            const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
+                                                || msgEl.querySelector('[data-icon="audio-download"]')
+                                                || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
+
+                                            if (downloadBtn) {
+                                                downloadBtn.click();
+                                                await new Promise(r => setTimeout(r, 6000));
+                                            }
+
+                                            if (msgType === 'image' || msgType === 'sticker') {
+                                                const img = msgEl.querySelector('img[src^="blob:"]')
+                                                    || msgEl.querySelector('img[src*="base64"]')
+                                                    || msgEl.querySelector('[data-testid="media-canvas"] img')
+                                                    || msgEl.querySelector('img[draggable="false"]');
+
+                                                if (img && img.src) {
+                                                    if (img.src.startsWith('blob:')) {
+                                                        try {
+                                                            const response = await fetch(img.src);
+                                                            const blob = await response.blob();
+                                                            return new Promise((resolve) => {
+                                                                const reader = new FileReader();
+                                                                reader.onloadend = () => {
+                                                                    const base64 = reader.result;
+                                                                    const matches = base64.match(/^data:(.+);base64,(.+)$/);
+                                                                    if (matches) {
+                                                                        resolve({
+                                                                            mimetype: matches[1],
+                                                                            data: matches[2]
+                                                                        });
+                                                                    } else {
+                                                                        resolve({ error: 'invalid_base64' });
+                                                                    }
+                                                                };
+                                                                reader.onerror = () => resolve({ error: 'reader_error' });
+                                                                reader.readAsDataURL(blob);
+                                                            });
+                                                        } catch (e) {
+                                                            return { error: 'blob_fetch_failed: ' + e.message };
+                                                        }
+                                                    } else if (img.src.startsWith('data:')) {
+                                                        const matches = img.src.match(/^data:(.+);base64,(.+)$/);
+                                                        if (matches) {
+                                                            return { mimetype: matches[1], data: matches[2] };
+                                                        }
+                                                    }
                                                 }
-                                            } catch (e) {}
+
+                                                const canvas = msgEl.querySelector('canvas');
+                                                if (canvas) {
+                                                    try {
+                                                        const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+                                                        const matches = dataUrl.match(/^data:(.+);base64,(.+)$/);
+                                                        if (matches) {
+                                                            return { mimetype: matches[1], data: matches[2] };
+                                                        }
+                                                    } catch (e) {}
+                                                }
+
+                                                return { error: 'image_not_found' };
+                                            }
+
+                                            return { error: 'type_not_supported_for_dom_extract' };
+
+                                        }, msg.id._serialized, msg.type);
+
+                                        if (extracted?.data && extracted?.mimetype) {
+                                            media = {
+                                                mimetype: extracted.mimetype,
+                                                data: extracted.data,
+                                                filename: null
+                                            };
+                                            console.log(`[messages-sync] DOM extraction OK: ${extracted.mimetype}`);
+                                        } else {
+                                            console.log(`[messages-sync] DOM extraction failed: ${extracted?.error || 'unknown'}`);
+                                            await new Promise(r => setTimeout(r, 2000));
+                                            media = await msg.downloadMedia().catch(() => null);
                                         }
-
-                                        return { error: 'image_not_found' };
+                                    } catch (extractErr) {
+                                        console.log(`[messages-sync] Extract error: ${extractErr?.message}`);
                                     }
-
-                                    return { error: 'type_not_supported_for_dom_extract' };
-
-                                }, msg.id._serialized, msg.type);
-
-                                if (extracted?.data && extracted?.mimetype) {
-                                    media = {
-                                        mimetype: extracted.mimetype,
-                                        data: extracted.data,
-                                        filename: null
-                                    };
-                                    console.log(`[messages-sync] DOM extraction OK: ${extracted.mimetype}`);
-                                } else {
-                                    console.log(`[messages-sync] DOM extraction failed: ${extracted?.error || 'unknown'}`);
-
-                                    await new Promise(r => setTimeout(r, 2000));
-                                    media = await msg.downloadMedia().catch(() => null);
                                 }
-                            } catch (extractErr) {
-                                console.log(`[messages-sync] Extract error: ${extractErr?.message}`);
-                            }
-                        }
 
-                        if (media?.data) {
+                                return media;
+                            })(),
+                            MEDIA_TIMEOUT_MS,
+                            `Media timeout (${MEDIA_TIMEOUT_MS/1000}s)`
+                        );
+
+                        if (mediaResult?.data) {
                             mediaCount++;
-
-                            const ext = mimeToExt(media.mimetype) || '';
-                            const filename = media.filename || `${idSer}${ext}`;
-
+                            const ext = mimeToExt(mediaResult.mimetype) || '';
+                            const filename = mediaResult.filename || `${idSer}${ext}`;
                             item.media = {
-                                mimetype: media.mimetype,
+                                mimetype: mediaResult.mimetype,
                                 filename: filename,
-                                bytes: Buffer.from(media.data, 'base64').length,
-                                data_url: `data:${media.mimetype};base64,${media.data}`
+                                bytes: Buffer.from(mediaResult.data, 'base64').length,
+                                data_url: `data:${mediaResult.mimetype};base64,${mediaResult.data}`
                             };
-
                             console.log(`[messages-sync] Media OK: ${idSer}, size=${item.media.bytes}`);
                         } else {
                             mediaErrorCount++;
@@ -1907,8 +2028,9 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                         }
                     } catch (e) {
                         mediaErrorCount++;
-                        console.log(`[messages-sync] Media error for ${idSer}:`, e?.message);
-                        item.media = { error: e?.message };
+                        // ★★★ 超时或其他错误，跳过该媒体但消息本身继续同步 ★★★
+                        console.log(`[messages-sync] Media SKIPPED for ${idSer}: ${e?.message}`);
+                        item.media = { error: e?.message || 'timeout_or_error', skipped: true };
                     }
                 }
             }
@@ -2065,41 +2187,19 @@ app.post('/send/media', async (req, res) => {
         if (!chatIdOrPhone) return bad(400, 'recipient not found');
 
         let chat = null;
-        let useDirectSend = false;  // ★★★ 新增：标记是否使用直接发送方式 ★★★
-
-        // ★★★ 修复：增加重试机制处理 getChat undefined 错误 ★★★
-        for (let attempt = 1; attempt <= 2; attempt++) {
-            try {
-                chat = await session.client.getChatById(chatIdOrPhone);
-                console.log(`[send/media] Got chat: ${chat?.id?._serialized}`);
-                break;  // 成功获取，退出重试
-            } catch (e) {
-                const errMsg = e?.message || '';
-                console.log(`[send/media] getChatById attempt ${attempt} failed: ${errMsg}`);
-
-                // 检查是否是 getChat undefined 错误
-                if (errMsg.includes('getChat') || errMsg.includes('undefined')) {
-                    if (attempt < 2) {
-                        // 等待后重试
-                        await new Promise(r => setTimeout(r, 1000));
-                        continue;
-                    }
-                    // 所有重试失败，标记使用直接发送
-                    console.log(`[send/media] Will use direct sendMessage instead`);
-                    useDirectSend = true;
-                } else {
-                    // 其他错误，尝试从缓存获取
-                    const cached = (session.chats || []).find(c => c?.id?._serialized === chatIdOrPhone);
-                    if (cached) {
-                        chat = cached;
-                        console.log(`[send/media] Using cached chat`);
-                        break;
-                    }
-                }
+        try {
+            chat = await session.client.getChatById(chatIdOrPhone);
+            console.log(`[send/media] Got chat: ${chat?.id?._serialized}`);
+        } catch (e) {
+            console.log(`[send/media] getChatById failed: ${e?.message}`);
+            const cached = (session.chats || []).find(c => c?.id?._serialized === chatIdOrPhone);
+            if (cached) {
+                chat = cached;
+                console.log(`[send/media] Using cached chat`);
             }
         }
 
-        if (!chat && !useDirectSend) {
+        if (!chat) {
             return bad(400, `Cannot get chat for ${chatIdOrPhone}`);
         }
 
@@ -2122,6 +2222,9 @@ app.post('/send/media', async (req, res) => {
         if (mediaItems.length === 0) return bad(400, 'missing media');
 
         console.log(`[send/media] Chat: ${chat.id._serialized}, items: ${mediaItems.length}`);
+
+        // ★★★ 关键修复：发送前标记，防止 message_create 事件误判 ★★★
+        markSendingTo(chatIdOrPhone);
 
         const results = [];
 
@@ -2167,36 +2270,18 @@ app.post('/send/media', async (req, res) => {
                 if (isVoice) opts.sendAudioAsVoice = true;
 
                 if (isVideo) {
-                    // ★★★ 修复：支持直接发送模式 ★★★
-                    if (useDirectSend) {
-                        try {
-                            msg = await session.client.sendMessage(chatIdOrPhone, media, opts);
-                            method = 'client.sendMessage';
-                        } catch (e) {
-                            console.error(`[send/media] Direct send video failed:`, e?.message);
-                            results.push({ ok: false, error: e?.message, index: i });
-                            continue;
-                        }
+                    const r = await sendVideo(chat, media, itemCaption);
+                    if (r.ok) {
+                        msg = r.msg;
+                        method = r.method;
                     } else {
-                        const r = await sendVideo(chat, media, itemCaption);
-                        if (r.ok) {
-                            msg = r.msg;
-                            method = r.method;
-                        } else {
-                            results.push({ ok: false, error: r.error, index: i });
-                            continue;
-                        }
+                        results.push({ ok: false, error: r.error, index: i });
+                        continue;
                     }
                 } else {
                     try {
-                        // ★★★ 修复：支持直接发送模式 ★★★
-                        if (useDirectSend) {
-                            msg = await session.client.sendMessage(chatIdOrPhone, media, opts);
-                            method = 'client.sendMessage';
-                        } else {
-                            msg = await chat.sendMessage(media, opts);
-                            method = 'chat.sendMessage';
-                        }
+                        msg = await chat.sendMessage(media, opts);
+                        method = 'chat.sendMessage';
                     } catch (e) {
                         console.error(`[send/media] Item ${i} failed:`, e?.message);
                         results.push({ ok: false, error: e?.message, index: i });
@@ -2228,6 +2313,9 @@ app.post('/send/media', async (req, res) => {
 
         const successCount = results.filter(r => r.ok).length;
         console.log(`[send/media] DONE: ${successCount}/${mediaItems.length}`);
+
+        // ★★★ 清除发送中标记 ★★★
+        clearSendingTo(chatIdOrPhone);
 
         const finalResult = {
             ok: successCount > 0,
