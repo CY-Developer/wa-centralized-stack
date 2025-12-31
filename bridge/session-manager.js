@@ -1,13 +1,11 @@
 /**
- * SessionManager - 动态会话管理模块 (增强版 + 启动同步)
+ * SessionManager - 动态会话管理模块 (V2 修复版)
  *
- * 功能：
- * 1. 动态从 AdsPower API 获取 profile 列表和名称
- * 2. 管理会话生命周期（注册、状态追踪、心跳检测）
- * 3. 收集历史消息用于启动同步 ★增强版★
- * 4. 提供统一的会话名称映射（替代硬编码）
- * 5. 自动健康检查和故障恢复
- * 6. 重试次数限制和异常状态管理
+ * V2 修复内容：
+ * 1. 添加重连锁（_restartLocks）防止并发重连
+ * 2. 增强 safeRestartSession 方法，完整的关闭-重启流程
+ * 3. 添加全局错误处理建议（需在入口文件实现）
+ * 4. 隔离各 session 的错误，防止互相影响
  *
  * 会话状态(sessionStatus):
  * - 'initializing': 初始化中
@@ -15,16 +13,6 @@
  * - 'disconnected': 断开连接（可恢复）
  * - 'restarting': 重启中
  * - 'error': 异常（重试次数耗尽，需人工干预）
- *
- * 环境变量：
- * - HEALTH_CHECK_INTERVAL_MS: 健康检查间隔（默认 300000 = 5分钟）
- * - HEALTH_CHECK_ENABLED: 是否启用健康检查（默认 1）
- * - MAX_RESTART_RETRIES: 最大重启次数（默认 3）
- * - RESTART_COOLDOWN_MS: 重启冷却时间（默认 60000 = 1分钟）
- * - AUTO_RESTART_ENABLED: 是否启用自动重启（默认 1）
- * - SYNC_ON_STARTUP: 是否启用启动同步（默认 1）
- * - SYNC_CONTACT_COUNT: 同步的联系人数量（默认 20）
- * - SYNC_HISTORY_HOURS: 同步的历史小时数（默认 12）
  */
 
 const axios = require('axios');
@@ -50,6 +38,9 @@ class SessionManager extends EventEmitter {
         // 会话存储：Map<sessionId, SessionInfo>
         this.sessions = new Map();
 
+        // ★★★ V2 新增：重连锁，防止同一 session 并发重连 ★★★
+        this._restartLocks = new Map();  // sessionId -> { locked: boolean, timestamp: number }
+
         // ★ 历史同步配置（增强）
         this.syncContactCount = Number(process.env.SYNC_CONTACT_COUNT || 20);
         this.syncHistoryHours = Number(process.env.SYNC_HISTORY_HOURS || 12);
@@ -63,6 +54,9 @@ class SessionManager extends EventEmitter {
         this.maxRestartRetries = Number(process.env.MAX_RESTART_RETRIES || 3);
         this.restartCooldown = Number(process.env.RESTART_COOLDOWN_MS || 60000);
         this.autoRestartEnabled = String(process.env.AUTO_RESTART_ENABLED || '1') === '1';
+
+        // ★★★ V2 新增：重连锁超时时间（防止死锁）★★★
+        this.restartLockTimeout = Number(process.env.RESTART_LOCK_TIMEOUT_MS || 120000); // 2分钟
 
         // 内部状态
         this._heartbeatTimer = null;
@@ -103,6 +97,47 @@ class SessionManager extends EventEmitter {
      */
     _getHeaders() {
         return this.adsKey ? { 'X-AdsPower-API-Key': this.adsKey } : {};
+    }
+
+    /**
+     * ★★★ V2 新增：获取重连锁 ★★★
+     * @returns {boolean} 是否成功获取锁
+     */
+    _acquireRestartLock(sessionId) {
+        const existing = this._restartLocks.get(sessionId);
+        const now = Date.now();
+
+        if (existing && existing.locked) {
+            // 检查是否超时
+            if (now - existing.timestamp < this.restartLockTimeout) {
+                console.log(`[SessionManager] Restart lock active for ${sessionId}, skipping (age: ${Math.round((now - existing.timestamp) / 1000)}s)`);
+                return false;
+            }
+            // 锁已超时，强制释放
+            console.warn(`[SessionManager] Restart lock timeout for ${sessionId}, forcing release`);
+        }
+
+        this._restartLocks.set(sessionId, { locked: true, timestamp: now });
+        console.log(`[SessionManager] Acquired restart lock for ${sessionId}`);
+        return true;
+    }
+
+    /**
+     * ★★★ V2 新增：释放重连锁 ★★★
+     */
+    _releaseRestartLock(sessionId) {
+        this._restartLocks.set(sessionId, { locked: false, timestamp: Date.now() });
+        console.log(`[SessionManager] Released restart lock for ${sessionId}`);
+    }
+
+    /**
+     * ★★★ V2 新增：检查是否有活跃的重连锁 ★★★
+     */
+    hasActiveRestartLock(sessionId) {
+        const lock = this._restartLocks.get(sessionId);
+        if (!lock || !lock.locked) return false;
+        // 检查是否超时
+        return (Date.now() - lock.timestamp) < this.restartLockTimeout;
     }
 
     /**
@@ -172,17 +207,18 @@ class SessionManager extends EventEmitter {
     async startBrowser(user_id) {
         const headers = this._getHeaders();
 
+        // ★★★ V2 改进：先确保完全停止 ★★★
         try {
             await axios.get(
                 `${this.adsBase}/api/v1/browser/stop?user_id=${encodeURIComponent(user_id)}`,
                 { headers, timeout: 10000 }
             );
-            await new Promise(r => setTimeout(r, 800));
+            await new Promise(r => setTimeout(r, 1500)); // 增加等待时间
         } catch (_) {}
 
         const { data } = await axios.get(
             `${this.adsBase}/api/v1/browser/start?user_id=${encodeURIComponent(user_id)}`,
-            { headers, timeout: 20000 }
+            { headers, timeout: 30000 }  // 增加超时时间
         );
 
         if (data.code !== 0) {
@@ -332,7 +368,6 @@ class SessionManager extends EventEmitter {
 
     /**
      * 获取所有会话（包含 client 对象）
-     * 用于启动同步等需要访问所有会话的场景
      */
     getAllSessions() {
         const result = {};
@@ -356,7 +391,8 @@ class SessionManager extends EventEmitter {
                 via: 'adspower-ws',
                 restartCount: session.restartCount || 0,
                 maxRetries: this.maxRestartRetries,
-                lastError: session.lastError || null
+                lastError: session.lastError || null,
+                hasRestartLock: this.hasActiveRestartLock(sessionId)  // ★ V2 新增
             };
         }
         return summary;
@@ -386,76 +422,110 @@ class SessionManager extends EventEmitter {
     }
 
     /**
-     * 重启会话
+     * ★★★ V2 核心方法：安全重启会话 ★★★
+     *
+     * 这是所有重启操作的统一入口，包含：
+     * 1. 重连锁检查
+     * 2. 完整的关闭-重启流程
+     * 3. 错误隔离
+     *
+     * @param {string} sessionId - 会话ID
+     * @param {string} reason - 重启原因（用于日志）
+     * @returns {Promise<{success: boolean, error?: string}>}
      */
-    async restartSession(sessionId) {
+    async safeRestartSession(sessionId, reason = 'unknown') {
         const session = this.sessions.get(sessionId);
         if (!session) {
             return { success: false, error: 'Session not found' };
         }
 
-        const now = Date.now();
-        if (session.lastRestartTime && (now - session.lastRestartTime) < this.restartCooldown) {
-            const waitTime = Math.ceil((this.restartCooldown - (now - session.lastRestartTime)) / 1000);
-            console.log(`[SessionManager] Restart cooldown for ${sessionId}, wait ${waitTime}s`);
-            return { success: false, error: `Cooldown active, wait ${waitTime}s` };
+        // 1. 尝试获取重连锁
+        if (!this._acquireRestartLock(sessionId)) {
+            return { success: false, error: 'Restart already in progress' };
         }
 
-        if (session.restartCount >= this.maxRestartRetries) {
-            console.error(`[SessionManager] Max restart retries (${this.maxRestartRetries}) reached for ${sessionId}`);
-            session.sessionStatus = SESSION_STATUS.ERROR;
-            session.lastError = `Max restart retries (${this.maxRestartRetries}) exceeded`;
-            this.emit('sessionError', {
-                sessionId,
-                error: session.lastError,
-                restartCount: session.restartCount
-            });
-            return { success: false, error: session.lastError };
-        }
-
-        console.log(`[SessionManager] Restarting session ${sessionId} (attempt ${session.restartCount + 1}/${this.maxRestartRetries})...`);
-
-        session.sessionStatus = SESSION_STATUS.RESTARTING;
-        session.restartCount++;
-        session.lastRestartTime = now;
-        this.emit('sessionRestarting', { sessionId, attempt: session.restartCount });
+        console.log(`[SessionManager] ========== Safe restart ${sessionId} (reason: ${reason}) ==========`);
 
         try {
-            if (session.client) {
-                try {
-                    await session.client.destroy();
-                    console.log(`[SessionManager] Old client destroyed for ${sessionId}`);
-                } catch (e) {
-                    console.warn(`[SessionManager] Error destroying client for ${sessionId}:`, e.message);
-                }
+            // 2. 检查重启次数
+            if (session.restartCount >= this.maxRestartRetries) {
+                console.error(`[SessionManager] Max restart retries (${this.maxRestartRetries}) reached for ${sessionId}`);
+                session.sessionStatus = SESSION_STATUS.ERROR;
+                session.lastError = `Max restart retries (${this.maxRestartRetries}) exceeded`;
+                this.emit('sessionError', {
+                    sessionId,
+                    error: session.lastError,
+                    restartCount: session.restartCount
+                });
+                return { success: false, error: session.lastError };
             }
 
-            await this.stopBrowser(sessionId);
-            await new Promise(r => setTimeout(r, 2000));
+            // 3. 更新状态
+            session.sessionStatus = SESSION_STATUS.RESTARTING;
+            session.restartCount++;
+            session.lastRestartTime = Date.now();
+            this.emit('sessionRestarting', { sessionId, attempt: session.restartCount, reason });
 
+            console.log(`[SessionManager] Restart attempt ${session.restartCount}/${this.maxRestartRetries} for ${sessionId}`);
+
+            // 4. ★★★ 关键步骤：安全销毁旧 client ★★★
+            if (session.client) {
+                try {
+                    console.log(`[SessionManager] Destroying old client for ${sessionId}...`);
+                    await Promise.race([
+                        session.client.destroy(),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('destroy timeout')), 10000))
+                    ]);
+                    console.log(`[SessionManager] Old client destroyed for ${sessionId}`);
+                } catch (e) {
+                    console.warn(`[SessionManager] Error destroying client for ${sessionId}: ${e.message}`);
+                    // 继续执行，不要因为销毁失败就停止
+                }
+                session.client = null;
+            }
+
+            // 5. ★★★ 关键步骤：确保 AdsPower 浏览器完全关闭 ★★★
+            console.log(`[SessionManager] Stopping AdsPower browser for ${sessionId}...`);
+            await this.stopBrowser(sessionId);
+            await new Promise(r => setTimeout(r, 2000)); // 等待浏览器完全关闭
+
+            // 6. 再次确认浏览器状态
+            const statusAfterStop = await this.checkBrowserStatus(sessionId);
+            if (statusAfterStop.status === 'active') {
+                console.warn(`[SessionManager] Browser still active after stop, retrying...`);
+                await this.stopBrowser(sessionId);
+                await new Promise(r => setTimeout(r, 3000)); // 再等一下
+            }
+
+            // 7. ★★★ 关键步骤：调用初始化函数重新启动 ★★★
             if (this._initSessionFunc) {
                 const config = {
                     sessionId,
                     sessionName: session.sessionName
                 };
+                console.log(`[SessionManager] Calling init function for ${sessionId}...`);
                 await this._initSessionFunc(config);
-                console.log(`[SessionManager] Session ${sessionId} restart initiated`);
+                console.log(`[SessionManager] Session ${sessionId} restart initiated successfully`);
                 return { success: true };
             } else {
                 throw new Error('No init function registered');
             }
 
         } catch (e) {
-            console.error(`[SessionManager] Restart failed for ${sessionId}:`, e.message);
+            console.error(`[SessionManager] Safe restart failed for ${sessionId}: ${e.message}`);
             session.lastError = e.message;
             session.sessionStatus = SESSION_STATUS.DISCONNECTED;
             this.emit('restartFailed', { sessionId, error: e.message });
             return { success: false, error: e.message };
+
+        } finally {
+            // 8. ★★★ 无论成功失败，都要释放锁 ★★★
+            this._releaseRestartLock(sessionId);
         }
     }
 
     /**
-     * 手动重置会话状态
+     * 手动重置会话状态（用于错误恢复）
      */
     resetSession(sessionId) {
         const session = this.sessions.get(sessionId);
@@ -463,6 +533,8 @@ class SessionManager extends EventEmitter {
             session.restartCount = 0;
             session.lastError = null;
             session.sessionStatus = SESSION_STATUS.DISCONNECTED;
+            // 同时释放可能存在的锁
+            this._releaseRestartLock(sessionId);
             console.log(`[SessionManager] Session ${sessionId} reset, can restart now`);
             return true;
         }
@@ -470,222 +542,17 @@ class SessionManager extends EventEmitter {
     }
 
     /**
-     * ★★★ 强制重启会话（确保先关闭浏览器）★★★
-     *
-     * 与 restartSession 的区别：
-     * 1. 不检查冷却时间（由心跳触发时已经是异常状态）
-     * 2. 确保浏览器完全关闭后再重启
-     * 3. 用于心跳检测到异常时的自动恢复
+     * ★★★ V2 保留：强制重启会话（内部方法，供心跳检测使用）★★★
+     * 现在改为调用 safeRestartSession
      */
     async _forceRestartSession(sessionId) {
-        const session = this.sessions.get(sessionId);
-        if (!session) {
-            return { success: false, error: 'Session not found' };
-        }
-
-        // 检查重启次数限制
-        if (session.restartCount >= this.maxRestartRetries) {
-            console.error(`[SessionManager] Max restart retries (${this.maxRestartRetries}) reached for ${sessionId}`);
-            session.sessionStatus = SESSION_STATUS.ERROR;
-            session.lastError = `Max restart retries (${this.maxRestartRetries}) exceeded`;
-            this.emit('sessionError', {
-                sessionId,
-                error: session.lastError,
-                restartCount: session.restartCount
-            });
-            return { success: false, error: session.lastError };
-        }
-
-        console.log(`[SessionManager] Force restarting session ${sessionId} (attempt ${session.restartCount + 1}/${this.maxRestartRetries})...`);
-
-        session.sessionStatus = SESSION_STATUS.RESTARTING;
-        session.restartCount++;
-        session.lastRestartTime = Date.now();
-        this.emit('sessionRestarting', { sessionId, attempt: session.restartCount });
-
-        try {
-            // 1. 销毁旧 client
-            if (session.client) {
-                try {
-                    await session.client.destroy();
-                    console.log(`[SessionManager] Old client destroyed for ${sessionId}`);
-                } catch (e) {
-                    console.warn(`[SessionManager] Error destroying client for ${sessionId}:`, e.message);
-                }
-                session.client = null;
-            }
-
-            // 2. ★★★ 关键：检查浏览器状态并强制关闭 ★★★
-            const browserStatus = await this.checkBrowserStatus(sessionId);
-            console.log(`[SessionManager] Browser status for ${sessionId}:`, browserStatus.status);
-
-            if (browserStatus.status === 'active') {
-                console.log(`[SessionManager] Browser still active, forcing stop for ${sessionId}...`);
-                await this.stopBrowser(sessionId);
-                await new Promise(r => setTimeout(r, 2000)); // 等待浏览器完全关闭
-            } else {
-                console.log(`[SessionManager] Browser already inactive for ${sessionId}`);
-            }
-
-            // 3. 再次确认浏览器已关闭
-            const afterStopStatus = await this.checkBrowserStatus(sessionId);
-            if (afterStopStatus.status === 'active') {
-                console.warn(`[SessionManager] Browser still active after stop attempt, retrying...`);
-                await this.stopBrowser(sessionId);
-                await new Promise(r => setTimeout(r, 3000));
-            }
-
-            // 4. 调用初始化函数重新启动
-            if (this._initSessionFunc) {
-                const config = {
-                    sessionId,
-                    sessionName: session.sessionName
-                };
-                console.log(`[SessionManager] Initializing session ${sessionId} with config:`, config);
-                await this._initSessionFunc(config);
-                console.log(`[SessionManager] Session ${sessionId} force restart initiated`);
-                return { success: true };
-            } else {
-                throw new Error('No init function registered');
-            }
-
-        } catch (e) {
-            console.error(`[SessionManager] Force restart failed for ${sessionId}:`, e.message);
-            session.lastError = e.message;
-            session.sessionStatus = SESSION_STATUS.DISCONNECTED;
-            this.emit('restartFailed', { sessionId, error: e.message });
-            return { success: false, error: e.message };
-        }
+        return this.safeRestartSession(sessionId, 'heartbeat_unhealthy');
     }
 
     /**
-     * ★ 增强版：收集历史消息（基于最后一条消息时间往前推）
-     *
-     * @param {string} sessionId - 会话ID
-     * @returns {Promise<Array>} 联系人及消息数据
+     * ★ 增强版：收集历史消息
      */
     async collectHistoryForStartupSync(sessionId) {
-        const session = this.sessions.get(sessionId);
-        if (!session?.client) {
-            console.warn(`[SessionManager] Cannot collect history: session ${sessionId} not ready`);
-            return [];
-        }
-
-        console.log(`[SessionManager] ★ Collecting startup sync history for ${sessionId}...`);
-        console.log(`[SessionManager] Config: contacts=${this.syncContactCount}, hours=${this.syncHistoryHours}`);
-
-        try {
-            const chats = await session.client.getChats();
-
-            // 只取私聊，排除群组，按时间排序
-            const privateChats = chats
-                .filter(c => !c.isGroup && !/@g\.us$/i.test(c.id?._serialized || ''))
-                .sort((a, b) => {
-                    const aTime = a.timestamp || a.lastMessage?.timestamp || 0;
-                    const bTime = b.timestamp || b.lastMessage?.timestamp || 0;
-                    return bTime - aTime;
-                })
-                .slice(0, this.syncContactCount);
-
-            console.log(`[SessionManager] Selected ${privateChats.length} private chats for sync`);
-
-            const results = [];
-
-            for (const chat of privateChats) {
-                try {
-                    const chatId = chat.id?._serialized || '';
-
-                    // ★ 关键：先获取最新消息，确定时间范围
-                    const recentMsgs = await chat.fetchMessages({ limit: 1 });
-                    if (!recentMsgs || recentMsgs.length === 0) {
-                        continue;
-                    }
-
-                    // 最后一条消息的时间戳
-                    const lastMsgTimestamp = recentMsgs[0].timestamp;
-                    if (!lastMsgTimestamp) {
-                        continue;
-                    }
-
-                    // ★ 计算时间范围：从最后一条消息往前推 N 小时
-                    const cutoffTimestamp = lastMsgTimestamp - (this.syncHistoryHours * 3600);
-
-                    console.log(`[SessionManager] Chat ${chatId}: range ${new Date(cutoffTimestamp * 1000).toISOString()} ~ ${new Date(lastMsgTimestamp * 1000).toISOString()}`);
-
-                    // 获取更多消息
-                    const allMessages = await chat.fetchMessages({ limit: 200 });
-
-                    // 过滤在时间范围内的消息
-                    const filtered = allMessages.filter(m => {
-                        const ts = m.timestamp;
-                        return ts && ts >= cutoffTimestamp && ts <= lastMsgTimestamp;
-                    });
-
-                    if (filtered.length === 0) {
-                        continue;
-                    }
-
-                    // 获取联系人信息
-                    const contact = await chat.getContact().catch(() => null);
-                    const contactName = contact?.pushname || contact?.name || chat.name || '';
-
-                    // 提取电话号码
-                    let phone = '';
-                    let phone_lid = '';
-                    if (/@c\.us$/i.test(chatId)) {
-                        phone = chatId.replace(/@.*/, '').replace(/\D/g, '');
-                    } else if (/@lid$/i.test(chatId)) {
-                        phone_lid = chatId.replace(/@.*/, '').replace(/\D/g, '');
-                    }
-
-                    // 转换消息格式
-                    const messages = filtered.map(m => ({
-                        id: m.id?._serialized || m.id,
-                        body: m.body || '',
-                        type: m.type || 'chat',
-                        fromMe: !!m.fromMe,
-                        timestamp: m.timestamp,
-                        hasMedia: !!m.hasMedia
-                    }));
-
-                    // 按时间升序排列
-                    messages.sort((a, b) => a.timestamp - b.timestamp);
-
-                    results.push({
-                        chatId,
-                        phone,
-                        phone_lid,
-                        name: contactName,
-                        sessionId,
-                        sessionName: session.sessionName,
-                        messages,
-                        lastMsgTimestamp,
-                        cutoffTimestamp,
-                        messageCount: messages.length
-                    });
-
-                    console.log(`[SessionManager] Chat ${phone || phone_lid || chatId}: ${messages.length} messages`);
-
-                } catch (chatErr) {
-                    console.warn(`[SessionManager] Error processing chat:`, chatErr.message);
-                }
-            }
-
-            const totalMessages = results.reduce((sum, c) => sum + c.messageCount, 0);
-            console.log(`[SessionManager] ★ Collected ${totalMessages} messages from ${results.length} contacts`);
-
-            return results;
-
-        } catch (e) {
-            console.error(`[SessionManager] collectHistoryForStartupSync error:`, e.message);
-            return [];
-        }
-    }
-
-    /**
-     * 旧版兼容：收集历史消息（基于当前时间往前推）
-     */
-    async collectHistoryForSync(sessionId) {
         const session = this.sessions.get(sessionId);
         if (!session?.client) {
             console.warn(`[SessionManager] Cannot collect history: session ${sessionId} not ready`);
@@ -697,55 +564,58 @@ class SessionManager extends EventEmitter {
         try {
             const chats = await session.client.getChats();
             const privateChats = chats
-                .filter(c => !c.isGroup)
+                .filter(c => !c.isGroup && !/@g\.us$/i.test(c.id?._serialized || ''))
                 .sort((a, b) => {
-                    const unreadDiff = (b.unreadCount || 0) - (a.unreadCount || 0);
-                    if (unreadDiff !== 0) return unreadDiff;
-                    return (b.timestamp || 0) - (a.timestamp || 0);
+                    const aTime = a.timestamp || a.lastMessage?.timestamp || 0;
+                    const bTime = b.timestamp || b.lastMessage?.timestamp || 0;
+                    return bTime - aTime;
                 })
                 .slice(0, this.syncContactCount);
 
             console.log(`[SessionManager] Selected ${privateChats.length} chats for history sync`);
 
-            const nowSec = Math.floor(Date.now() / 1000);
-            const cutoffSec = nowSec - (this.syncHistoryHours * 3600);
-
             const results = [];
+            let totalMessages = 0;
+            let totalContacts = 0;
 
             for (const chat of privateChats) {
                 try {
-                    const messages = await chat.fetchMessages({ limit: 50 });
-                    const filtered = messages.filter(m =>
-                        m.timestamp && m.timestamp >= cutoffSec
-                    );
+                    const chatId = chat.id?._serialized || '';
+                    const recentMsgs = await chat.fetchMessages({ limit: 1 });
+                    if (!recentMsgs || recentMsgs.length === 0) continue;
 
-                    if (filtered.length > 0) {
+                    const lastMsg = recentMsgs[0];
+                    const lastMsgTime = lastMsg.timestamp || 0;
+                    const cutoffTime = lastMsgTime - (this.syncHistoryHours * 3600);
+
+                    const allMsgs = await chat.fetchMessages({ limit: 100 });
+                    const relevantMsgs = allMsgs.filter(m => (m.timestamp || 0) >= cutoffTime);
+
+                    if (relevantMsgs.length > 0) {
                         results.push({
-                            chatId: chat.id?._serialized,
-                            phone: chat.id?.user,
-                            name: chat.name || chat.pushname || '',
-                            messages: filtered.map(m => ({
+                            chatId,
+                            name: chat.name || '',
+                            messages: relevantMsgs.map(m => ({
                                 id: m.id?._serialized,
                                 body: m.body,
-                                type: m.type,
                                 fromMe: m.fromMe,
                                 timestamp: m.timestamp,
-                                hasMedia: m.hasMedia
+                                type: m.type
                             }))
                         });
+                        totalMessages += relevantMsgs.length;
+                        totalContacts++;
                     }
                 } catch (e) {
-                    console.warn(`[SessionManager] Error fetching messages for chat:`, e.message);
+                    // 单个聊天失败不影响其他
                 }
             }
 
-            const totalMessages = results.reduce((sum, c) => sum + c.messages.length, 0);
-            console.log(`[SessionManager] Collected ${totalMessages} messages from ${results.length} contacts`);
-
+            console.log(`[SessionManager] Collected ${totalMessages} messages from ${totalContacts} contacts`);
             return results;
 
         } catch (e) {
-            console.error(`[SessionManager] Error collecting history:`, e.message);
+            console.error(`[SessionManager] collectHistory error:`, e.message);
             return [];
         }
     }
@@ -754,47 +624,36 @@ class SessionManager extends EventEmitter {
      * 执行心跳检查
      */
     async performHeartbeatCheck() {
-        if (!this.healthCheckEnabled) return [];
-
         const results = [];
 
         for (const [sessionId, session] of this.sessions) {
-            if (session.sessionStatus === SESSION_STATUS.ERROR) {
-                results.push({
-                    sessionId,
-                    sessionName: session.sessionName,
-                    previousStatus: session.sessionStatus,
-                    isHealthy: false,
-                    skipped: true,
-                    reason: 'Session in error state, manual intervention required'
-                });
-                continue;
-            }
-
-            if (session.sessionStatus === SESSION_STATUS.RESTARTING) {
-                results.push({
-                    sessionId,
-                    sessionName: session.sessionName,
-                    previousStatus: session.sessionStatus,
-                    isHealthy: false,
-                    skipped: true,
-                    reason: 'Session is restarting'
-                });
-                continue;
-            }
-
             try {
+                // 跳过正在重启或已出错的会话
+                if (session.sessionStatus === SESSION_STATUS.RESTARTING) {
+                    continue;
+                }
+                if (session.sessionStatus === SESSION_STATUS.ERROR) {
+                    continue;
+                }
+
+                // ★★★ V2 新增：跳过有活跃重连锁的会话 ★★★
+                if (this.hasActiveRestartLock(sessionId)) {
+                    console.log(`[SessionManager] Session ${sessionId} has active restart lock, skipping heartbeat`);
+                    continue;
+                }
+
                 const checkResult = {
                     sessionId,
                     sessionName: session.sessionName,
-                    previousStatus: session.sessionStatus,
-                    checks: {},
-                    restartCount: session.restartCount || 0
+                    isHealthy: true,
+                    checks: {}
                 };
 
+                // 检查 AdsPower 浏览器状态
                 const browserStatus = await this.checkBrowserStatus(sessionId);
                 checkResult.checks.browser = browserStatus.status;
 
+                // 检查 WhatsApp 客户端状态
                 if (session.client) {
                     try {
                         const waState = await session.client.getState();
@@ -815,18 +674,13 @@ class SessionManager extends EventEmitter {
                     checkResult.checks.waState = 'no_client';
                 }
 
-                // ★★★ 修复：OPENING 状态视为正在连接，不触发重启 ★★★
+                // 健康判断
                 const waState = checkResult.checks.waState;
                 const isConnectedOrOpening = waState === 'CONNECTED' || waState === 'OPENING';
-
-                // ★★★ 关键修复：只要 WhatsApp 状态是 CONNECTED，就认为是健康的 ★★★
-                // AdsPower 的 browser/active API 不可靠，经常在浏览器正常运行时返回 inactive
-                // 真正重要的是 WhatsApp 客户端是否能正常工作
                 const isHealthy = waState === 'CONNECTED';
 
-                // 记录浏览器状态仅供参考，不作为健康判断依据
+                // 记录浏览器状态仅供参考
                 if (browserStatus.status !== 'active' && waState === 'CONNECTED') {
-                    // 仅记录日志，不触发重启（限制日志频率）
                     if (!session._lastBrowserInactiveLog || Date.now() - session._lastBrowserInactiveLog > 60000) {
                         console.log(`[SessionManager] Session ${sessionId}: AdsPower reports browser inactive, but WA is CONNECTED - ignoring`);
                         session._lastBrowserInactiveLog = Date.now();
@@ -835,27 +689,20 @@ class SessionManager extends EventEmitter {
 
                 checkResult.isHealthy = isHealthy;
 
-                // ★★★ 增强：检测到不健康时的处理逻辑 ★★★
+                // 不健康时的处理
                 if (!isHealthy) {
-                    // ★★★ 新增：宽限期检查 - READY 后 30 秒内不触发重启 ★★★
+                    // 宽限期检查
                     const GRACE_PERIOD_MS = 30000;
                     const timeSinceReady = session.readyAt ? (Date.now() - session.readyAt) : Infinity;
                     const inGracePeriod = timeSinceReady < GRACE_PERIOD_MS;
 
-                    // ★★★ 新增：OPENING 状态不触发重启，等待连接完成 ★★★
                     if (isConnectedOrOpening && browserStatus.status === 'active') {
-                        // OPENING 状态 - 正在连接中，不触发重启
                         if (waState === 'OPENING') {
                             console.log(`[SessionManager] Session ${sessionId} is OPENING, waiting for connection...`);
                         }
-                        // 不做任何重启操作
-                    }
-                    // 宽限期内不触发重启
-                    else if (inGracePeriod) {
+                    } else if (inGracePeriod) {
                         console.log(`[SessionManager] Session ${sessionId} in grace period (${Math.round(timeSinceReady/1000)}s/${GRACE_PERIOD_MS/1000}s), skipping restart`);
-                    }
-                    // 只有在 READY 状态下且过了宽限期才触发重启
-                    else if (session.sessionStatus === SESSION_STATUS.READY) {
+                    } else if (session.sessionStatus === SESSION_STATUS.READY) {
                         console.warn(`[SessionManager] Session ${sessionId} unhealthy:`, checkResult.checks);
 
                         session.sessionStatus = SESSION_STATUS.DISCONNECTED;
@@ -867,8 +714,8 @@ class SessionManager extends EventEmitter {
                             console.log(`[SessionManager] Auto-restarting session ${sessionId}...`);
                             checkResult.autoRestart = true;
 
-                            // ★★★ 关键：先确保浏览器关闭，再重启 ★★★
-                            this._forceRestartSession(sessionId).then(result => {
+                            // ★★★ V2 改进：使用 safeRestartSession ★★★
+                            this.safeRestartSession(sessionId, 'heartbeat_unhealthy').then(result => {
                                 if (!result.success) {
                                     console.error(`[SessionManager] Auto-restart failed for ${sessionId}: ${result.error}`);
                                 }
@@ -876,9 +723,7 @@ class SessionManager extends EventEmitter {
                                 console.error(`[SessionManager] Auto-restart error for ${sessionId}:`, e.message);
                             });
                         }
-                    }
-                    // 如果已经是 DISCONNECTED 或 RESTARTING 状态，不再重复触发
-                    else if (session.sessionStatus === SESSION_STATUS.DISCONNECTED) {
+                    } else if (session.sessionStatus === SESSION_STATUS.DISCONNECTED) {
                         console.log(`[SessionManager] Session ${sessionId} still disconnected, waiting for restart...`);
                     }
                 }
@@ -1005,6 +850,7 @@ class SessionManager extends EventEmitter {
 
         this.sessions.clear();
         this._profileCache.clear();
+        this._restartLocks.clear();  // ★ V2 新增
         this._initialized = false;
 
         console.log('[SessionManager] Shutdown complete');

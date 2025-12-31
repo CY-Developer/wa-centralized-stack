@@ -797,6 +797,41 @@ app.post('/ingest', async (req, res) => {
             hasAttachment: !!attachment, hasMedia: !!media
         });
 
+        // ★★★ 新增：LID 转电话号码三层兜底逻辑 ★★★
+        // 层级1: 已有电话号码 (@c.us) - 直接使用
+        // 层级2: 只有 LID (@lid) - 调用 Bridge API getContactLidAndPhone
+        // 层级3: API 也找不到 - 检查联系人名称是否看起来像电话号码
+        if (!phone && phone_lid && sessionId) {
+            console.log(`[INGEST] No phone, trying to resolve LID: ${phone_lid}`);
+
+            // 层级2: 调用 Bridge API 解析 LID
+            try {
+                const resolveUrl = `${WA_BRIDGE_URL}/resolve-lid/${sessionId}/${phone_lid}`;
+                const resolveResp = await axios.get(resolveUrl, {
+                    headers: WA_BRIDGE_TOKEN ? { 'x-api-token': WA_BRIDGE_TOKEN } : {},
+                    timeout: 10000
+                }).catch(() => null);
+
+                if (resolveResp?.data?.ok && resolveResp.data.phone) {
+                    phone = resolveResp.data.phone;
+                    console.log(`[INGEST] LID resolved to phone via API: ${phone_lid} -> ${phone}`);
+                } else {
+                    console.log(`[INGEST] LID API returned no phone for: ${phone_lid}`);
+                }
+            } catch (e) {
+                console.log(`[INGEST] LID resolve API error: ${e?.message}`);
+            }
+
+            // 层级3: 检查联系人名称是否看起来像电话号码
+            if (!phone && name) {
+                const phoneFromName = extractPhoneFromName(name);
+                if (phoneFromName) {
+                    phone = phoneFromName;
+                    console.log(`[INGEST] Extracted phone from contact name: "${name}" -> ${phone}`);
+                }
+            }
+        }
+
         inbox_id = await resolveInboxId(sessionId);  // ★ 传入 sessionId
         const phoneE164 = toE164(phone || phone_lid);
 
@@ -1179,8 +1214,39 @@ app.post('/ingest-outgoing', async (req, res) => {
             }
         }
 
+        // ★★★ 新增：LID 转电话号码三层兜底逻辑 ★★★
+        let resolvedPhone = phone;
+        if (!resolvedPhone && phone_lid && sessionId) {
+            console.log(`[INGEST_OUT] No phone, trying to resolve LID: ${phone_lid}`);
+
+            // 层级2: 调用 Bridge API 解析 LID
+            try {
+                const resolveUrl = `${WA_BRIDGE_URL}/resolve-lid/${sessionId}/${phone_lid}`;
+                const resolveResp = await axios.get(resolveUrl, {
+                    headers: WA_BRIDGE_TOKEN ? { 'x-api-token': WA_BRIDGE_TOKEN } : {},
+                    timeout: 10000
+                }).catch(() => null);
+
+                if (resolveResp?.data?.ok && resolveResp.data.phone) {
+                    resolvedPhone = resolveResp.data.phone;
+                    console.log(`[INGEST_OUT] LID resolved to phone via API: ${phone_lid} -> ${resolvedPhone}`);
+                }
+            } catch (e) {
+                console.log(`[INGEST_OUT] LID resolve API error: ${e?.message}`);
+            }
+
+            // 层级3: 检查联系人名称是否看起来像电话号码
+            if (!resolvedPhone && name) {
+                const phoneFromName = extractPhoneFromName(name);
+                if (phoneFromName) {
+                    resolvedPhone = phoneFromName;
+                    console.log(`[INGEST_OUT] Extracted phone from contact name: "${name}" -> ${resolvedPhone}`);
+                }
+            }
+        }
+
         // 4. 确定目标电话
-        const targetPhone = phone || phone_lid || to?.replace(/@.*/, '').replace(/\D/g, '');
+        const targetPhone = resolvedPhone || phone_lid || to?.replace(/@.*/, '').replace(/\D/g, '');
         if (!targetPhone) {
             return res.json({ ok: true, skipped: 'no phone' });
         }
