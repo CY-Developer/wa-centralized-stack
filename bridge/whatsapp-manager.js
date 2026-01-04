@@ -60,6 +60,37 @@ const sessions = new Proxy(_sessionsStore, {
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 function rnd(a,b){ return Math.floor(Math.random()*(b-a+1))+a; }
 
+// ★★★ V3 新增：检查 session 是否真正可用 ★★★
+function isSessionReady(sessionId) {
+    const smSession = sessionManager.getSession(sessionId);
+    if (!smSession) return { ready: false, reason: 'session_not_found' };
+
+    // 检查是否有重启锁
+    if (sessionManager.hasActiveRestartLock && sessionManager.hasActiveRestartLock(sessionId)) {
+        return { ready: false, reason: 'restart_in_progress' };
+    }
+
+    // 检查状态
+    const status = smSession.sessionStatus;
+    if (status !== 'ready') {
+        return { ready: false, reason: `status_${status}` };
+    }
+
+    // 检查 client
+    if (!smSession.client) {
+        return { ready: false, reason: 'no_client' };
+    }
+
+    // 检查 client 的 pupPage 是否有效
+    try {
+        if (smSession.client.pupPage && smSession.client.pupPage.isClosed()) {
+            return { ready: false, reason: 'page_closed' };
+        }
+    } catch (_) {}
+
+    return { ready: true };
+}
+
 // 发送限流（每号每分钟/同会话冷却）
 // 发送限流（统一读取 .env.chatwoot 的 RATE_PER_MIN / SAME_CHAT_COOLDOWN_MS）
 const SEND_RPM         = Number(process.env.RATE_PER_MIN || process.env.SEND_RPM || 12);
@@ -1881,6 +1912,13 @@ app.post('/send/text', async (req, res) => {
         if (!sessionId || !text) return bad(400, 'missing sessionId/text');
         if (!to && !to_lid) return bad(400, 'missing to or to_lid');
 
+        // ★★★ V3 增强：检查 session 是否真正可用 ★★★
+        const readyCheck = isSessionReady(sessionId);
+        if (!readyCheck.ready) {
+            console.warn(`[send/text] Session ${sessionId} not ready: ${readyCheck.reason}`);
+            return bad(503, `session not ready: ${readyCheck.reason}`);
+        }
+
         const session = sessions[sessionId];
         if (!session || !session.client) return bad(400, 'session not ready');
 
@@ -2372,6 +2410,17 @@ app.post('/send/media', async (req, res) => {
 
         if (!sessionId) return bad(400, 'missing sessionId');
         if (!to && !to_lid) return bad(400, 'missing to or to_lid');
+
+        // ★★★ V3 增强：检查 session 是否真正可用 ★★★
+        const readyCheck = isSessionReady(sessionId);
+        if (!readyCheck.ready) {
+            console.warn(`[send/media] Session ${sessionId} not ready: ${readyCheck.reason}`);
+            // 清理缓存状态
+            if (message_id) {
+                sendMediaCache.delete(message_id);
+            }
+            return bad(503, `session not ready: ${readyCheck.reason}`);
+        }
 
         const session = sessions[sessionId];
         if (!session || !session.client) return bad(400, 'session not ready');

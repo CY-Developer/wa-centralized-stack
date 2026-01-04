@@ -676,14 +676,33 @@ class SessionManager extends EventEmitter {
 
                 // 健康判断
                 const waState = checkResult.checks.waState;
-                const isConnectedOrOpening = waState === 'CONNECTED' || waState === 'OPENING';
+                // ★★★ V3 修复：null 状态视为"正在连接"，给它机会 ★★★
+                const isConnectedOrOpening = waState === 'CONNECTED' || waState === 'OPENING' || waState === null;
                 const isHealthy = waState === 'CONNECTED';
 
-                // 记录浏览器状态仅供参考
-                if (browserStatus.status !== 'active' && waState === 'CONNECTED') {
+                // ★★★ V3 修复：null 状态计数器，连续多次才判定为 unhealthy ★★★
+                if (waState === null) {
+                    session._nullStateCount = (session._nullStateCount || 0) + 1;
+                    if (session._nullStateCount <= 5) {  // 给 5 次机会（约 15 秒）
+                        console.log(`[SessionManager] Session ${sessionId}: waState is null (${session._nullStateCount}/5), waiting...`);
+                        results.push({ ...checkResult, isHealthy: false, waiting: true });
+                        continue;  // 跳过这次检查
+                    }
+                } else if (waState === 'CONNECTED') {
+                    session._nullStateCount = 0;  // 重置计数器
+                }
+
+                // ★★★ V3 修复：忽略 AdsPower 的 inactive 误报 ★★★
+                if (browserStatus.status !== 'active' && isConnectedOrOpening) {
                     if (!session._lastBrowserInactiveLog || Date.now() - session._lastBrowserInactiveLog > 60000) {
-                        console.log(`[SessionManager] Session ${sessionId}: AdsPower reports browser inactive, but WA is CONNECTED - ignoring`);
+                        console.log(`[SessionManager] Session ${sessionId}: AdsPower reports browser inactive, but WA is ${waState || 'loading'} - ignoring`);
                         session._lastBrowserInactiveLog = Date.now();
+                    }
+                    // 如果 WA 是 CONNECTED，直接视为健康
+                    if (waState === 'CONNECTED') {
+                        checkResult.isHealthy = true;
+                        results.push(checkResult);
+                        continue;
                     }
                 }
 
@@ -691,8 +710,8 @@ class SessionManager extends EventEmitter {
 
                 // 不健康时的处理
                 if (!isHealthy) {
-                    // 宽限期检查
-                    const GRACE_PERIOD_MS = 30000;
+                    // ★★★ V3 修复：延长宽限期到 60 秒 ★★★
+                    const GRACE_PERIOD_MS = 60000;
                     const timeSinceReady = session.readyAt ? (Date.now() - session.readyAt) : Infinity;
                     const inGracePeriod = timeSinceReady < GRACE_PERIOD_MS;
 
@@ -703,25 +722,34 @@ class SessionManager extends EventEmitter {
                     } else if (inGracePeriod) {
                         console.log(`[SessionManager] Session ${sessionId} in grace period (${Math.round(timeSinceReady/1000)}s/${GRACE_PERIOD_MS/1000}s), skipping restart`);
                     } else if (session.sessionStatus === SESSION_STATUS.READY) {
-                        console.warn(`[SessionManager] Session ${sessionId} unhealthy:`, checkResult.checks);
+                        // ★★★ V3 修复：只有真正的问题状态才重启 ★★★
+                        const reallyUnhealthy = waState === 'error' || waState === 'CONFLICT' ||
+                            waState === 'UNPAIRED' || waState === 'UNLAUNCHED' ||
+                            (session._nullStateCount && session._nullStateCount > 5);
 
-                        session.sessionStatus = SESSION_STATUS.DISCONNECTED;
-                        session.lastError = `Browser: ${browserStatus.status}, WA: ${checkResult.checks.waState}`;
+                        if (!reallyUnhealthy) {
+                            console.log(`[SessionManager] Session ${sessionId}: waState=${waState}, not critical - skipping restart`);
+                        } else {
+                            console.warn(`[SessionManager] Session ${sessionId} unhealthy:`, checkResult.checks);
 
-                        this.emit('sessionUnhealthy', { sessionId, checks: checkResult.checks });
+                            session.sessionStatus = SESSION_STATUS.DISCONNECTED;
+                            session.lastError = `Browser: ${browserStatus.status}, WA: ${checkResult.checks.waState}`;
 
-                        if (this.autoRestartEnabled) {
-                            console.log(`[SessionManager] Auto-restarting session ${sessionId}...`);
-                            checkResult.autoRestart = true;
+                            this.emit('sessionUnhealthy', { sessionId, checks: checkResult.checks });
 
-                            // ★★★ V2 改进：使用 safeRestartSession ★★★
-                            this.safeRestartSession(sessionId, 'heartbeat_unhealthy').then(result => {
-                                if (!result.success) {
-                                    console.error(`[SessionManager] Auto-restart failed for ${sessionId}: ${result.error}`);
-                                }
-                            }).catch(e => {
-                                console.error(`[SessionManager] Auto-restart error for ${sessionId}:`, e.message);
-                            });
+                            if (this.autoRestartEnabled) {
+                                console.log(`[SessionManager] Auto-restarting session ${sessionId}...`);
+                                checkResult.autoRestart = true;
+
+                                // ★★★ V2 改进：使用 safeRestartSession ★★★
+                                this.safeRestartSession(sessionId, 'heartbeat_unhealthy').then(result => {
+                                    if (!result.success) {
+                                        console.error(`[SessionManager] Auto-restart failed for ${sessionId}: ${result.error}`);
+                                    }
+                                }).catch(e => {
+                                    console.error(`[SessionManager] Auto-restart error for ${sessionId}:`, e.message);
+                                });
+                            }
                         }
                     } else if (session.sessionStatus === SESSION_STATUS.DISCONNECTED) {
                         console.log(`[SessionManager] Session ${sessionId} still disconnected, waiting for restart...`);
