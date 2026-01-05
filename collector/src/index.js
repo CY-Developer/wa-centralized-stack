@@ -1199,6 +1199,39 @@ app.post('/ingest-outgoing', async (req, res) => {
             hasAttachment: !!attachment
         });
 
+        // ★★★ 新增：媒体消息但没有 attachment 时，尝试补充获取 ★★★
+        let enhancedAttachment = attachment;
+        const MEDIA_TYPES = ['image', 'video', 'audio', 'ptt', 'sticker', 'document'];
+        if (MEDIA_TYPES.includes(type) && !attachment && sessionId && messageId) {
+            console.log(`[INGEST_OUT] Media message without attachment, trying to fetch: ${type}`);
+
+            try {
+                // 调用 Bridge API 尝试重新获取媒体
+                const fetchMediaUrl = `${WA_BRIDGE_URL}/fetch-media`;
+                const mediaResp = await axios.post(fetchMediaUrl, {
+                    sessionId,
+                    messageId
+                }, {
+                    headers: WA_BRIDGE_TOKEN ? { 'x-api-token': WA_BRIDGE_TOKEN } : {},
+                    timeout: 20000
+                }).catch(() => null);
+
+                if (mediaResp?.data?.ok && mediaResp.data.media) {
+                    const m = mediaResp.data.media;
+                    enhancedAttachment = {
+                        data_url: `data:${m.mimetype};base64,${m.data}`,
+                        mime: m.mimetype,
+                        filename: m.filename || `${type}_${Date.now()}.${m.mimetype?.split('/')[1] || 'bin'}`
+                    };
+                    console.log(`[INGEST_OUT] Media fetched successfully: ${m.mimetype}`);
+                } else {
+                    console.log(`[INGEST_OUT] Media fetch failed or returned no data`);
+                }
+            } catch (e) {
+                console.log(`[INGEST_OUT] Media fetch error: ${e?.message}`);
+            }
+        }
+
         // 2. 跳过群组/广播
         if (/@g\.us$/i.test(to) || /@broadcast/i.test(to)) {
             return res.json({ ok: true, skipped: 'group/broadcast' });
@@ -1366,8 +1399,8 @@ app.post('/ingest-outgoing', async (req, res) => {
             }
         }
 
-        // 8. 处理附件
-        const attachments = normalizeAttachments({ attachment, messageId });
+        // 8. 处理附件（使用可能被增强的附件）
+        const attachments = normalizeAttachments({ attachment: enhancedAttachment, messageId });
 
         // ★★★ 新增：重试标志 ★★★
         let retryAttempted = false;
@@ -3562,55 +3595,55 @@ app.post('/chatwoot/webhook', async (req, res) => {
                 message_id
             });
 
-            // 【Bug 1 修复】同步发送，等待结果
-            try {
-                const result = await postWithRetry(
-                    `${WA_BRIDGE_URL}/send/text`,
-                    { sessionId: finalSession, to: to || '', to_lid: to_lid || '', text },
-                    headers
-                );
+            // ★★★ 修复：改为异步模式，先返回成功给 Chatwoot ★★★
+            // 这样即使 Bridge 响应较慢，Chatwoot 也不会显示"发送失败"
+            res.json({
+                ok: true,
+                sent: true,
+                async: true,
+                message_id
+            });
 
-                const success = result?.ok;
+            // 后台异步发送（不阻塞响应）
+            setImmediate(async () => {
+                const startTime = Date.now();
+                try {
+                    const result = await postWithRetry(
+                        `${WA_BRIDGE_URL}/send/text`,
+                        { sessionId: finalSession, to: to || '', to_lid: to_lid || '', text },
+                        headers,
+                        3,  // 3次重试
+                        60000  // 60秒超时
+                    );
 
-                logToCollector('[CW->WA] TEXT_RESULT', {
-                    success,
-                    msgId: result?.msgId,
-                    message_id
-                });
+                    const success = result?.ok;
+                    const duration = Date.now() - startTime;
 
-                if (!success) {
-                    const errorMsg = result?.error || 'text send failed';
-                    await markMessageAsFailed(account_id, conversation_id, message_id, errorMsg);
-                    return res.json({
-                        ok: false,
+                    logToCollector('[CW->WA] TEXT_RESULT', {
+                        success,
+                        msgId: result?.msgId,
+                        message_id,
+                        duration: `${duration}ms`
+                    });
+
+                    if (!success) {
+                        console.error(`[TEXT_ASYNC] ✗ 发送失败: message_id=${message_id}, error=${result?.error}`);
+                    } else {
+                        console.log(`[TEXT_ASYNC] ✓ 发送成功: message_id=${message_id}, msgId=${result?.msgId}, duration=${duration}ms`);
+                    }
+                } catch (err) {
+                    const duration = Date.now() - startTime;
+                    const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
+                    console.error(`[TEXT_ASYNC] ✗ 发送异常: message_id=${message_id}, error=${errorMsg}, duration=${duration}ms`);
+                    logToCollector('[CW->WA] TEXT_ERROR', {
                         error: errorMsg,
-                        message_id
+                        message_id,
+                        duration: `${duration}ms`
                     });
                 }
+            });
 
-                return res.json({
-                    ok: true,
-                    sent: true,
-                    message_id,
-                    waMessageId: result?.msgId
-                });
-
-            } catch (err) {
-                const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
-                console.error('[CW->WA] TEXT_ERROR', errorMsg);
-                logToCollector('[CW->WA] TEXT_ERROR', {
-                    error: errorMsg,
-                    message_id
-                });
-
-                await markMessageAsFailed(account_id, conversation_id, message_id, errorMsg);
-
-                return res.json({
-                    ok: false,
-                    error: errorMsg,
-                    message_id
-                });
-            }
+            return; // 已经返回响应，直接退出
         }
 
         return res.json({ ok: true, skipped: 'no content' });

@@ -14,6 +14,15 @@ const COLLECTOR_TOKEN = process.env.COLLECTOR_INGEST_TOKEN || process.env.API_TO
 
 const { sessionManager, SESSION_STATUS } = require('./session-manager');
 
+// ★★★ V3.2 新增：联系人同步模块 ★★★
+let contactSync = null;
+try {
+    contactSync = require('./contact-sync');
+    console.log('[BOOT] ContactSync module loaded');
+} catch (e) {
+    console.log('[BOOT] ContactSync module not found, sync disabled');
+}
+
 // SESSIONS 现在由 SessionManager 动态管理
 // 保留解析逻辑用于后备
 const SESSIONS_ENV = (process.env.SESSIONS || '')
@@ -919,36 +928,59 @@ async function initSessionViaAdsPower(config) {
                     direction: 'outgoing'
                 };
 
-                // 7. 媒体处理（复用入站消息的逻辑，包括 DOM 提取备选）
+                // 7. 媒体处理（增强版：多次重试 + 延迟 + DOM 备选）
                 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
                 if (message.hasMedia || MEDIA_TYPES.has(message.type)) {
                     try {
                         let media = null;
+                        const MAX_MEDIA_RETRIES = 3;
 
-                        // 方法1：使用 API 下载
-                        try {
-                            const mediaPromise = message.downloadMedia();
-                            const timeoutPromise = new Promise((_, reject) =>
-                                setTimeout(() => reject(new Error('timeout')), 8000)
-                            );
-                            media = await Promise.race([mediaPromise, timeoutPromise]);
-                        } catch (e1) {
-                            console.log(`[${sessionId}] Media API failed: ${e1?.message}`);
+                        // ★★★ 增强：多次重试下载媒体 ★★★
+                        for (let attempt = 1; attempt <= MAX_MEDIA_RETRIES && !media?.data; attempt++) {
+                            // 方法1：使用 API 下载
+                            try {
+                                const mediaPromise = message.downloadMedia();
+                                const timeoutPromise = new Promise((_, reject) =>
+                                    setTimeout(() => reject(new Error('timeout')), 15000)  // 增加到15秒
+                                );
+                                media = await Promise.race([mediaPromise, timeoutPromise]);
+
+                                if (media?.data) {
+                                    console.log(`[${sessionId}] Media API OK on attempt ${attempt}`);
+                                    break;
+                                }
+                            } catch (e1) {
+                                console.log(`[${sessionId}] Media API attempt ${attempt}/${MAX_MEDIA_RETRIES} failed: ${e1?.message}`);
+                            }
+
+                            // 如果第一次失败，等待后重试（媒体可能还在上传）
+                            if (attempt < MAX_MEDIA_RETRIES && !media?.data) {
+                                const waitTime = attempt * 2000;  // 2秒, 4秒
+                                console.log(`[${sessionId}] Waiting ${waitTime}ms before retry...`);
+                                await new Promise(r => setTimeout(r, waitTime));
+                            }
                         }
 
-                        // 方法2：DOM 提取备选（仅图片/贴纸）
+                        // 方法2：DOM 提取备选（仅图片/贴纸）- 增强版
                         if (!media?.data && (message.type === 'image' || message.type === 'sticker')) {
                             console.log(`[${sessionId}] Trying DOM extraction for outgoing media...`);
+
+                            // 等待一下让图片加载到 DOM
+                            await new Promise(r => setTimeout(r, 1500));
 
                             try {
                                 const clientRef = sessions[sessionId]?.client;
                                 if (clientRef?.pupPage) {
                                     const extracted = await clientRef.pupPage.evaluate(async (msgId) => {
+                                        // 尝试多种选择器
                                         const msgEl = document.querySelector(`[data-id="${msgId}"]`);
                                         if (!msgEl) return {error: 'msg_not_found'};
 
+                                        // 尝试多种图片选择器
                                         const img = msgEl.querySelector('img[src^="blob:"]')
-                                            || msgEl.querySelector('img[draggable="false"]');
+                                            || msgEl.querySelector('img[draggable="false"]')
+                                            || msgEl.querySelector('img[src*="media"]')
+                                            || msgEl.querySelector('img:not([src^="data:image/svg"])');
 
                                         if (img?.src?.startsWith('blob:')) {
                                             try {
@@ -968,19 +1000,45 @@ async function initSessionViaAdsPower(config) {
                                                     reader.readAsDataURL(blob);
                                                 });
                                             } catch (e) {
-                                                return {error: 'blob_fetch_failed'};
+                                                return {error: 'blob_fetch_failed: ' + e.message};
                                             }
                                         }
-                                        return {error: 'no_image_src'};
+
+                                        // 如果 img.src 是普通 URL，尝试获取
+                                        if (img?.src && !img.src.startsWith('data:')) {
+                                            try {
+                                                const response = await fetch(img.src);
+                                                const blob = await response.blob();
+                                                return new Promise((resolve) => {
+                                                    const reader = new FileReader();
+                                                    reader.onloadend = () => {
+                                                        const base64 = reader.result;
+                                                        const matches = base64.match(/^data:(.+);base64,(.+)$/);
+                                                        if (matches) {
+                                                            resolve({mimetype: matches[1], data: matches[2]});
+                                                        } else {
+                                                            resolve({error: 'invalid_base64'});
+                                                        }
+                                                    };
+                                                    reader.readAsDataURL(blob);
+                                                });
+                                            } catch (e) {
+                                                return {error: 'url_fetch_failed: ' + e.message};
+                                            }
+                                        }
+
+                                        return {error: 'no_image_src', imgSrc: img?.src?.substring(0, 50)};
                                     }, message.id._serialized);
 
                                     if (extracted?.data) {
                                         media = extracted;
                                         console.log(`[${sessionId}] DOM extraction OK for outgoing`);
+                                    } else {
+                                        console.log(`[${sessionId}] DOM extraction failed: ${extracted?.error}`);
                                     }
                                 }
                             } catch (domErr) {
-                                console.log(`[${sessionId}] DOM extraction failed: ${domErr?.message}`);
+                                console.log(`[${sessionId}] DOM extraction error: ${domErr?.message}`);
                             }
                         }
 
@@ -1001,7 +1059,7 @@ async function initSessionViaAdsPower(config) {
 
                             console.log(`[${sessionId}] Media ready: ${media.mimetype}, ${(media.data.length / 1024).toFixed(1)}KB`);
                         } else {
-                            console.log(`[${sessionId}] Media unavailable for outgoing message`);
+                            console.log(`[${sessionId}] Media unavailable for outgoing message after all attempts`);
                         }
 
                     } catch (mediaErr) {
@@ -1135,40 +1193,75 @@ async function initSessionViaAdsPower(config) {
                         chatId: chat?.id?._serialized || ''
                     };
 
-                    // 媒体处理（API + DOM提取备选）
+                    // ★★★ V4 改进：媒体处理（增加重试机制和更长超时）★★★
                     if (message.hasMedia === true && typeof message.downloadMedia === 'function') {
                         try {
                             let media = null;
-                            try {
-                                const mediaPromise = message.downloadMedia();
-                                const timeoutPromise = new Promise((_, reject) =>
-                                    setTimeout(() => reject(new Error('timeout')), 5000)
-                                );
-                                media = await Promise.race([mediaPromise, timeoutPromise]);
-                            } catch (e1) {
-                                // API 失败
+                            const maxRetries = 3;
+
+                            // 等待一小段时间，让媒体有时间加载
+                            await new Promise(r => setTimeout(r, 1000));
+
+                            // 重试下载媒体
+                            for (let attempt = 1; attempt <= maxRetries && !media?.data; attempt++) {
+                                try {
+                                    console.log(`[${sessionId}] Downloading media (attempt ${attempt}/${maxRetries})...`);
+                                    const mediaPromise = message.downloadMedia();
+                                    const timeoutPromise = new Promise((_, reject) =>
+                                        setTimeout(() => reject(new Error('timeout')), 15000)  // 15秒超时
+                                    );
+                                    media = await Promise.race([mediaPromise, timeoutPromise]);
+
+                                    if (media?.data) {
+                                        console.log(`[${sessionId}] Media download OK on attempt ${attempt}`);
+                                        break;
+                                    }
+                                } catch (e1) {
+                                    console.log(`[${sessionId}] Media download attempt ${attempt} failed: ${e1?.message || 'unknown'}`);
+                                    if (attempt < maxRetries) {
+                                        await new Promise(r => setTimeout(r, 2000));  // 等待 2 秒后重试
+                                    }
+                                }
                             }
 
+                            // ★★★ 如果 API 失败，尝试 DOM 提取 ★★★
                             if (!media?.data && (message.type === 'image' || message.type === 'sticker')) {
                                 console.log(`[${sessionId}] API failed, extracting from DOM...`);
 
                                 try {
                                     const clientRef = sessions[sessionId]?.client;
                                     if (clientRef?.pupPage) {
+                                        // 等待一下让 DOM 加载
+                                        await new Promise(r => setTimeout(r, 2000));
+
                                         const extracted = await clientRef.pupPage.evaluate(async (msgId) => {
-                                            const msgEl = document.querySelector(`[data-id="${msgId}"]`);
+                                            // 尝试多种选择器找到消息元素
+                                            let msgEl = document.querySelector(`[data-id="${msgId}"]`);
+
+                                            // 如果找不到，尝试其他方式
+                                            if (!msgEl) {
+                                                // 尝试通过部分 ID 匹配
+                                                const partialId = msgId.split('_').pop();
+                                                msgEl = document.querySelector(`[data-id*="${partialId}"]`);
+                                            }
+
                                             if (!msgEl) return {error: 'msg_not_found'};
 
+                                            // 检查是否需要点击下载
                                             const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
+                                                || msgEl.querySelector('[data-icon="download"]')
                                                 || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
 
                                             if (downloadBtn) {
                                                 downloadBtn.click();
-                                                await new Promise(r => setTimeout(r, 5000));
+                                                await new Promise(r => setTimeout(r, 8000));  // 等待下载完成
                                             }
 
+                                            // 尝试多种方式获取图片
                                             const img = msgEl.querySelector('img[src^="blob:"]')
-                                                || msgEl.querySelector('img[draggable="false"]');
+                                                || msgEl.querySelector('img[draggable="false"][src^="blob:"]')
+                                                || msgEl.querySelector('img[data-plain-text]')
+                                                || msgEl.querySelector('div[data-testid="image-thumb"] img');
 
                                             if (img?.src?.startsWith('blob:')) {
                                                 try {
@@ -1185,21 +1278,28 @@ async function initSessionViaAdsPower(config) {
                                                                 resolve({error: 'invalid_base64'});
                                                             }
                                                         };
+                                                        reader.onerror = () => resolve({error: 'reader_error'});
                                                         reader.readAsDataURL(blob);
                                                     });
                                                 } catch (e) {
-                                                    return {error: 'blob_fetch_failed'};
+                                                    return {error: 'blob_fetch_failed: ' + e.message};
                                                 }
                                             }
-                                            return {error: 'no_image_src'};
+
+                                            // 返回更详细的错误信息
+                                            const hasImg = !!msgEl.querySelector('img');
+                                            return {error: `no_blob_src (hasImg: ${hasImg})`};
                                         }, message.id._serialized);
 
                                         if (extracted?.data) {
                                             media = extracted;
                                             console.log(`[${sessionId}] DOM extraction OK`);
+                                        } else {
+                                            console.log(`[${sessionId}] DOM extraction failed: ${extracted?.error || 'unknown'}`);
                                         }
                                     }
-                                } catch (_) {
+                                } catch (domErr) {
+                                    console.log(`[${sessionId}] DOM extraction error: ${domErr?.message}`);
                                 }
                             }
 
@@ -1211,7 +1311,7 @@ async function initSessionViaAdsPower(config) {
                                 };
                                 console.log(`[${sessionId}] media OK: ${media.mimetype}, ${media.data.length} bytes`);
                             } else {
-                                console.log(`[${sessionId}] media unavailable`);
+                                console.log(`[${sessionId}] media unavailable after all attempts`);
                             }
                         } catch (mediaErr) {
                             console.log(`[${sessionId}] media error: ${mediaErr?.message}`);
@@ -1315,6 +1415,20 @@ async function initSessionViaAdsPower(config) {
                 await new Promise(r => setTimeout(r, 2000));
             } catch (e) {
                 console.error(`[${config.sessionId}] init failed:`, e?.message || e);
+
+                // ★★★ V3.1 修复：初始化失败后延迟重启 ★★★
+                console.log(`[${config.sessionId}] Scheduling restart in 10 seconds...`);
+                setTimeout(async () => {
+                    try {
+                        console.log(`[${config.sessionId}] Attempting restart after init failure...`);
+                        const result = await sessionManager.safeRestartSession(config.sessionId, 'init_failed');
+                        if (!result.success) {
+                            console.error(`[${config.sessionId}] Restart failed: ${result.error}`);
+                        }
+                    } catch (restartErr) {
+                        console.error(`[${config.sessionId}] Restart error:`, restartErr?.message);
+                    }
+                }, 10000);  // 10 秒后重试
             }
         }
 
@@ -1345,6 +1459,11 @@ async function initSessionViaAdsPower(config) {
 
         // 启动心跳监控
         sessionManager.startHeartbeat();
+
+        // ★★★ V3.2 新增：初始化联系人同步定时任务 ★★★
+        if (contactSync) {
+            contactSync.initialize(sessionManager);
+        }
 
     } catch (e) {
         console.error('[BOOT] Fatal error:', e.message);
@@ -1407,6 +1526,72 @@ app.get('/sessions/:id', (req, res) => {
             lastRestartTime: session.lastRestartTime || null,
             lastError: session.lastError || null
         }
+    });
+});
+
+// ========== ★★★ V3.2 新增：联系人同步 API ★★★ ==========
+
+/**
+ * POST /contact-sync/trigger
+ * 手动触发联系人同步
+ *
+ * 请求体:
+ * {
+ *   sessionId: string  // 可选，指定单个 session，不传则同步所有
+ * }
+ */
+app.post('/contact-sync/trigger', async (req, res) => {
+    if (!contactSync) {
+        return res.status(501).json({ ok: false, error: 'ContactSync module not loaded' });
+    }
+
+    try {
+        const { sessionId } = req.body || {};
+
+        console.log(`[API] Contact sync triggered, sessionId=${sessionId || 'all'}`);
+
+        // 异步执行，立即返回
+        const promise = contactSync.triggerSync(sessionId);
+
+        // 不等待完成，直接返回
+        res.json({
+            ok: true,
+            message: sessionId
+                ? `Sync started for session ${sessionId}`
+                : 'Sync started for all sessions'
+        });
+
+        // 后台执行并记录结果
+        promise.then(results => {
+            console.log('[API] Contact sync completed');
+        }).catch(e => {
+            console.error('[API] Contact sync failed:', e.message);
+        });
+
+    } catch (e) {
+        console.error('[API] Contact sync trigger error:', e.message);
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+/**
+ * GET /contact-sync/status
+ * 获取同步配置状态
+ */
+app.get('/contact-sync/status', (req, res) => {
+    if (!contactSync) {
+        return res.json({
+            ok: true,
+            enabled: false,
+            reason: 'module_not_loaded'
+        });
+    }
+
+    res.json({
+        ok: true,
+        enabled: contactSync.SYNC_ENABLED,
+        intervalHours: contactSync.SYNC_INTERVAL_HOURS,
+        filter: "last 24 hours"
     });
 });
 
@@ -1902,6 +2087,155 @@ app.get('/resolve-lid/:sessionId/:lid', async (req, res) => {
     }
 });
 
+// ========== 获取消息媒体 ==========
+/**
+ * POST /fetch-media
+ * 尝试获取指定消息的媒体内容
+ * 用于当 message_create 事件中媒体下载失败时的补充获取
+ */
+app.post('/fetch-media', async (req, res) => {
+    try {
+        const { sessionId, messageId } = req.body || {};
+
+        if (!sessionId || !messageId) {
+            return res.status(400).json({ ok: false, error: 'missing sessionId or messageId' });
+        }
+
+        const session = sessions[sessionId];
+        if (!session || !session.client) {
+            return res.status(400).json({ ok: false, error: 'session not ready' });
+        }
+
+        console.log(`[fetch-media] Fetching media for message: ${messageId.substring(0, 30)}...`);
+
+        // 尝试从 Store 获取消息
+        let message = null;
+        try {
+            const page = session.client.pupPage;
+            if (page) {
+                message = await page.evaluate(async (msgId) => {
+                    try {
+                        const msg = window.Store?.Msg?.get(msgId);
+                        if (!msg) return null;
+
+                        return {
+                            id: msg.id?._serialized,
+                            type: msg.type,
+                            hasMedia: !!msg.mediaData,
+                            body: msg.body
+                        };
+                    } catch (e) {
+                        return null;
+                    }
+                }, messageId);
+            }
+        } catch (e) {
+            console.log(`[fetch-media] Store lookup failed: ${e?.message}`);
+        }
+
+        // 尝试下载媒体（多种方法）
+        let media = null;
+
+        // 方法1：直接通过 client 获取消息并下载媒体
+        try {
+            // 从 messageId 提取 chatId
+            const chatIdMatch = messageId.match(/(?:true|false)_(.+?)_/);
+            if (chatIdMatch) {
+                const chatId = chatIdMatch[1];
+                const chat = await session.client.getChatById(chatId).catch(() => null);
+
+                if (chat) {
+                    // 获取最近消息
+                    const messages = await chat.fetchMessages({ limit: 50 });
+                    const targetMsg = messages.find(m => m.id?._serialized === messageId);
+
+                    if (targetMsg && targetMsg.hasMedia) {
+                        console.log(`[fetch-media] Found message in chat, downloading media...`);
+
+                        const mediaPromise = targetMsg.downloadMedia();
+                        const timeoutPromise = new Promise((_, reject) =>
+                            setTimeout(() => reject(new Error('timeout')), 20000)
+                        );
+                        media = await Promise.race([mediaPromise, timeoutPromise]);
+
+                        if (media?.data) {
+                            console.log(`[fetch-media] Media downloaded: ${media.mimetype}`);
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            console.log(`[fetch-media] Chat fetch method failed: ${e?.message}`);
+        }
+
+        // 方法2：DOM 提取（如果上面失败）
+        if (!media?.data) {
+            try {
+                const page = session.client.pupPage;
+                if (page) {
+                    console.log(`[fetch-media] Trying DOM extraction...`);
+
+                    const extracted = await page.evaluate(async (msgId) => {
+                        const msgEl = document.querySelector(`[data-id="${msgId}"]`);
+                        if (!msgEl) return { error: 'msg_not_found' };
+
+                        const img = msgEl.querySelector('img[src^="blob:"]')
+                            || msgEl.querySelector('img[draggable="false"]')
+                            || msgEl.querySelector('img:not([src^="data:image/svg"])');
+
+                        if (img?.src?.startsWith('blob:')) {
+                            try {
+                                const response = await fetch(img.src);
+                                const blob = await response.blob();
+                                return new Promise((resolve) => {
+                                    const reader = new FileReader();
+                                    reader.onloadend = () => {
+                                        const base64 = reader.result;
+                                        const matches = base64.match(/^data:(.+);base64,(.+)$/);
+                                        if (matches) {
+                                            resolve({ mimetype: matches[1], data: matches[2] });
+                                        } else {
+                                            resolve({ error: 'invalid_base64' });
+                                        }
+                                    };
+                                    reader.readAsDataURL(blob);
+                                });
+                            } catch (e) {
+                                return { error: 'blob_fetch_failed' };
+                            }
+                        }
+                        return { error: 'no_image_src' };
+                    }, messageId);
+
+                    if (extracted?.data) {
+                        media = extracted;
+                        console.log(`[fetch-media] DOM extraction successful`);
+                    }
+                }
+            } catch (e) {
+                console.log(`[fetch-media] DOM extraction failed: ${e?.message}`);
+            }
+        }
+
+        if (media && media.mimetype && media.data) {
+            const ext = media.mimetype?.split('/')[1]?.split(';')[0] || 'bin';
+            return res.json({
+                ok: true,
+                media: {
+                    mimetype: media.mimetype,
+                    data: media.data,
+                    filename: media.filename || `media_${Date.now()}.${ext}`
+                }
+            });
+        }
+
+        return res.json({ ok: false, error: 'media not available' });
+    } catch (e) {
+        console.error(`[fetch-media] Error: ${e?.message}`);
+        return res.status(500).json({ ok: false, error: e?.message });
+    }
+});
+
 // ========== 发文本 ==========
 app.post('/send/text', async (req, res) => {
     const ok  = (code, data) => res.status(code).json(data);
@@ -2147,7 +2481,22 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
                 if (msg.hasMedia || MEDIA_TYPES.has(msg.type)) {
                     try {
-                        let media = await msg.downloadMedia().catch(() => null);
+                        let media = null;
+
+                        // ★★★ V4 改进：增加重试机制 ★★★
+                        for (let attempt = 1; attempt <= 2 && !media?.data; attempt++) {
+                            try {
+                                const mediaPromise = msg.downloadMedia();
+                                const timeoutPromise = new Promise((_, reject) =>
+                                    setTimeout(() => reject(new Error('timeout')), 15000)
+                                );
+                                media = await Promise.race([mediaPromise, timeoutPromise]);
+                            } catch (dlErr) {
+                                if (attempt < 2) {
+                                    await new Promise(r => setTimeout(r, 1000));
+                                }
+                            }
+                        }
 
                         if (!media?.data) {
                             console.log(`[messages-sync] API failed, extracting from DOM for ${idSer}...`);

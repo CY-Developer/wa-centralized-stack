@@ -323,8 +323,15 @@ class SessionManager extends EventEmitter {
             if (status === SESSION_STATUS.READY && previousStatus !== SESSION_STATUS.READY) {
                 session.restartCount = 0;
                 session.lastError = null;
+                session.lastErrorTime = null;  // ★ V3: 清除错误时间
                 session.readyAt = Date.now();  // ★ 记录变为 READY 的时间，用于宽限期判断
                 console.log(`[SessionManager] Session ${sessionId} recovered, reset restart count`);
+            }
+
+            // ★★★ V3 新增：记录 error 状态的时间 ★★★
+            if (status === SESSION_STATUS.ERROR && previousStatus !== SESSION_STATUS.ERROR) {
+                session.lastErrorTime = Date.now();
+                console.log(`[SessionManager] Session ${sessionId} entered error state`);
             }
 
             this.emit('statusChange', { sessionId, status, previousStatus });
@@ -753,6 +760,24 @@ class SessionManager extends EventEmitter {
                         }
                     } else if (session.sessionStatus === SESSION_STATUS.DISCONNECTED) {
                         console.log(`[SessionManager] Session ${sessionId} still disconnected, waiting for restart...`);
+                    } else if (session.sessionStatus === SESSION_STATUS.ERROR) {
+                        // ★★★ V3 新增：处理 error 状态的 session ★★★
+                        const timeSinceError = session.lastErrorTime ? (Date.now() - session.lastErrorTime) : Infinity;
+
+                        // 如果 error 状态超过 30 秒，尝试重启
+                        if (timeSinceError > 30000 && this.autoRestartEnabled) {
+                            console.log(`[SessionManager] Session ${sessionId} in error state for ${Math.round(timeSinceError/1000)}s, attempting restart...`);
+
+                            this.safeRestartSession(sessionId, 'error_state_recovery').then(result => {
+                                if (!result.success) {
+                                    console.error(`[SessionManager] Error recovery failed for ${sessionId}: ${result.error}`);
+                                }
+                            }).catch(e => {
+                                console.error(`[SessionManager] Error recovery error for ${sessionId}:`, e.message);
+                            });
+                        } else if (timeSinceError <= 30000) {
+                            console.log(`[SessionManager] Session ${sessionId} in error state (${Math.round(timeSinceError/1000)}s), waiting before retry...`);
+                        }
                     }
                 }
 
