@@ -10,7 +10,7 @@ BRIDGE_BASE=http://192.168.11.45:5010
 # SESSIONS 变量：
 # - 如果留空，将管理 AdsPower 中的所有 profile
 # - 如果指定，只管理列出的 profile ID
-SESSIONS=k16f9wid,k17se6o0
+SESSIONS=k16f9wid,k17se6o0,k18dh83n,k18dgrox
 
 ######## 历史消息同步配置 ########
 # 启动时是否同步历史消息（1=是，0=否）
@@ -102,3 +102,10 @@ MAX_RESTART_RETRIES=3
 
 # 重启冷却时间（毫秒），默认 60000 = 1分钟
 RESTART_COOLDOWN_MS=60000
+
+
+
+
+CONTACT_SYNC_ENABLED=1# 启用
+CONTACT_SYNC_HOUR=17# 北京时间小时（可选，默认17）
+CONTACT_SYNC_MINUTE=30# 分钟（可选，默认30）

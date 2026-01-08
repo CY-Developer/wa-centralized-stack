@@ -120,7 +120,7 @@ async function takeSendToken(){
 
 // jid/phone 处理
 const DIGITS = s => String(s||'').replace(/\D/g,'');
-const toJid  = s => /@g\.us$|@c\.us$/.test(s) ? s : (DIGITS(s) ? `${DIGITS(s)}@c.us` : String(s||'').trim());
+const toJid  = s => /@g\.us$|@c\.us$|@lid$/.test(s) ? s : (DIGITS(s) ? `${DIGITS(s)}@c.us` : String(s||'').trim());
 
 // 是否包含中日韩字符
 const hasCJK = (s) => /[\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/.test(String(s||''));
@@ -928,6 +928,59 @@ async function initSessionViaAdsPower(config) {
                     direction: 'outgoing'
                 };
 
+                // ★★★ V5.3：出站消息引用处理（与入站消息保持一致）★★★
+                const hasQuote = message.hasQuotedMsg ||
+                    !!(message._data?.quotedStanzaID) ||
+                    !!(message._data?.quotedMsg);
+
+                if (hasQuote) {
+                    try {
+                        let quotedMsg = null;
+
+                        // 方法1：通过 getQuotedMessage API
+                        if (message.hasQuotedMsg) {
+                            quotedMsg = await message.getQuotedMessage();
+                        }
+
+                        // 方法2：如果API失败，尝试从 _data 构建引用信息
+                        if (!quotedMsg && message._data?.quotedMsg) {
+                            const qd = message._data.quotedMsg;
+                            quotedMsg = {
+                                id: { _serialized: qd.id || message._data.quotedStanzaID || '' },
+                                body: qd.body || qd.caption || '',
+                                type: qd.type || 'chat',
+                                fromMe: !!qd.fromMe,
+                                timestamp: qd.t || 0
+                            };
+                        }
+
+                        // 方法3：如果只有 quotedStanzaID，构建最小引用信息
+                        if (!quotedMsg && message._data?.quotedStanzaID) {
+                            quotedMsg = {
+                                id: { _serialized: message._data.quotedStanzaID },
+                                body: '',
+                                type: 'chat',
+                                fromMe: false,
+                                timestamp: 0
+                            };
+                        }
+
+                        if (quotedMsg) {
+                            payload.quotedMsg = {
+                                id: quotedMsg.id?._serialized || quotedMsg.id?.id || '',
+                                body: quotedMsg.body || quotedMsg.caption || '',
+                                type: quotedMsg.type || 'chat',
+                                fromMe: !!quotedMsg.fromMe,
+                                timestamp: quotedMsg.timestamp || 0,
+                                hasMedia: !!quotedMsg.hasMedia
+                            };
+                            console.log(`[${sessionId}] Outgoing quote detected: ${payload.quotedMsg.id?.substring(0, 30)}..., body="${(payload.quotedMsg.body || '').substring(0, 20)}..."`);
+                        }
+                    } catch (e) {
+                        console.log(`[${sessionId}] Failed to get quoted message for outgoing: ${e.message}`);
+                    }
+                }
+
                 // 7. 媒体处理（增强版：多次重试 + 延迟 + DOM 备选）
                 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
                 if (message.hasMedia || MEDIA_TYPES.has(message.type)) {
@@ -1193,6 +1246,50 @@ async function initSessionViaAdsPower(config) {
                         chatId: chat?.id?._serialized || ''
                     };
 
+                    // ★★★ V5.2增强：引用消息检测（主方法 + 备用方法）★★★
+                    // 主方法：使用 hasQuotedMsg API
+                    // 备用方法：检查 _data.quotedStanzaID（某些情况下 hasQuotedMsg 可能为 false 但实际有引用）
+                    const hasQuote = message.hasQuotedMsg ||
+                        !!(message._data?.quotedStanzaID) ||
+                        !!(message._data?.quotedMsg);
+
+                    if (hasQuote) {
+                        try {
+                            let quotedMsg = null;
+
+                            // 方法1：通过 getQuotedMessage API
+                            if (message.hasQuotedMsg) {
+                                quotedMsg = await message.getQuotedMessage();
+                            }
+
+                            // 方法2：如果API失败，尝试从 _data 构建引用信息
+                            if (!quotedMsg && message._data?.quotedMsg) {
+                                const qd = message._data.quotedMsg;
+                                quotedMsg = {
+                                    id: { _serialized: qd.id || message._data.quotedStanzaID || '' },
+                                    body: qd.body || qd.caption || '',
+                                    type: qd.type || 'chat',
+                                    fromMe: !!qd.fromMe,
+                                    timestamp: qd.t || 0
+                                };
+                            }
+
+                            if (quotedMsg) {
+                                payload.quotedMsg = {
+                                    id: quotedMsg.id?._serialized || quotedMsg.id?.id || '',
+                                    body: quotedMsg.body || '',
+                                    type: quotedMsg.type || 'chat',
+                                    fromMe: !!quotedMsg.fromMe,
+                                    timestamp: quotedMsg.timestamp || 0,
+                                    hasMedia: !!quotedMsg.hasMedia
+                                };
+                                console.log(`[${sessionId}] Quoted message: ${payload.quotedMsg.id?.substring(0, 30)}...`);
+                            }
+                        } catch (e) {
+                            console.log(`[${sessionId}] Failed to get quoted message: ${e.message}`);
+                        }
+                    }
+
                     // ★★★ V4 改进：媒体处理（增加重试机制和更长超时）★★★
                     if (message.hasMedia === true && typeof message.downloadMedia === 'function') {
                         try {
@@ -1318,7 +1415,7 @@ async function initSessionViaAdsPower(config) {
                         }
                     }
 
-                    console.log(`[${sessionId}] >>> PUSH: phone=${payload.phone}, text="${(payload.text || '').slice(0, 30)}..."`);
+                    console.log(`[${sessionId}] >>> PUSH: phone=${payload.phone}, text="${(payload.text || '').slice(0, 30)}...", hasQuote=${!!payload.quotedMsg}, quoteBody=${payload.quotedMsg?.body?.substring(0, 20) || 'none'}`);
 
                     await postWithRetry(`${COLLECTOR_BASE}/ingest`, payload, {'x-api-token': COLLECTOR_TOKEN});
 
@@ -1339,6 +1436,52 @@ async function initSessionViaAdsPower(config) {
 
             } catch (err) {
                 console.error(`[${sessionId}] Error updating chat cache:`, err.message);
+            }
+        });
+
+        // ★★★ 新增：监听消息撤回/删除事件 ★★★
+        client.on('message_revoke_everyone', async (revokedMsg, oldMsg) => {
+            try {
+                const msgId = revokedMsg?.id?._serialized || revokedMsg?.id?.id || '';
+                const from = revokedMsg?.from || '';
+                const chatId = revokedMsg?.to || from;
+
+                // 解析电话号码
+                let phone = '';
+                let phone_lid = '';
+
+                if (/@c\.us$/i.test(chatId)) {
+                    phone = chatId.replace(/@.*/, '').replace(/\D/g, '');
+                } else if (/@lid$/i.test(chatId)) {
+                    phone_lid = chatId.replace(/@.*/, '').replace(/\D/g, '');
+                }
+
+                console.log(`[${sessionId}] Message revoked: ${msgId?.substring(0, 40)}...`);
+
+                // 发送撤回事件到 Collector
+                const payload = {
+                    type: 'message_revoke',
+                    sessionId: sessionId,
+                    sessionName: sessionManager.getSessionName(sessionId) || sessionId,
+                    phone: phone,
+                    phone_lid: phone_lid,
+                    messageId: msgId,
+                    revokedBy: from,
+                    originalBody: oldMsg?.body || '',
+                    originalType: oldMsg?.type || '',
+                    timestamp: Date.now()
+                };
+
+                await postWithRetry(
+                    `${COLLECTOR_BASE}/ingest`,
+                    payload,
+                    { 'x-api-token': COLLECTOR_TOKEN }
+                ).catch(e => {
+                    console.error(`[${sessionId}] Failed to push revoke event: ${e.message}`);
+                });
+
+            } catch (e) {
+                console.error(`[${sessionId}] Error handling message_revoke_everyone:`, e.message);
             }
         });
 
@@ -1590,7 +1733,7 @@ app.get('/contact-sync/status', (req, res) => {
     res.json({
         ok: true,
         enabled: contactSync.SYNC_ENABLED,
-        intervalHours: contactSync.SYNC_INTERVAL_HOURS,
+        schedule: `${contactSync.SYNC_HOUR}:${String(contactSync.SYNC_MINUTE).padStart(2, '0')} Beijing time`,
         filter: "last 24 hours"
     });
 });
@@ -1716,8 +1859,9 @@ app.get('/chats/:sessionId', async (req, res) => {
     if (!session) {
         return res.status(400).json({ error: 'Session not found.' });
     }
-    if (session.status !== 'ready') {
-        return res.status(400).json({ error: 'Session not ready.' });
+    // ★★★ V5修复：改用 client 检查 ★★★
+    if (!session.client) {
+        return res.status(400).json({ error: 'Session not ready (no client).' });
     }
     try {
         const chats = session.chats.filter(c => !c.isGroup);
@@ -1770,7 +1914,8 @@ app.get('/messages/:sessionId/:chatId', async (req, res) => {
 
     const session = sessions[sessionId];
     if (!session) return res.status(400).json({ error: 'Session not found.' });
-    if (session.status !== 'ready') return res.status(400).json({ error: 'Session not ready.' });
+    // ★★★ V5修复：改用 client 检查 ★★★
+    if (!session.client) return res.status(400).json({ error: 'Session not ready (no client).' });
 
     try {
         const chat = await session.client.getChatById(chatId);
@@ -1788,8 +1933,49 @@ app.get('/messages/:sessionId/:chatId', async (req, res) => {
                 fromMe: !!msg.fromMe,
                 type: msg.type,
                 body: caption || (msg.type === 'chat' ? msg.body : ''),
-                timestamp: msg.timestamp || Date.now()
+                timestamp: msg.timestamp || Date.now(),
+                quotedMsg: null  // ★ V5新增
             };
+
+            // ★★★ V5.2增强：获取引用消息（主方法 + 备用方法）★★★
+            const hasQuote = msg.hasQuotedMsg ||
+                !!(msg._data?.quotedStanzaID) ||
+                !!(msg._data?.quotedMsg);
+
+            if (hasQuote) {
+                try {
+                    let quotedMsg = null;
+
+                    // 方法1：通过 getQuotedMessage API
+                    if (msg.hasQuotedMsg) {
+                        quotedMsg = await msg.getQuotedMessage();
+                    }
+
+                    // 方法2：如果API失败，尝试从 _data 构建引用信息
+                    if (!quotedMsg && msg._data?.quotedMsg) {
+                        const qd = msg._data.quotedMsg;
+                        quotedMsg = {
+                            id: { _serialized: qd.id || msg._data.quotedStanzaID || '' },
+                            body: qd.body || qd.caption || '',
+                            type: qd.type || 'chat',
+                            fromMe: !!qd.fromMe,
+                            timestamp: qd.t || 0
+                        };
+                    }
+
+                    if (quotedMsg) {
+                        item.quotedMsg = {
+                            id: quotedMsg.id?._serialized || quotedMsg.id?.id || '',
+                            body: quotedMsg.body || '',
+                            type: quotedMsg.type || 'chat',
+                            fromMe: !!quotedMsg.fromMe,
+                            timestamp: quotedMsg.timestamp || 0
+                        };
+                    }
+                } catch (qe) {
+                    item.quotedMsg = { error: qe.message };
+                }
+            }
 
             if (includeMedia) {
                 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
@@ -1842,6 +2028,369 @@ app.post('/send-text/:sessionId', async (req,res)=>{
         res.json({ ok:true, id: msg.id?._serialized || null });
     }catch(e){
         res.status(400).json({ ok:false, error: e.message || String(e) });
+    }
+});
+
+// ★★★ 新增：引用回复发送 API ★★★
+/**
+ * POST /send/reply/:sessionId
+ * 发送带引用的回复消息
+ *
+ * 请求体:
+ * {
+ *   chatIdOrPhone: string,      // 聊天ID或电话号码
+ *   text: string,               // 消息内容
+ *   quotedMessageId: string     // 被引用的消息ID (WA message ID)
+ * }
+ */
+app.post('/send/reply/:sessionId', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const { chatIdOrPhone, text, quotedMessageId } = req.body || {};
+
+        if (!chatIdOrPhone) {
+            return res.status(400).json({ ok: false, error: 'need chatIdOrPhone' });
+        }
+        if (!text) {
+            return res.status(400).json({ ok: false, error: 'need text' });
+        }
+        if (!quotedMessageId) {
+            return res.status(400).json({ ok: false, error: 'need quotedMessageId' });
+        }
+
+        const session = sessions[sessionId];
+        if (!session || !session.client) {
+            return res.status(400).json({ ok: false, error: 'session not ready' });
+        }
+
+        console.log(`[${sessionId}] Sending reply with quote: ${quotedMessageId?.substring(0, 40)}...`);
+
+        // 获取聊天对象
+        const chat = await getChat(sessionId, chatIdOrPhone);
+
+        // 发送限流
+        await takeSendToken();
+        await ensureChatCooldown(sessionId, chat.id._serialized);
+
+        // 发送带引用的消息
+        const msg = await chat.sendMessage(text, {
+            quotedMessageId: quotedMessageId
+        });
+
+        console.log(`[${sessionId}] Reply sent: ${msg.id?._serialized?.substring(0, 40)}...`);
+
+        res.json({
+            ok: true,
+            msgId: msg.id?._serialized || null,
+            quotedMessageId: quotedMessageId
+        });
+
+    } catch (e) {
+        console.error(`[${req.params.sessionId}] send/reply error:`, e.message);
+        res.status(400).json({ ok: false, error: e.message || String(e) });
+    }
+});
+
+// ★★★ 新增：删除消息 API ★★★
+/**
+ * POST /delete-message/:sessionId
+ * 删除 WhatsApp 消息
+ *
+ * 请求体:
+ * {
+ *   chatIdOrPhone: string,    // 聊天ID或电话号码（可选，用于辅助查找）
+ *   messageId: string,        // 要删除的消息ID (WA message ID)
+ *   everyone: boolean         // true=所有人可见的撤回（默认）, false=仅自己
+ * }
+ */
+app.post('/delete-message/:sessionId', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const { chatIdOrPhone, messageId, everyone = true } = req.body || {};
+
+        if (!messageId) {
+            return res.status(400).json({ ok: false, error: 'need messageId' });
+        }
+
+        const session = sessions[sessionId];
+        if (!session || !session.client) {
+            return res.status(400).json({ ok: false, error: 'session not ready' });
+        }
+
+        console.log(`[${sessionId}] Deleting message: ${messageId?.substring(0, 40)}..., everyone: ${everyone}`);
+
+        // 方法1: 通过 Store 直接获取消息
+        let message = null;
+
+        try {
+            const msgData = await session.client.pupPage.evaluate(async (msgId) => {
+                const msg = window.Store.Msg.get(msgId);
+                if (msg) {
+                    return window.WWebJS.getMessageModel(msg);
+                }
+                return null;
+            }, messageId);
+
+            if (msgData) {
+                // 需要使用 whatsapp-web.js 的 Message 类包装
+                const { Message } = require('whatsapp-web.js');
+                message = new Message(session.client, msgData);
+            }
+        } catch (e) {
+            console.log(`[${sessionId}] Could not get message from Store: ${e.message}`);
+        }
+
+        // 方法2: 如果提供了 chatIdOrPhone，遍历聊天消息查找
+        if (!message && chatIdOrPhone) {
+            try {
+                const chat = await getChat(sessionId, chatIdOrPhone);
+                const messages = await chat.fetchMessages({ limit: 50 });
+                message = messages.find(m =>
+                    m.id?._serialized === messageId ||
+                    m.id?.id === messageId
+                );
+            } catch (e) {
+                console.log(`[${sessionId}] Could not find message in chat: ${e.message}`);
+            }
+        }
+
+        if (!message) {
+            return res.status(404).json({ ok: false, error: 'message not found' });
+        }
+
+        // 检查是否可以删除（只能撤回自己发送的消息给所有人）
+        if (!message.fromMe && everyone) {
+            return res.status(400).json({
+                ok: false,
+                error: 'can only delete own messages for everyone'
+            });
+        }
+
+        // 执行删除
+        await message.delete(everyone);
+
+        console.log(`[${sessionId}] Message deleted: ${messageId?.substring(0, 40)}...`);
+
+        res.json({
+            ok: true,
+            messageId: messageId,
+            everyone: everyone,
+            deleted: true
+        });
+
+    } catch (e) {
+        console.error(`[${req.params.sessionId}] delete-message error:`, e.message);
+        res.status(400).json({ ok: false, error: e.message || String(e) });
+    }
+});
+
+// ★★★ 测试接口：获取聊天消息列表 ★★★
+/**
+ * GET /test/messages/:sessionId/:chatId
+ * 获取指定聊天的最近消息（包含引用消息信息）
+ *
+ * 参数:
+ *   sessionId: session ID
+ *   chatId: 聊天ID (如 85270379015@c.us 或 27153387237439@lid)
+ *
+ * Query:
+ *   limit: 消息数量，默认20
+ */
+app.get('/test/messages/:sessionId/:chatId', async (req, res) => {
+    try {
+        const { sessionId, chatId } = req.params;
+        const limit = parseInt(req.query.limit) || 20;
+
+        const session = sessions[sessionId];
+        if (!session || !session.client) {
+            return res.status(400).json({ ok: false, error: 'session not ready' });
+        }
+
+        console.log(`[${sessionId}] Fetching messages: chatId=${chatId}, limit=${limit}`);
+
+        // 获取聊天对象
+        let chat;
+        try {
+            chat = await session.client.getChatById(chatId);
+        } catch (e) {
+            // 尝试通过电话号码获取
+            const phone = chatId.replace(/@.*/, '').replace(/\D/g, '');
+            if (phone) {
+                try {
+                    chat = await session.client.getChatById(`${phone}@c.us`);
+                } catch (e2) {
+                    try {
+                        chat = await session.client.getChatById(`${phone}@lid`);
+                    } catch (e3) {
+                        // 都失败了
+                    }
+                }
+            }
+        }
+
+        if (!chat) {
+            return res.status(404).json({ ok: false, error: 'chat not found' });
+        }
+
+        // 获取消息
+        const messages = await chat.fetchMessages({ limit });
+
+        // 格式化消息（包含引用信息）
+        const formattedMessages = [];
+
+        for (const msg of messages) {
+            const formatted = {
+                id: msg.id?._serialized || msg.id?.id || '',
+                body: msg.body || '',
+                type: msg.type || 'chat',
+                fromMe: !!msg.fromMe,
+                timestamp: msg.timestamp || 0,
+                timestampDate: msg.timestamp ? new Date(msg.timestamp * 1000).toISOString() : null,
+                hasQuotedMsg: !!(msg.hasQuotedMsg || msg._data?.quotedStanzaID || msg._data?.quotedMsg),
+                quotedMsg: null
+            };
+
+            // ★★★ V5.2增强：如果有引用消息，获取详情（主方法 + 备用方法）★★★
+            const hasQuote = msg.hasQuotedMsg ||
+                !!(msg._data?.quotedStanzaID) ||
+                !!(msg._data?.quotedMsg);
+
+            if (hasQuote) {
+                try {
+                    let quoted = null;
+
+                    // 方法1：通过 getQuotedMessage API
+                    if (msg.hasQuotedMsg) {
+                        quoted = await msg.getQuotedMessage();
+                    }
+
+                    // 方法2：如果API失败，尝试从 _data 构建引用信息
+                    if (!quoted && msg._data?.quotedMsg) {
+                        const qd = msg._data.quotedMsg;
+                        quoted = {
+                            id: { _serialized: qd.id || msg._data.quotedStanzaID || '' },
+                            body: qd.body || qd.caption || '',
+                            type: qd.type || 'chat',
+                            fromMe: !!qd.fromMe,
+                            timestamp: qd.t || 0
+                        };
+                    }
+
+                    if (quoted) {
+                        formatted.quotedMsg = {
+                            id: quoted.id?._serialized || quoted.id?.id || '',
+                            body: quoted.body || '',
+                            type: quoted.type || 'chat',
+                            fromMe: !!quoted.fromMe,
+                            timestamp: quoted.timestamp || 0
+                        };
+                    }
+                } catch (e) {
+                    formatted.quotedMsg = { error: e.message };
+                }
+            }
+
+            formattedMessages.push(formatted);
+        }
+
+        res.json({
+            ok: true,
+            sessionId,
+            chatId: chat.id._serialized,
+            chatName: chat.name || null,
+            messageCount: formattedMessages.length,
+            messages: formattedMessages
+        });
+
+    } catch (e) {
+        console.error(`[${req.params.sessionId}] test/messages error:`, e.message);
+        res.status(400).json({ ok: false, error: e.message || String(e) });
+    }
+});
+
+// ★★★ 测试接口：通过电话号码获取聊天ID ★★★
+app.get('/test/chat-id/:sessionId/:phone', async (req, res) => {
+    try {
+        const { sessionId, phone } = req.params;
+
+        const session = sessions[sessionId];
+        if (!session || !session.client) {
+            return res.status(400).json({ ok: false, error: 'session not ready' });
+        }
+
+        const digits = phone.replace(/\D/g, '');
+
+        // 尝试不同格式
+        const attempts = [`${digits}@c.us`, `${digits}@lid`];
+
+        for (const chatId of attempts) {
+            try {
+                const chat = await session.client.getChatById(chatId);
+                if (chat) {
+                    return res.json({
+                        ok: true,
+                        phone: digits,
+                        chatId: chat.id._serialized,
+                        chatName: chat.name || null,
+                        isGroup: chat.isGroup || false
+                    });
+                }
+            } catch (e) {
+                // 继续尝试下一个
+            }
+        }
+
+        res.status(404).json({ ok: false, error: 'chat not found', tried: attempts });
+
+    } catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+
+// ★★★ 测试接口：列出最近聊天 ★★★
+app.get('/test/chats/:sessionId', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const limit = parseInt(req.query.limit) || 20;
+
+        const session = sessions[sessionId];
+        if (!session || !session.client) {
+            return res.status(400).json({ ok: false, error: 'session not ready' });
+        }
+
+        const allChats = session.chats || await session.client.getChats();
+
+        // 按最后消息时间排序
+        const sorted = allChats
+            .filter(c => !c.isGroup && !c.id._serialized.includes('status@broadcast'))
+            .sort((a, b) => {
+                const ta = a.lastMessage?.timestamp || a.timestamp || 0;
+                const tb = b.lastMessage?.timestamp || b.timestamp || 0;
+                return tb - ta;
+            })
+            .slice(0, limit);
+
+        const formatted = sorted.map(chat => ({
+            chatId: chat.id._serialized,
+            name: chat.name || null,
+            phone: chat.id._serialized.replace(/@.*/, ''),
+            lastMessage: chat.lastMessage ? {
+                body: chat.lastMessage.body?.substring(0, 50) || '',
+                timestamp: chat.lastMessage.timestamp,
+                fromMe: chat.lastMessage.fromMe
+            } : null,
+            unreadCount: chat.unreadCount || 0
+        }));
+
+        res.json({
+            ok: true,
+            sessionId,
+            count: formatted.length,
+            chats: formatted
+        });
+
+    } catch (e) {
+        res.status(400).json({ ok: false, error: e.message });
     }
 });
 
@@ -1900,7 +2449,8 @@ app.post('/send', async (req, res) => {
         return res.status(400).json({ error: 'Missing sessionId, to, or message' });
     }
     const session = sessions[sessionId];
-    if (!session || session.status !== 'ready') {
+    // ★★★ V5修复：改用 client 检查 ★★★
+    if (!session || !session.client) {
         return res.status(400).json({ error: 'Session not ready.' });
     }
     try {
@@ -2412,32 +2962,111 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
 
     const session = sessions[sessionId];
     if (!session) return res.status(400).json({ ok: false, error: 'Session not found' });
-    if (session.status !== 'ready') return res.status(400).json({ ok: false, error: 'Session not ready' });
+    // ★★★ V5修复：改用 client 检查，与测试接口保持一致 ★★★
+    if (!session.client) return res.status(400).json({ ok: false, error: 'Session not ready (no client)' });
 
     try {
         console.log(`[messages-sync] session=${sessionId}, chat=${chatId}`);
         console.log(`[messages-sync] time: ${new Date(afterTs * 1000).toISOString()} ~ ${new Date(beforeTs * 1000).toISOString()}`);
 
-        // ★★★ 修复：增强 getChatById 错误处理，支持 LID 类型聊天 ★★★
+        // ★★★ V5修复：先检查 WhatsApp Store 是否可用 ★★★
+        let storeReady = false;
+        try {
+            storeReady = await session.client.pupPage.evaluate(() => {
+                return !!(window.Store && window.Store.Chat);
+            });
+        } catch (e) {
+            console.log(`[messages-sync] Store check failed: ${e?.message}`);
+        }
+
+        if (!storeReady) {
+            console.log(`[messages-sync] WhatsApp Store not ready, returning error (not empty)`);
+            // ★★★ 重要：返回错误而不是空数组，避免 Collector 删除现有消息 ★★★
+            return res.status(503).json({
+                ok: false,
+                error: 'WhatsApp Store not ready',
+                messages: null,  // null 而不是 []，让 Collector 知道这是错误
+                retryable: true
+            });
+        }
+
+        // ★★★ V5修复：增强聊天查找逻辑 ★★★
         let chat = null;
+
+        // 提取电话号码用于多格式匹配
+        const phoneDigits = chatId.replace(/@.*/, '').replace(/\D/g, '');
+
+        // 方法1: 直接获取
         try {
             chat = await session.client.getChatById(chatId);
+            console.log(`[messages-sync] Got chat via getChatById: ${chatId}`);
         } catch (e) {
             console.log(`[messages-sync] getChatById failed: ${e?.message}`);
+        }
 
-            // 尝试从缓存的 chats 中查找
-            if (session.chats && Array.isArray(session.chats)) {
-                chat = session.chats.find(c => c?.id?._serialized === chatId);
+        // 方法2: 尝试 @c.us 格式
+        if (!chat && phoneDigits && !chatId.endsWith('@c.us')) {
+            try {
+                chat = await session.client.getChatById(`${phoneDigits}@c.us`);
+                console.log(`[messages-sync] Got chat via @c.us format`);
+            } catch (e) {
+                // 忽略
+            }
+        }
+
+        // 方法3: 尝试 @lid 格式
+        if (!chat && phoneDigits && !chatId.endsWith('@lid')) {
+            try {
+                chat = await session.client.getChatById(`${phoneDigits}@lid`);
+                console.log(`[messages-sync] Got chat via @lid format`);
+            } catch (e) {
+                // 忽略
+            }
+        }
+
+        // 方法4: 从缓存的 chats 中查找
+        if (!chat && session.chats && Array.isArray(session.chats)) {
+            // 尝试精确匹配
+            chat = session.chats.find(c => c?.id?._serialized === chatId);
+
+            // 尝试电话号码匹配
+            if (!chat && phoneDigits) {
+                chat = session.chats.find(c => {
+                    const cPhone = c?.id?._serialized?.replace(/@.*/, '').replace(/\D/g, '');
+                    return cPhone === phoneDigits;
+                });
+            }
+
+            if (chat) {
+                console.log(`[messages-sync] Using cached chat: ${chat.id?._serialized}`);
+            }
+        }
+
+        // 方法5: 刷新聊天列表后重试
+        if (!chat) {
+            console.log(`[messages-sync] Refreshing chats and retrying...`);
+            try {
+                const freshChats = await session.client.getChats();
+                session.chats = freshChats;
+
+                chat = freshChats.find(c => {
+                    const cId = c?.id?._serialized || '';
+                    const cPhone = cId.replace(/@.*/, '').replace(/\D/g, '');
+                    return cId === chatId || cPhone === phoneDigits;
+                });
+
                 if (chat) {
-                    console.log(`[messages-sync] Using cached chat for ${chatId}`);
+                    console.log(`[messages-sync] Found chat after refresh: ${chat.id?._serialized}`);
                 }
+            } catch (e) {
+                console.log(`[messages-sync] getChats failed: ${e?.message}`);
             }
+        }
 
-            // 如果仍然找不到，返回空结果而不是错误
-            if (!chat) {
-                console.log(`[messages-sync] Chat not found, returning empty result for ${chatId}`);
-                return res.json({ ok: true, messages: [], note: 'Chat not accessible' });
-            }
+        // 如果仍然找不到，返回空结果
+        if (!chat) {
+            console.log(`[messages-sync] Chat not found after all attempts: ${chatId}`);
+            return res.json({ ok: true, messages: [], note: 'Chat not accessible' });
         }
 
         const fetchLimit = Math.min(limit * 5, 500);
@@ -2474,8 +3103,49 @@ app.get('/messages-sync/:sessionId/:chatId', async (req, res) => {
                 timestamp: msgTs,
                 timestampMs: msgTs * 1000,
                 datetime: new Date((msgTs + timezoneOffset) * 1000).toISOString(),
-                ack: msg.ack
+                ack: msg.ack,
+                quotedMsg: null  // ★ V5新增：引用消息字段
             };
+
+            // ★★★ V5.2增强：获取引用消息（主方法 + 备用方法）★★★
+            const hasQuote = msg.hasQuotedMsg ||
+                !!(msg._data?.quotedStanzaID) ||
+                !!(msg._data?.quotedMsg);
+
+            if (hasQuote) {
+                try {
+                    let quotedMsg = null;
+
+                    // 方法1：通过 getQuotedMessage API
+                    if (msg.hasQuotedMsg) {
+                        quotedMsg = await msg.getQuotedMessage();
+                    }
+
+                    // 方法2：如果API失败，尝试从 _data 构建引用信息
+                    if (!quotedMsg && msg._data?.quotedMsg) {
+                        const qd = msg._data.quotedMsg;
+                        quotedMsg = {
+                            id: { _serialized: qd.id || msg._data.quotedStanzaID || '' },
+                            body: qd.body || qd.caption || '',
+                            type: qd.type || 'chat',
+                            fromMe: !!qd.fromMe,
+                            timestamp: qd.t || 0
+                        };
+                    }
+
+                    if (quotedMsg) {
+                        item.quotedMsg = {
+                            id: quotedMsg.id?._serialized || quotedMsg.id?.id || '',
+                            body: quotedMsg.body || '',
+                            type: quotedMsg.type || 'chat',
+                            fromMe: !!quotedMsg.fromMe,
+                            timestamp: quotedMsg.timestamp || 0
+                        };
+                    }
+                } catch (qe) {
+                    item.quotedMsg = { error: qe.message };
+                }
+            }
 
             if (includeMedia || includeBase64) {
                 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
@@ -2670,7 +3340,8 @@ app.post('/messages-batch/:sessionId', async (req, res) => {
 
     const session = sessions[sessionId];
     if (!session) return res.status(400).json({ ok: false, error: 'Session not found' });
-    if (session.status !== 'ready') return res.status(400).json({ ok: false, error: 'Session not ready' });
+    // ★★★ V5修复：改用 client 检查，与测试接口保持一致 ★★★
+    if (!session.client) return res.status(400).json({ ok: false, error: 'Session not ready (no client)' });
 
     if (!Array.isArray(chatIds) || chatIds.length === 0) {
         return res.status(400).json({ ok: false, error: 'chatIds array required' });

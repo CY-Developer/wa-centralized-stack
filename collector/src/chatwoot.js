@@ -877,17 +877,97 @@ async function createMessageMultipart({ account_id = DEFAULT_ACCOUNT_ID, convers
 
 
 
-async function createIncomingMessage({ account_id = DEFAULT_ACCOUNT_ID, conversation_id, content, text, attachments }) {
-  const bodyContent = (content ?? text ?? '');
+async function createIncomingMessage({
+                                       account_id = DEFAULT_ACCOUNT_ID,
+                                       conversation_id,
+                                       content,
+                                       text,
+                                       attachments,
+                                       quotedMsg,        // ★★★ V5 新增：引用消息信息 ★★★
+                                       wa_message_id,    // ★★★ V5 新增：WhatsApp消息ID ★★★
+                                       in_reply_to       // ★★★ V5.3.3 新增：被引用消息的Chatwoot消息ID ★★★
+                                     }) {
+  let bodyContent = (content ?? text ?? '');
   const hasAtt = Array.isArray(attachments) && attachments.length > 0;
 
+  // ★★★ V5 新增：构建 content_attributes ★★★
+  const content_attributes = {};
+
+  // 保存 WhatsApp 消息ID（用于后续引用/删除）
+  if (wa_message_id) {
+    content_attributes.wa_message_id = wa_message_id;
+  }
+
+  // ★★★ V5.3.4修复：正确使用Chatwoot原生引用 ★★★
+  // 关键：in_reply_to 时，content 只包含实际消息内容，不需要添加引用文本！
+  if (in_reply_to) {
+    content_attributes.in_reply_to = in_reply_to;
+    console.log(`[createIncomingMessage] Native reply: in_reply_to=${in_reply_to}, content will NOT include quote text`);
+  }
+
+  // 保存引用消息的WhatsApp ID（用于可能的调试/追溯）
+  if (quotedMsg && quotedMsg.id) {
+    content_attributes.quoted_wa_message_id = quotedMsg.id;
+  }
+
+  // ★★★ V5.3.4修复：只有在没有原生引用时才用文本模拟 ★★★
+  if (quotedMsg && !in_reply_to) {
+    // 根据消息类型生成引用内容预览
+    let quotedBody = quotedMsg.body || quotedMsg.caption || '';
+    if (!quotedBody && quotedMsg.type) {
+      const typeLabels = {
+        'image': '[图片]',
+        'video': '[视频]',
+        'audio': '[语音]',
+        'ptt': '[语音消息]',
+        'document': '[文件]',
+        'sticker': '[表情贴纸]',
+        'location': '[位置]',
+        'contact': '[联系人]',
+        'contact_card': '[名片]'
+      };
+      quotedBody = typeLabels[quotedMsg.type] || `[${quotedMsg.type || '媒体'}消息]`;
+    }
+
+    // 文本模拟引用（备用方案）
+    const quotedFrom = quotedMsg.fromMe ? '我' : '对方';
+    const quotedText = (quotedBody || '').replace(/\n/g, ' ').substring(0, 40);
+    bodyContent = `▎💬 ${quotedFrom}：${quotedText}\n\n${bodyContent}`;
+    console.log('[createIncomingMessage] Fallback to text quote (no CW message ID found)');
+  }
+
+  if (quotedMsg) {
+    console.log('[createIncomingMessage] Quote info:', {
+      hasNativeReply: !!in_reply_to,
+      quotedMsgId: quotedMsg.id?.substring(0, 30),
+      quotedMsgType: quotedMsg.type
+    });
+  }
+
   if (hasAtt) {
-    return createMessageMultipart({ account_id, conversation_id, content: bodyContent, attachments });
+    return createMessageMultipart({
+      account_id,
+      conversation_id,
+      content: bodyContent,
+      attachments,
+      content_attributes
+    });
+  }
+
+  const data = {
+    content: String(bodyContent),
+    message_type: 'incoming',
+    private: false
+  };
+
+  // ★★★ 添加 content_attributes ★★★
+  if (Object.keys(content_attributes).length > 0) {
+    data.content_attributes = content_attributes;
   }
 
   return cwRequest('post',
       `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`,
-      { data: { content: String(bodyContent), message_type: 'incoming', private: false } }
+      { data }
   );
 }
 async function createContactNote({ account_id, contact_id, content }) {
@@ -1378,6 +1458,7 @@ async function fallbackBatchCreate({
   let skipped = 0;
   const errors = [];
   const created_ids = [];
+  const created_mappings = [];  // ★★★ V5.3新增：消息ID映射 ★★★
 
   for (const msg of messages) {
     try {
@@ -1409,6 +1490,13 @@ async function fallbackBatchCreate({
       if (result?.id) {
         created++;
         created_ids.push(result.id);
+        // ★★★ V5.3新增：记录消息ID映射 ★★★
+        if (msg.source_id) {
+          created_mappings.push({
+            waMessageId: msg.source_id,
+            cwMessageId: result.id
+          });
+        }
       }
     } catch (e) {
       const errMsg = e?.message || '';
@@ -1435,6 +1523,7 @@ async function fallbackBatchCreate({
     failed,
     skipped,
     created_ids,
+    created_mappings,  // ★★★ V5.3新增 ★★★
     failed_details: errors
   };
 }
@@ -1620,6 +1709,58 @@ async function checkMessagesExist({ account_id, conversation_id, source_ids }) {
   return existingIds;
 }
 
+/**
+ * ★★★ V5新增：更新消息的 source_id ★★★
+ * 用于在发送成功后回写 WhatsApp 消息ID
+ * @param {Object} options
+ * @returns {Promise<Object|null>}
+ */
+async function updateMessageSourceId({ account_id, conversation_id, message_id, source_id }) {
+  if (!account_id || !conversation_id || !message_id || !source_id) {
+    console.warn('[updateMessageSourceId] Missing required params');
+    return null;
+  }
+
+  try {
+    console.log(`[updateMessageSourceId] Updating message ${message_id} with source_id ${source_id.substring(0, 40)}...`);
+
+    // ★★★ V5修复：使用专门的 update_source_id API ★★★
+    // 需要先在 Chatwoot 后端添加这个 API（见 chatwoot-source-id-patch）
+    const res = await cwRequest('patch',
+        `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages/${message_id}/update_source_id`,
+        {
+          source_id: source_id
+        }
+    );
+
+    console.log(`[updateMessageSourceId] Success: message ${message_id} -> source_id ${source_id.substring(0, 40)}`);
+    return res;
+  } catch (e) {
+    // 如果新 API 不存在（404），尝试旧方式
+    if (e.response?.status === 404) {
+      console.warn(`[updateMessageSourceId] New API not found, trying legacy method...`);
+      try {
+        const res = await cwRequest('patch',
+            `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages/${message_id}`,
+            {
+              content_attributes: {
+                wa_message_id: source_id
+              }
+            }
+        );
+        console.log(`[updateMessageSourceId] Legacy success (content_attributes): message ${message_id}`);
+        return res;
+      } catch (legacyErr) {
+        console.error(`[updateMessageSourceId] Legacy method also failed: ${legacyErr.message}`);
+        throw legacyErr;
+      }
+    }
+
+    console.error(`[updateMessageSourceId] Failed: ${e.message}`);
+    throw e;
+  }
+}
+
 module.exports = {
   listAccounts,
   listInboxes,
@@ -1634,6 +1775,7 @@ module.exports = {
   request,
   createIncomingMessage,
   batchQueryMessages,
+  updateMessageSourceId,
   batchDeleteMessages,
   findMessageByContentAndTime,
   calculateTimeOffset,
@@ -1647,5 +1789,5 @@ module.exports = {
   // 新增：去重检查函数
   checkMessageExists,
   findMessageBySourceId,
-  checkMessagesExist,
+  checkMessagesExist
 };

@@ -2,27 +2,24 @@
  * contact-sync.js - WhatsApp 联系人定时同步到 Chatwoot
  *
  * 功能：
- * - 定时获取 WhatsApp 今天有聊天的联系人
- * - 解析电话号码（复用现有逻辑）
- * - 同步到 Chatwoot（新增/更新）
+ * - 每天北京时间 17:30 自动同步
+ * - 获取最近 24 小时有聊天的联系人
+ * - 解析电话号码并同步到 Chatwoot
  *
  * 环境变量配置：
  * - CONTACT_SYNC_ENABLED: 是否启用 (1/0)，默认 0
- * - CONTACT_SYNC_INTERVAL_HOURS: 同步间隔小时数，默认 6
  * - CONTACT_SYNC_ON_STARTUP: 启动时是否立即执行一次，默认 0
- *
- * 同步范围：只同步今天有聊天的联系人（根据最后消息时间判断）
+ * - CONTACT_SYNC_HOUR: 每天执行的小时（北京时间），默认 17
+ * - CONTACT_SYNC_MINUTE: 每天执行的分钟，默认 30
  */
 
 const axios = require('axios');
 
 // 配置
 const SYNC_ENABLED = process.env.CONTACT_SYNC_ENABLED === '1';
-const SYNC_INTERVAL_HOURS = parseInt(process.env.CONTACT_SYNC_INTERVAL_HOURS || '6');
 const SYNC_ON_STARTUP = process.env.CONTACT_SYNC_ON_STARTUP === '1';
-
-// 兼容旧配置，但不再使用
-const SYNC_COUNT = parseInt(process.env.CONTACT_SYNC_COUNT || '100');
+const SYNC_HOUR = parseInt(process.env.CONTACT_SYNC_HOUR || '17');    // 北京时间小时
+const SYNC_MINUTE = parseInt(process.env.CONTACT_SYNC_MINUTE || '30'); // 分钟
 
 // Chatwoot 配置
 const CW_BASE = (process.env.CHATWOOT_BASE_URL || '').replace(/\/$/, '');
@@ -34,6 +31,107 @@ const BRIDGE_BASE = process.env.WA_BRIDGE_URL || process.env.MANAGER_BASE || 'ht
 
 // 依赖注入
 let sessionManager = null;
+let scheduledTimer = null;
+
+/**
+ * ★ 格式化北京时间为可读字符串
+ * @returns {string} 例如: "2025年01月06日 17时30分25秒"
+ */
+function formatBeijingTime(date = new Date()) {
+    // 北京时间 = UTC + 8
+    const beijingOffset = 8 * 60;  // 分钟
+    const localOffset = date.getTimezoneOffset();  // 本地时区偏移（分钟，西为正）
+    const totalOffset = beijingOffset + localOffset;  // 服务器到北京时间的偏移
+
+    const beijingTime = new Date(date.getTime() + totalOffset * 60 * 1000);
+
+    const year = beijingTime.getFullYear();
+    const month = String(beijingTime.getMonth() + 1).padStart(2, '0');
+    const day = String(beijingTime.getDate()).padStart(2, '0');
+    const hours = String(beijingTime.getHours()).padStart(2, '0');
+    const minutes = String(beijingTime.getMinutes()).padStart(2, '0');
+    const seconds = String(beijingTime.getSeconds()).padStart(2, '0');
+
+    return `${year}年${month}月${day}日 ${hours}时${minutes}分${seconds}秒`;
+}
+
+/**
+ * ★ 格式化持续时间为可读字符串
+ * @param {number} ms - 毫秒
+ * @returns {string} 例如: "2分35秒" 或 "1小时5分钟"
+ */
+function formatDurationChinese(ms) {
+    const totalSeconds = Math.floor(ms / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+        return `${hours}小时${minutes}分钟${seconds}秒`;
+    } else if (minutes > 0) {
+        return `${minutes}分${seconds}秒`;
+    } else {
+        return `${seconds}秒`;
+    }
+}
+
+/**
+ * 计算到下次北京时间指定时刻的毫秒数
+ */
+function getMillisecondsUntilBeijingTime(hour, minute) {
+    const now = new Date();
+
+    // 创建北京时间的目标时间
+    // 北京时间 = UTC + 8
+    const beijingOffset = 8 * 60;  // 分钟
+    const localOffset = now.getTimezoneOffset();  // 本地时区偏移（分钟，西为正）
+    const totalOffset = beijingOffset + localOffset;  // 服务器到北京时间的偏移
+
+    // 计算北京时间的当前时刻
+    const beijingNow = new Date(now.getTime() + totalOffset * 60 * 1000);
+
+    // 设置目标时间（今天的 hour:minute）
+    const target = new Date(beijingNow);
+    target.setHours(hour, minute, 0, 0);
+
+    // 如果已经过了今天的目标时间，设为明天
+    if (target <= beijingNow) {
+        target.setDate(target.getDate() + 1);
+    }
+
+    // 转换回服务器时间计算差值
+    const targetServerTime = new Date(target.getTime() - totalOffset * 60 * 1000);
+    return targetServerTime.getTime() - now.getTime();
+}
+
+/**
+ * 格式化毫秒为可读时间
+ */
+function formatDuration(ms) {
+    const hours = Math.floor(ms / (1000 * 60 * 60));
+    const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
+    return `${hours}h ${minutes}m`;
+}
+
+/**
+ * 调度下次同步
+ */
+function scheduleNextSync() {
+    const msUntilNext = getMillisecondsUntilBeijingTime(SYNC_HOUR, SYNC_MINUTE);
+
+    console.log(`[ContactSync] Next sync at ${SYNC_HOUR}:${SYNC_MINUTE.toString().padStart(2, '0')} Beijing time (in ${formatDuration(msUntilNext)})`);
+
+    scheduledTimer = setTimeout(() => {
+        console.log('[ContactSync] ========================================');
+        console.log('[ContactSync] Running scheduled sync...');
+        syncAllSessions().catch(e => {
+            console.error('[ContactSync] Scheduled sync failed:', e.message);
+        }).finally(() => {
+            // 完成后调度下一次（24小时后）
+            scheduleNextSync();
+        });
+    }, msUntilNext);
+}
 
 /**
  * 初始化模块
@@ -51,28 +149,21 @@ function initialize(sm) {
         return;
     }
 
-    console.log(`[ContactSync] Initialized: interval=${SYNC_INTERVAL_HOURS}h, filter=last 24 hours`);
+    console.log(`[ContactSync] Initialized: daily at ${SYNC_HOUR}:${SYNC_MINUTE.toString().padStart(2, '0')} Beijing time`);
 
     // 启动时执行一次
     if (SYNC_ON_STARTUP) {
         setTimeout(() => {
+            console.log('[ContactSync] ========================================');
             console.log('[ContactSync] Running startup sync...');
             syncAllSessions().catch(e => {
                 console.error('[ContactSync] Startup sync failed:', e.message);
             });
-        }, 30000);  // 等待 30 秒让所有 session 就绪
+        }, 30000);
     }
 
-    // 定时执行
-    const intervalMs = SYNC_INTERVAL_HOURS * 60 * 60 * 1000;
-    setInterval(() => {
-        console.log('[ContactSync] Running scheduled sync...');
-        syncAllSessions().catch(e => {
-            console.error('[ContactSync] Scheduled sync failed:', e.message);
-        });
-    }, intervalMs);
-
-    console.log(`[ContactSync] Next sync in ${SYNC_INTERVAL_HOURS} hours`);
+    // 调度每日定时同步
+    scheduleNextSync();
 }
 
 /**
@@ -218,6 +309,7 @@ function extractPhoneFromName(str) {
         if (trimmed.startsWith('+')) {
             e164 = '+' + digits;
         } else if (digits.length >= 10) {
+            // 猜测国际格式
             e164 = '+' + digits;
         }
         return { isPhone: true, digits, e164 };
@@ -227,97 +319,93 @@ function extractPhoneFromName(str) {
 }
 
 /**
- * 解析联系人的电话号码
- *
- * 电话号码解析逻辑流程：
- * ┌─────────────────────────────────────────────────────────┐
- * │ 层级1: 检查是否有 @c.us 格式的电话号码                    │
- * │        ↓ 有 → 直接使用                                   │
- * │        ↓ 无 → 继续层级2                                  │
- * ├─────────────────────────────────────────────────────────┤
- * │ 层级2: 调用 Bridge API getContactLidAndPhone             │
- * │        将 @lid 转换为 @c.us 电话号码                      │
- * │        ↓ 成功 → 使用解析出的电话                         │
- * │        ↓ 失败 → 继续层级3                                │
- * ├─────────────────────────────────────────────────────────┤
- * │ 层级3: 检查联系人名称是否看起来像电话号码                  │
- * │        例如: "+1 408 555 1234" → 提取 14085551234        │
- * │        ↓ 匹配 → 使用提取的电话                           │
- * │        ↓ 不匹配 → 使用 LID 作为标识符                    │
- * └─────────────────────────────────────────────────────────┘
- *
- * @param {Object} chat - WhatsApp 聊天对象
- * @param {string} sessionId - Session ID
- * @returns {Object} { phone, lid, name }
+ * 解析聊天对象获取电话号码
+ * 三层解析：chatId → name → contact
  */
 async function resolveContactPhone(chat, sessionId) {
     const chatId = chat.id?._serialized || '';
-    const contactName = chat.name || '';
+    const isLid = chatId.includes('@lid');
 
     let phone = null;
     let lid = null;
+    let name = chat.name || null;
 
-    // 层级1: 检查是否有 @c.us 格式
-    if (chatId.endsWith('@c.us')) {
-        phone = chatId.replace('@c.us', '');
+    // 第一层：从 chatId 提取
+    if (isLid) {
+        lid = chatId.replace('@lid', '');
+    } else {
+        const match = chatId.match(/^(\d+)@/);
+        if (match) {
+            phone = match[1];
+        }
     }
 
-    // 层级2: 调用 Bridge API 解析 @lid
-    if (!phone && chatId.endsWith('@lid')) {
-        lid = chatId.replace('@lid', '');
+    // 第二层：从 name 提取电话（如果还没有电话）
+    if (!phone && name) {
+        const extracted = extractPhoneFromName(name);
+        if (extracted.isPhone && extracted.digits) {
+            phone = extracted.digits;
+        }
+    }
 
+    // 第三层：尝试通过 contact 获取
+    if (!phone && chat.contact) {
         try {
-            const response = await axios.get(
-                `${BRIDGE_BASE}/resolve-lid/${sessionId}/${lid}`,
-                { timeout: 10000 }
-            );
+            const contact = chat.contact;
 
-            if (response.data?.ok && response.data?.phone) {
-                phone = response.data.phone;
+            // 尝试从 number 字段获取
+            if (contact.number) {
+                const digits = contact.number.replace(/\D/g, '');
+                if (digits.length >= 7) {
+                    phone = digits;
+                }
+            }
+
+            // 尝试从 pushname 提取
+            if (!phone && contact.pushname) {
+                const extracted = extractPhoneFromName(contact.pushname);
+                if (extracted.isPhone) {
+                    phone = extracted.digits;
+                }
+            }
+
+            // 使用 pushname 作为名称
+            if (contact.pushname && contact.pushname !== name) {
+                name = contact.pushname;
             }
         } catch (e) {
-            // 静默处理，继续下一层级
+            // 忽略错误
         }
     }
 
-    // 层级3: 检查名称是否像电话号码
-    if (!phone && contactName) {
-        const phoneCheck = extractPhoneFromName(contactName);
-        if (phoneCheck.isPhone && phoneCheck.digits) {
-            phone = phoneCheck.digits;
-        }
-    }
-
-    return { phone, lid, name: contactName };
+    return { phone, lid, name, chatId };
 }
 
 /**
  * 同步单个联系人到 Chatwoot
  */
-async function syncContactToChatwoot(contact, sessionId, sessionName) {
-    const { phone, lid, name } = contact;
+async function syncContactToChatwoot(contactInfo, sessionId, sessionName) {
+    const { phone, lid, name, chatId } = contactInfo;
 
+    const stats = {
+        action: 'skip',
+        contactId: null,
+        changes: []
+    };
+
+    // 必须至少有 phone 或 lid
     if (!phone && !lid) {
-        return { action: 'skip', reason: 'no_identifier' };
+        return stats;
     }
 
-    const stats = { action: 'none', phone, lid, name, changes: [] };
-
     try {
-        let existingByPhone = null;
-        let existingByLid = null;
+        // 先搜索是否已存在
+        const existingByPhone = phone ? await searchChatwootContact(phone, sessionId) : null;
+        const existingByLid = (!existingByPhone && lid) ? await searchChatwootContact(lid, sessionId) : null;
 
-        if (phone) {
-            existingByPhone = await searchChatwootContact(phone, sessionId);
-        }
-
-        if (lid) {
-            existingByLid = await searchChatwootContact(lid, sessionId);
-        }
-
-        // 情况1: 都没找到 → 创建新联系人
+        // 情况1: 完全不存在 → 创建
         if (!existingByPhone && !existingByLid) {
-            const newContact = await createChatwootContact({
+            const created = await createChatwootContact({
                 sessionId,
                 sessionName,
                 phone,
@@ -325,9 +413,12 @@ async function syncContactToChatwoot(contact, sessionId, sessionName) {
                 name
             });
 
-            stats.action = 'created';
-            stats.contactId = newContact?.id;
-            console.log(`[ContactSync] Created: ${name || phone || lid}`);
+            if (created) {
+                stats.action = 'created';
+                stats.contactId = created.id;
+                console.log(`[ContactSync] Created: ${name || phone || lid}`);
+            }
+
             return stats;
         }
 
@@ -459,12 +550,21 @@ async function syncSessionContacts(sessionId) {
     }
 
     const sessionName = sessionManager.getSessionName(sessionId) || sessionId;
-    console.log(`[ContactSync] Syncing ${sessionId} (${sessionName})...`);
 
-    const startTime = Date.now();
+    // ★ 记录开始时间
+    const startTime = new Date();
+    const startTimeStr = formatBeijingTime(startTime);
+
+    console.log(`[ContactSync] ----------------------------------------`);
+    console.log(`[ContactSync] [${sessionName}] 开始同步`);
+    console.log(`[ContactSync] [${sessionName}] 开始时间: ${startTimeStr}`);
+
     const stats = {
         sessionId,
         sessionName,
+        startTime: startTimeStr,
+        endTime: null,
+        duration: null,
         total: 0,
         created: 0,
         updated: 0,
@@ -486,9 +586,16 @@ async function syncSessionContacts(sessionId) {
         });
 
         stats.total = recentPrivateChats.length;
+        console.log(`[ContactSync] [${sessionName}] 找到 ${stats.total} 个最近24小时的聊天`);
 
         if (recentPrivateChats.length === 0) {
-            console.log(`[ContactSync] No chats in last 24h, nothing to sync`);
+            const endTime = new Date();
+            const duration = endTime - startTime;
+            stats.endTime = formatBeijingTime(endTime);
+            stats.duration = formatDurationChinese(duration);
+            console.log(`[ContactSync] [${sessionName}] 无需同步`);
+            console.log(`[ContactSync] [${sessionName}] 结束时间: ${stats.endTime}`);
+            console.log(`[ContactSync] [${sessionName}] 耗时: ${stats.duration}`);
             return stats;
         }
 
@@ -532,14 +639,30 @@ async function syncSessionContacts(sessionId) {
             }
         }
 
-        const elapsed = Date.now() - startTime;
-        console.log(`[ContactSync] ${sessionName}: created=${stats.created}, updated=${stats.updated}, unchanged=${stats.unchanged}, ${elapsed}ms`);
+        // ★ 记录结束时间
+        const endTime = new Date();
+        const duration = endTime - startTime;
+        stats.endTime = formatBeijingTime(endTime);
+        stats.duration = formatDurationChinese(duration);
+
+        console.log(`[ContactSync] [${sessionName}] 同步完成`);
+        console.log(`[ContactSync] [${sessionName}] 结果: 新建=${stats.created}, 更新=${stats.updated}, 无变化=${stats.unchanged}, 跳过=${stats.skipped}, 错误=${stats.errors}`);
+        console.log(`[ContactSync] [${sessionName}] 结束时间: ${stats.endTime}`);
+        console.log(`[ContactSync] [${sessionName}] 耗时: ${stats.duration}`);
 
         return stats;
 
     } catch (e) {
-        console.error(`[ContactSync] Session ${sessionId} failed:`, e.message);
+        const endTime = new Date();
+        const duration = endTime - startTime;
+        stats.endTime = formatBeijingTime(endTime);
+        stats.duration = formatDurationChinese(duration);
         stats.error = e.message;
+
+        console.error(`[ContactSync] [${sessionName}] 同步失败: ${e.message}`);
+        console.log(`[ContactSync] [${sessionName}] 结束时间: ${stats.endTime}`);
+        console.log(`[ContactSync] [${sessionName}] 耗时: ${stats.duration}`);
+
         return stats;
     }
 }
@@ -553,11 +676,19 @@ async function syncAllSessions() {
         return;
     }
 
-    console.log('[ContactSync] Starting full sync...');
-    const startTime = Date.now();
+    // ★ 记录总开始时间
+    const totalStartTime = new Date();
+    const totalStartTimeStr = formatBeijingTime(totalStartTime);
+
+    console.log('[ContactSync] ========================================');
+    console.log('[ContactSync] ★★★ 联系人同步任务开始 ★★★');
+    console.log(`[ContactSync] 开始时间: ${totalStartTimeStr}`);
+    console.log('[ContactSync] ========================================');
 
     const allSessions = sessionManager.getAllSessions();
     const sessionIds = Object.keys(allSessions);
+
+    console.log(`[ContactSync] 共 ${sessionIds.length} 个 Session 需要同步`);
 
     const results = [];
 
@@ -567,11 +698,33 @@ async function syncAllSessions() {
         await new Promise(r => setTimeout(r, 1000));
     }
 
-    const elapsed = Date.now() - startTime;
+    // ★ 记录总结束时间
+    const totalEndTime = new Date();
+    const totalDuration = totalEndTime - totalStartTime;
+    const totalEndTimeStr = formatBeijingTime(totalEndTime);
+    const totalDurationStr = formatDurationChinese(totalDuration);
+
     const totalCreated = results.reduce((sum, r) => sum + (r.created || 0), 0);
     const totalUpdated = results.reduce((sum, r) => sum + (r.updated || 0), 0);
+    const totalUnchanged = results.reduce((sum, r) => sum + (r.unchanged || 0), 0);
+    const totalSkipped = results.reduce((sum, r) => sum + (r.skipped || 0), 0);
+    const totalErrors = results.reduce((sum, r) => sum + (r.errors || 0), 0);
+    const totalContacts = results.reduce((sum, r) => sum + (r.total || 0), 0);
 
-    console.log(`[ContactSync] Complete: ${sessionIds.length} sessions, created=${totalCreated}, updated=${totalUpdated}, ${elapsed}ms`);
+    console.log('[ContactSync] ========================================');
+    console.log('[ContactSync] ★★★ 联系人同步任务完成 ★★★');
+    console.log(`[ContactSync] 开始时间: ${totalStartTimeStr}`);
+    console.log(`[ContactSync] 结束时间: ${totalEndTimeStr}`);
+    console.log(`[ContactSync] 总耗时: ${totalDurationStr}`);
+    console.log('[ContactSync] ----------------------------------------');
+    console.log(`[ContactSync] Session 数量: ${sessionIds.length}`);
+    console.log(`[ContactSync] 联系人总数: ${totalContacts}`);
+    console.log(`[ContactSync] 新建: ${totalCreated}`);
+    console.log(`[ContactSync] 更新: ${totalUpdated}`);
+    console.log(`[ContactSync] 无变化: ${totalUnchanged}`);
+    console.log(`[ContactSync] 跳过: ${totalSkipped}`);
+    console.log(`[ContactSync] 错误: ${totalErrors}`);
+    console.log('[ContactSync] ========================================');
 
     return results;
 }
@@ -592,6 +745,6 @@ module.exports = {
     syncSessionContacts,
     triggerSync,
     SYNC_ENABLED,
-    SYNC_INTERVAL_HOURS,
-    SYNC_COUNT
+    SYNC_HOUR,
+    SYNC_MINUTE
 };
