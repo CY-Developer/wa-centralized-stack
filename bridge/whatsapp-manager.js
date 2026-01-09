@@ -1442,9 +1442,12 @@ async function initSessionViaAdsPower(config) {
         // ★★★ 新增：监听消息撤回/删除事件 ★★★
         client.on('message_revoke_everyone', async (revokedMsg, oldMsg) => {
             try {
-                const msgId = revokedMsg?.id?._serialized || revokedMsg?.id?.id || '';
-                const from = revokedMsg?.from || '';
-                const chatId = revokedMsg?.to || from;
+                // ★★★ V5.3.13修复：使用oldMsg的ID，这才是被撤回的原始消息ID ★★★
+                // revokedMsg.id 是"撤回通知"的ID（新生成的）
+                // oldMsg.id 才是原始消息的ID
+                const msgId = oldMsg?.id?._serialized || oldMsg?.id?.id || revokedMsg?.id?._serialized || '';
+                const from = revokedMsg?.from || oldMsg?.from || '';
+                const chatId = revokedMsg?.to || oldMsg?.to || from;
 
                 // 解析电话号码
                 let phone = '';
@@ -1456,7 +1459,7 @@ async function initSessionViaAdsPower(config) {
                     phone_lid = chatId.replace(/@.*/, '').replace(/\D/g, '');
                 }
 
-                console.log(`[${sessionId}] Message revoked: ${msgId?.substring(0, 40)}...`);
+                console.log(`[${sessionId}] Message revoked: ${msgId?.substring(0, 40)}... (original msg)`);
 
                 // 发送撤回事件到 Collector
                 const payload = {
@@ -2044,51 +2047,212 @@ app.post('/send-text/:sessionId', async (req,res)=>{
  * }
  */
 app.post('/send/reply/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    // ★★★ V5.3.9新增：接收quotedMessageSuffix ★★★
+    const { chatIdOrPhone, text, quotedMessageId, quotedMessageSuffix } = req.body;
+
     try {
-        const { sessionId } = req.params;
-        const { chatIdOrPhone, text, quotedMessageId } = req.body || {};
-
-        if (!chatIdOrPhone) {
-            return res.status(400).json({ ok: false, error: 'need chatIdOrPhone' });
-        }
-        if (!text) {
-            return res.status(400).json({ ok: false, error: 'need text' });
-        }
-        if (!quotedMessageId) {
-            return res.status(400).json({ ok: false, error: 'need quotedMessageId' });
-        }
-
+        // ★★★ V5.3.12修复：使用正确的session获取方式 ★★★
         const session = sessions[sessionId];
-        if (!session || !session.client) {
-            return res.status(400).json({ ok: false, error: 'session not ready' });
+        if (!session || session.status !== 'ready') {
+            return res.status(503).json({ ok: false, error: 'session not ready' });
+        }
+        const client = session.client;
+        if (!client) {
+            return res.status(503).json({ ok: false, error: 'client not available' });
         }
 
-        console.log(`[${sessionId}] Sending reply with quote: ${quotedMessageId?.substring(0, 40)}...`);
+        // 获取chat对象
+        const chat = await client.getChatById(chatIdOrPhone);
+        if (!chat) {
+            return res.status(404).json({ ok: false, error: 'chat not found' });
+        }
 
-        // 获取聊天对象
-        const chat = await getChat(sessionId, chatIdOrPhone);
+        let finalQuotedId = quotedMessageId;
 
-        // 发送限流
-        await takeSendToken();
-        await ensureChatCooldown(sessionId, chat.id._serialized);
+        // ★★★ V5.3.9新增：如果有后缀，尝试在当前聊天中查找正确的消息ID ★★★
+        // ★★★ V5.3.13修复：优先选择Phone格式（@c.us），因为手机端更容易识别 ★★★
+        if (quotedMessageSuffix) {
+            try {
+                // 获取最近消息（100条通常足够找到被引用的消息）
+                const messages = await chat.fetchMessages({ limit: 100 });
 
-        // 发送带引用的消息
-        const msg = await chat.sendMessage(text, {
-            quotedMessageId: quotedMessageId
-        });
+                // 用后缀匹配 - 可能有多个匹配（LID和Phone格式）
+                const allMatched = messages.filter(m => {
+                    if (!m.id?._serialized) return false;
+                    const msgSuffix = m.id._serialized.split('_').pop();
+                    return msgSuffix === quotedMessageSuffix;
+                });
 
-        console.log(`[${sessionId}] Reply sent: ${msg.id?._serialized?.substring(0, 40)}...`);
+                if (allMatched.length > 0) {
+                    // ★★★ V5.3.13优化：优先选择Phone格式 ★★★
+                    const phoneMatch = allMatched.find(m => m.id._serialized.includes('@c.us'));
+                    const matched = phoneMatch || allMatched[0];
 
-        res.json({
+                    finalQuotedId = matched.id._serialized;
+                    console.log(`[send/reply] Found message by suffix: ${quotedMessageSuffix} -> ${finalQuotedId.substring(0, 40)} (phone_preferred=${!!phoneMatch})`);
+                } else {
+                    console.log(`[send/reply] No message found with suffix: ${quotedMessageSuffix}, using original ID`);
+                }
+            } catch (e) {
+                console.warn(`[send/reply] Suffix search failed: ${e.message}, using original ID`);
+            }
+        }
+
+        // ★★★ V5.3.13说明：关于手机端引用不显示的问题 ★★★
+        // 经过分析，同一条消息在不同设备上的LID是不同的：
+        // - Dylan设备: true_17932042137754@lid_xxx
+        // - Chloe设备: false_27153387237439@lid_xxx
+        // LID本身不同（17932042137754 vs 27153387237439），无法通过格式转换解决。
+        // 这是WhatsApp协议层面的限制，只能依赖后缀匹配。
+        // 网页端能正常显示是因为whatsapp-web.js可能内部做了处理。
+
+        // 发送引用消息
+        console.log(`[send/reply] Sending with quotedMessageId: ${finalQuotedId?.substring(0, 40)}`);
+        const msg = await chat.sendMessage(text, { quotedMessageId: finalQuotedId });
+
+        return res.json({
             ok: true,
-            msgId: msg.id?._serialized || null,
-            quotedMessageId: quotedMessageId
+            msgId: msg.id._serialized,
+            timestamp: msg.timestamp
         });
 
     } catch (e) {
-        console.error(`[${req.params.sessionId}] send/reply error:`, e.message);
-        res.status(400).json({ ok: false, error: e.message || String(e) });
+        console.error(`[send/reply] Error: ${e.message}`);
+        return res.status(500).json({ ok: false, error: e.message });
     }
+});
+
+// ★★★ V5.3.13新增：查找消息ID API ★★★
+/**
+ * POST /lookup-message/:sessionId
+ * 在指定session的聊天中查找消息ID
+ *
+ * 用途：发送引用消息前，先在接收方设备上查找正确的消息ID格式
+ *
+ * 请求体:
+ * {
+ *   chatIdOrPhone: string,      // 聊天对象的ID或电话号码
+ *   messageSuffix: string       // 消息ID后缀
+ * }
+ *
+ * 返回:
+ * {
+ *   ok: true,
+ *   messageId: string,          // 找到的完整消息ID
+ *   found: boolean
+ * }
+ */
+app.post('/lookup-message/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    const { chatIdOrPhone, messageSuffix } = req.body;
+
+    try {
+        if (!chatIdOrPhone || !messageSuffix) {
+            return res.status(400).json({ ok: false, error: 'need chatIdOrPhone & messageSuffix' });
+        }
+
+        const session = sessions[sessionId];
+        if (!session || session.status !== 'ready') {
+            return res.status(503).json({ ok: false, error: 'session not ready', found: false });
+        }
+
+        const client = session.client;
+        if (!client) {
+            return res.status(503).json({ ok: false, error: 'client not available', found: false });
+        }
+
+        // 获取chat对象
+        let chat;
+        try {
+            chat = await client.getChatById(chatIdOrPhone);
+        } catch (e) {
+            console.log(`[lookup-message] Chat not found: ${chatIdOrPhone}, trying with @c.us`);
+            // 尝试添加@c.us后缀
+            if (!chatIdOrPhone.includes('@')) {
+                chat = await client.getChatById(`${chatIdOrPhone}@c.us`);
+            }
+        }
+
+        if (!chat) {
+            return res.json({ ok: true, found: false, error: 'chat not found' });
+        }
+
+        // 获取最近消息
+        const messages = await chat.fetchMessages({ limit: 100 });
+
+        // 用后缀匹配
+        const matched = messages.find(m => {
+            if (!m.id?._serialized) return false;
+            const msgSuffix = m.id._serialized.split('_').pop();
+            return msgSuffix === messageSuffix;
+        });
+
+        if (matched) {
+            console.log(`[lookup-message] Found: suffix=${messageSuffix} -> ${matched.id._serialized.substring(0, 45)}`);
+            return res.json({
+                ok: true,
+                found: true,
+                messageId: matched.id._serialized
+            });
+        } else {
+            console.log(`[lookup-message] Not found: suffix=${messageSuffix} in chat ${chatIdOrPhone}`);
+            return res.json({
+                ok: true,
+                found: false
+            });
+        }
+
+    } catch (e) {
+        console.error(`[lookup-message] Error: ${e.message}`);
+        return res.status(500).json({ ok: false, error: e.message, found: false });
+    }
+});
+
+// ★★★ V5.3.13新增：通过电话号码查找session ★★★
+/**
+ * GET /resolve-session/:phone
+ * 查找哪个session对应指定的电话号码
+ */
+app.get('/resolve-session/:phone', (req, res) => {
+    const { phone } = req.params;
+    const cleanPhone = phone.replace(/\D/g, '');
+
+    for (const [sid, sess] of Object.entries(sessions)) {
+        if (!sess || sess.status !== 'ready') continue;
+
+        const widUser = sess.client?.info?.wid?.user || sess.info?.wid?.user;
+        if (widUser === cleanPhone) {
+            console.log(`[resolve-session] Found: ${cleanPhone} -> ${sid}`);
+            return res.json({ ok: true, found: true, sessionId: sid });
+        }
+    }
+
+    console.log(`[resolve-session] Not found: ${cleanPhone}`);
+    return res.json({ ok: true, found: false });
+});
+
+// ★★★ V5.3.13新增：获取session信息 ★★★
+/**
+ * GET /session/:sessionId
+ * 获取指定session的信息（包括电话号码）
+ */
+app.get('/session/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
+    const session = sessions[sessionId];
+
+    if (!session) {
+        return res.status(404).json({ ok: false, error: 'session not found' });
+    }
+
+    const info = {
+        status: session.status,
+        name: session.name,
+        wid: session.client?.info?.wid || session.info?.wid || null
+    };
+
+    console.log(`[session] Info for ${sessionId}: wid=${info.wid?.user || 'none'}`);
+    return res.json({ ok: true, info });
 });
 
 // ★★★ 新增：删除消息 API ★★★

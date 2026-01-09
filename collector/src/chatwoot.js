@@ -3,6 +3,13 @@ const FormData = require('form-data');
 const path = require('path');
 const { CFG } = require('./config');
 
+// ★★★ V5.3.13新增：提取消息ID后缀 ★★★
+function extractMessageIdSuffix(messageId) {
+  if (!messageId) return null;
+  const parts = messageId.split('_');
+  return parts.length > 0 ? parts[parts.length - 1] : null;
+}
+
 // ★★★ 新增：联系人内存缓存（解决 Chatwoot 搜索 API 索引延迟问题） ★★★
 const contactCache = new Map();  // key: digits -> value: { contact, timestamp }
 const conversationCache = new Map();  // key: contact_id:inbox_id -> value: { conversation, timestamp }
@@ -804,7 +811,14 @@ async function getConversationDetails(account_id = DEFAULT_ACCOUNT_ID, conversat
   return cwRequest('get', `/api/v1/accounts/${account_id}/conversations/${conversation_id}`);
 }
 
-async function createMessageMultipart({ account_id = DEFAULT_ACCOUNT_ID, conversation_id, content, attachments = [] }) {
+async function createMessageMultipart({
+                                        account_id = DEFAULT_ACCOUNT_ID,
+                                        conversation_id,
+                                        content,
+                                        attachments = [],
+                                        content_attributes = {},  // ★★★ V5.3.10新增 ★★★
+                                        source_id = null          // ★★★ V5.3.10新增 ★★★
+                                      }) {
   const url = `${CW_BASE}/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`;
 
   // 先把所有附件转成 {buffer, filename, contentType}，避免重试时二次下载
@@ -843,6 +857,13 @@ async function createMessageMultipart({ account_id = DEFAULT_ACCOUNT_ID, convers
     if (content !== undefined && content !== null) form.append('content', String(content));
     form.append('message_type', msgTypeVal);  // 新版优先 'incoming'，必要时回退 1
     form.append('private', 'false');
+    // ★★★ V5.3.10新增：添加source_id和content_attributes ★★★
+    if (source_id) {
+      form.append('source_id', source_id);
+    }
+    if (Object.keys(content_attributes).length > 0) {
+      form.append('content_attributes', JSON.stringify(content_attributes));
+    }
     for (const f of files) {
       form.append('attachments[]', f.buffer, { filename: f.filename, contentType: f.contentType });
     }
@@ -885,13 +906,15 @@ async function createIncomingMessage({
                                        attachments,
                                        quotedMsg,        // ★★★ V5 新增：引用消息信息 ★★★
                                        wa_message_id,    // ★★★ V5 新增：WhatsApp消息ID ★★★
-                                       in_reply_to       // ★★★ V5.3.3 新增：被引用消息的Chatwoot消息ID ★★★
+                                       in_reply_to,      // ★★★ V5.3.3 新增：被引用消息的Chatwoot消息ID ★★★
+                                       content_attributes: externalContentAttrs = {},  // ★★★ V5.3.10新增：接收外部content_attributes ★★★
+                                       source_id         // ★★★ V5.3.10新增：source_id用于去重 ★★★
                                      }) {
   let bodyContent = (content ?? text ?? '');
   const hasAtt = Array.isArray(attachments) && attachments.length > 0;
 
-  // ★★★ V5 新增：构建 content_attributes ★★★
-  const content_attributes = {};
+  // ★★★ V5.3.10修复：合并外部传入的content_attributes ★★★
+  const content_attributes = { ...externalContentAttrs };
 
   // 保存 WhatsApp 消息ID（用于后续引用/删除）
   if (wa_message_id) {
@@ -950,7 +973,8 @@ async function createIncomingMessage({
       conversation_id,
       content: bodyContent,
       attachments,
-      content_attributes
+      content_attributes,
+      source_id  // ★★★ V5.3.10新增 ★★★
     });
   }
 
@@ -959,6 +983,11 @@ async function createIncomingMessage({
     message_type: 'incoming',
     private: false
   };
+
+  // ★★★ V5.3.10修复：添加source_id ★★★
+  if (source_id) {
+    data.source_id = source_id;
+  }
 
   // ★★★ 添加 content_attributes ★★★
   if (Object.keys(content_attributes).length > 0) {
@@ -989,6 +1018,31 @@ async function updateContactNote({ account_id, contact_id, note_id, content }) {
 /**
  * 获取会话消息列表
  */
+/**
+ * ★★★ V5.3.12新增：获取单条消息 ★★★
+ * @param {string} account_id - 账户ID
+ * @param {number} conversation_id - 会话ID
+ * @param {number} message_id - 消息ID
+ * @returns {Object|null} - 消息对象或null
+ */
+async function getMessage({ account_id = DEFAULT_ACCOUNT_ID, conversation_id, message_id }) {
+  if (!conversation_id || !message_id) return null;
+
+  try {
+    // Chatwoot没有直接获取单条消息的API，我们通过获取会话消息来查找
+    const url = `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`;
+    const result = await cwRequest('get', url);
+    const messages = result?.payload || result || [];
+
+    // 在最近消息中查找指定ID的消息
+    const message = messages.find(m => m.id === message_id);
+    return message || null;
+  } catch (e) {
+    console.warn(`[getMessage] Failed to get message ${message_id}: ${e.message}`);
+    return null;
+  }
+}
+
 async function getConversationMessages({ account_id = DEFAULT_ACCOUNT_ID, conversation_id, after, before }) {
   let allMessages = [];
   let beforeId = null;
@@ -1140,6 +1194,101 @@ async function createOutgoingMessage({
       message_type: 'outgoing',
       private: false
     }
+  });
+}
+
+
+/**
+ * ★★★ V5.3.10新增：支持引用的outgoing消息创建 ★★★
+ */
+async function createOutgoingMessageWithReply({
+                                                account_id = DEFAULT_ACCOUNT_ID,
+                                                conversation_id,
+                                                content,
+                                                attachments = [],
+                                                source_id,
+                                                content_attributes = {},
+                                                in_reply_to = null
+                                              }) {
+  const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+
+  // 构建content_attributes（包含in_reply_to）
+  const finalContentAttrs = { ...content_attributes };
+  if (in_reply_to) {
+    finalContentAttrs.in_reply_to = in_reply_to;
+    console.log(`[createOutgoingMessageWithReply] Native reply: in_reply_to=${in_reply_to}`);
+  }
+
+  if (hasAttachments) {
+    // 有附件：使用 FormData
+    const url = `${CW_BASE}/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`;
+
+    const files = [];
+    for (const att of attachments) {
+      if (!att) continue;
+
+      if (att.data_url) {
+        const parsed = parseDataUrlLoose(att.data_url);
+        if (parsed) {
+          const ct = cleanMime(att.file_type || parsed.contentType);
+          const fn = forceFileExt(att.filename || parsed.filename, ct);
+          files.push({ buffer: parsed.buffer, filename: fn, contentType: ct });
+        }
+      } else if (att.file_url) {
+        try {
+          const file = await fetchAsBuffer(att.file_url);
+          const ct = cleanMime(att.file_type || file.contentType);
+          const fn = forceFileExt(att.filename || file.filename, ct);
+          files.push({ buffer: file.buffer, filename: fn, contentType: ct });
+        } catch (e) {
+          console.error('[createOutgoingMessageWithReply] Fetch attachment failed:', e?.message);
+        }
+      }
+    }
+
+    const form = new FormData();
+    form.append('content', String(content || ''));
+    form.append('message_type', 'outgoing');
+    form.append('private', 'false');
+    if (source_id) {
+      form.append('source_id', source_id);
+    }
+    if (Object.keys(finalContentAttrs).length > 0) {
+      form.append('content_attributes', JSON.stringify(finalContentAttrs));
+    }
+
+    for (const f of files) {
+      form.append('attachments[]', f.buffer, { filename: f.filename, contentType: f.contentType });
+    }
+
+    const headers = { ...form.getHeaders(), api_access_token: CW_TOKEN };
+    const res = await axios.post(url, form, {
+      headers,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      validateStatus: s => s >= 200 && s < 300
+    });
+
+    return res.data;
+  }
+
+  // 无附件：JSON 请求
+  const data = {
+    content: String(content || ''),
+    message_type: 'outgoing',
+    private: false
+  };
+
+  if (source_id) {
+    data.source_id = source_id;
+  }
+
+  if (Object.keys(finalContentAttrs).length > 0) {
+    data.content_attributes = finalContentAttrs;
+  }
+
+  return cwRequest('post', `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`, {
+    data
   });
 }
 
@@ -1404,54 +1553,42 @@ function calculateTimeOffset(cwMessages, waMessages) {
  * @param {number} options.account_id - 账户 ID
  * @param {number} options.conversation_id - 会话 ID
  * @param {Array} options.messages - 消息数组
+ * @param {Function} options.findCwMessageIdFn - 实时查找CW消息ID的函数（V5.3.13新增）
  * @returns {Promise<Object>}
  */
 async function batchCreateMessages({
                                      account_id = DEFAULT_ACCOUNT_ID,
                                      conversation_id,
-                                     messages
+                                     messages,
+                                     findCwMessageIdFn = null  // ★★★ V5.3.13新增 ★★★
                                    }) {
   if (!messages || messages.length === 0) {
-    return { ok: true, created: 0, failed: 0, skipped: 0, created_ids: [] };
+    return { ok: true, created: 0, failed: 0, skipped: 0, created_ids: [], created_mappings: [] };
   }
 
   console.log(`[batchCreateMessages] Start: conv=${conversation_id}, count=${messages.length}`);
 
-  try {
-    // 尝试使用批量 API
-    const result = await request('post',
-        `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages/batch_create`,
-        { messages }
-    );
-
-    console.log(`[batchCreateMessages] Success: created=${result?.created}, skipped=${result?.skipped}, failed=${result?.failed}`);
-    return result;
-
-  } catch (e) {
-    const status = e?.response?.status || e?.status;
-
-    // 如果批量 API 不存在（404），降级到逐条创建
-    if (status === 404) {
-      console.log(`[batchCreateMessages] API not found (404), fallback to single create`);
-      return await fallbackBatchCreate({
-        account_id,
-        conversation_id,
-        messages
-      });
-    }
-
-    console.error(`[batchCreateMessages] Error: ${e?.message}`);
-    throw e;
-  }
+  // ★★★ V5.3.8修复：始终使用fallback方式以确保返回映射 ★★★
+  // 原因：Chatwoot原生批量API不返回消息ID映射信息
+  // fallback虽然较慢，但保证返回映射，对于引用功能至关重要
+  console.log(`[batchCreateMessages] Using fallback mode to ensure mappings`);
+  return await fallbackBatchCreate({
+    account_id,
+    conversation_id,
+    messages,
+    findCwMessageIdFn  // ★★★ V5.3.13新增：传递查找函数 ★★★
+  });
 }
 
 /**
  * 降级批量创建（逐条）
+ * V5.3.13修复：实时查找in_reply_to，确保同步消息原生引用正确
  */
 async function fallbackBatchCreate({
                                      account_id = DEFAULT_ACCOUNT_ID,
                                      conversation_id,
-                                     messages
+                                     messages,
+                                     findCwMessageIdFn = null  // ★★★ V5.3.13新增：实时查找函数 ★★★
                                    }) {
   let created = 0;
   let failed = 0;
@@ -1460,9 +1597,52 @@ async function fallbackBatchCreate({
   const created_ids = [];
   const created_mappings = [];  // ★★★ V5.3新增：消息ID映射 ★★★
 
+  // ★★★ V5.3.13新增：临时映射，用于本次同步中的引用查找 ★★★
+  const syncSessionMapping = new Map();
+
   for (const msg of messages) {
     try {
       const isIncoming = msg.message_type === 0 || msg.message_type === 'incoming';
+
+      // ★★★ V5.3.13修复：实时查找in_reply_to ★★★
+      let in_reply_to = null;
+      const quotedMsgWaId = msg._quotedMsgWaId;  // 被引用消息的WA ID
+
+      if (quotedMsgWaId) {
+        // 1. 先从本次同步的临时映射查找
+        const quotedSuffix = extractMessageIdSuffix(quotedMsgWaId);
+        if (quotedSuffix && syncSessionMapping.has(quotedSuffix)) {
+          in_reply_to = syncSessionMapping.get(quotedSuffix);
+          console.log(`[fallbackBatchCreate] Found in session mapping: suffix=${quotedSuffix} -> cw=${in_reply_to}`);
+        }
+
+        // 2. 如果临时映射没有，用传入的查找函数从Redis查找
+        if (!in_reply_to && findCwMessageIdFn) {
+          in_reply_to = await findCwMessageIdFn(conversation_id, quotedMsgWaId);
+          if (in_reply_to) {
+            console.log(`[fallbackBatchCreate] Found in Redis: wa=${quotedMsgWaId.substring(0, 25)} -> cw=${in_reply_to}`);
+          }
+        }
+
+        // 3. 如果都没找到，使用准备阶段的旧ID（兼容）
+        if (!in_reply_to) {
+          in_reply_to = msg._in_reply_to || msg.content_attributes?.in_reply_to || null;
+          if (in_reply_to) {
+            console.log(`[fallbackBatchCreate] Using prepared in_reply_to: ${in_reply_to}`);
+          }
+        }
+      } else {
+        // 没有引用消息，使用准备阶段的值（兼容旧逻辑）
+        in_reply_to = msg._in_reply_to || msg.content_attributes?.in_reply_to || null;
+      }
+
+      if (in_reply_to) {
+        console.log(`[fallbackBatchCreate] Message has native reply: source_id=${msg.source_id?.substring(0, 25)}, in_reply_to=${in_reply_to}`);
+      } else if (quotedMsgWaId && msg._quotedTextFallback) {
+        // ★★★ V5.3.13新增：找不到映射时使用文本格式引用 ★★★
+        console.log(`[fallbackBatchCreate] No mapping found, using text fallback for: wa=${quotedMsgWaId.substring(0, 25)}`);
+        msg.content = msg._quotedTextFallback;
+      }
 
       let result;
       if (isIncoming) {
@@ -1473,18 +1653,22 @@ async function fallbackBatchCreate({
           source_id: msg.source_id,
           private: msg.private || false,
           content_attributes: msg.content_attributes || {},
-          attachments: msg.attachments || []
+          attachments: msg.attachments || [],
+          in_reply_to  // ★★★ V5.3.10修复：传递in_reply_to参数 ★★★
         });
       } else {
-        result = await createOutgoingMessage({
+        // ★★★ V5.3.10修复：outgoing消息也支持in_reply_to ★★★
+        const outgoingResult = await createOutgoingMessageWithReply({
           account_id,
           conversation_id,
           content: msg.content || '',
           source_id: msg.source_id,
           private: msg.private || false,
           content_attributes: msg.content_attributes || {},
-          attachments: msg.attachments || []
+          attachments: msg.attachments || [],
+          in_reply_to
         });
+        result = outgoingResult;
       }
 
       if (result?.id) {
@@ -1496,6 +1680,13 @@ async function fallbackBatchCreate({
             waMessageId: msg.source_id,
             cwMessageId: result.id
           });
+
+          // ★★★ V5.3.13新增：立即保存到临时映射，供后续引用消息使用 ★★★
+          const suffix = extractMessageIdSuffix(msg.source_id);
+          if (suffix) {
+            syncSessionMapping.set(suffix, result.id);
+            console.log(`[fallbackBatchCreate] Session mapping saved: suffix=${suffix} -> cw=${result.id}`);
+          }
         }
       }
     } catch (e) {

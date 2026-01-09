@@ -98,16 +98,50 @@ const MESSAGE_MAP_TTL = 30 * 24 * 3600; // 30天
  * @param {string} waMessageId - WhatsApp消息ID
  * @param {number} cwMessageId - Chatwoot消息ID
  */
+/**
+ * ★★★ V5.3.7新增：提取消息ID后缀（唯一标识部分） ★★★
+ * WhatsApp消息ID格式: true/false_xxx@xxx_SUFFIX
+ * 同一条消息在发送方和接收方的后缀相同，但前缀不同
+ * 例如：
+ * - 发送方: true_17932042137754@lid_3EB0A8ED271F02A0B3C23B
+ * - 接收方: true_85256018957@c.us_3EB0A8ED271F02A0B3C23B
+ * 后缀都是: 3EB0A8ED271F02A0B3C23B
+ */
+function extractMessageIdSuffix(messageId) {
+    if (!messageId) return null;
+    // 格式: true_xxx@lid_3EB0A8ED271F02A0B3C23B
+    // 或: false_xxx@c.us_3EB0A8ED271F02A0B3C23B
+    // 提取最后一个下划线后的部分（后缀）
+    const lastUnderscoreIndex = messageId.lastIndexOf('_');
+    if (lastUnderscoreIndex > 0 && lastUnderscoreIndex < messageId.length - 1) {
+        return messageId.substring(lastUnderscoreIndex + 1);
+    }
+    return null;
+}
+
+/**
+ * ★★★ V5.3.7改进：保存消息ID映射（包含后缀索引） ★★★
+ */
 async function saveMessageMapping(conversation_id, waMessageId, cwMessageId) {
     if (!redis || !conversation_id || !waMessageId || !cwMessageId) return false;
     try {
         const pipeline = redis.pipeline();
-        // 正向映射: wa -> cw
+        // 1. 正向映射: wa -> cw
         pipeline.set(`cw:msgmap:${conversation_id}:${waMessageId}`, String(cwMessageId), 'EX', MESSAGE_MAP_TTL);
-        // 反向映射: cw -> wa
+        // 2. 反向映射: cw -> wa
         pipeline.set(`cw:msgmap:rev:${conversation_id}:${cwMessageId}`, waMessageId, 'EX', MESSAGE_MAP_TTL);
+
+        // 3. ★★★ V5.3.7新增：后缀索引 ★★★
+        // 同一条消息在不同端ID前缀不同，但后缀相同
+        const suffix = extractMessageIdSuffix(waMessageId);
+        if (suffix && suffix.length >= 10) {
+            pipeline.set(`cw:msgmap:suffix:${conversation_id}:${suffix}`, String(cwMessageId), 'EX', MESSAGE_MAP_TTL);
+            // 4. ★★★ V5.3.13新增：全局后缀索引（用于撤回查找）★★★
+            pipeline.set(`cw:msgmap:suffix_global:${suffix}`, `${conversation_id}:${cwMessageId}`, 'EX', MESSAGE_MAP_TTL);
+        }
+
         await pipeline.exec();
-        console.log(`[MSG_MAP] Saved: wa=${waMessageId.substring(0, 35)} <-> cw=${cwMessageId}`);
+        console.log(`[MSG_MAP] Saved: wa=${waMessageId.substring(0, 35)} <-> cw=${cwMessageId}${suffix ? `, suffix=${suffix.substring(0, 15)}` : ''}`);
         return true;
     } catch (e) {
         console.warn(`[MSG_MAP] Save failed: ${e.message}`);
@@ -127,7 +161,7 @@ async function getMessageMapping(conversation_id, waMessageId) {
         const key = `cw:msgmap:${conversation_id}:${waMessageId}`;
         const cwMessageId = await redis.get(key);
         if (cwMessageId) {
-            console.log(`[MSG_MAP] Found: wa=${waMessageId.substring(0, 35)} -> cw=${cwMessageId}`);
+            console.log(`[MSG_MAP] Found in Redis: wa=${waMessageId.substring(0, 35)} -> cw=${cwMessageId}`);
             return Number(cwMessageId);
         }
         return null;
@@ -135,6 +169,65 @@ async function getMessageMapping(conversation_id, waMessageId) {
         console.warn(`[MSG_MAP] Get failed: ${e.message}`);
         return null;
     }
+}
+
+/**
+ * ★★★ V5.3.7改进：通过source_id在Chatwoot中查找消息ID ★★★
+ * 支持后缀匹配，解决发送方/接收方ID不同的问题
+ * @param {number} conversation_id - Chatwoot会话ID
+ * @param {string} waMessageId - WhatsApp消息ID (即source_id)
+ * @returns {number|null} - Chatwoot消息ID或null
+ */
+async function findCwMessageIdBySourceId(conversation_id, waMessageId) {
+    // ★★★ V5.3.11修复：禁用Chatwoot API查询 ★★★
+    // 原因：API分页查询整个会话（1000+条消息）需要60-165秒，
+    // 导致消息重复发送问题。
+    // 现在只依赖Redis映射，如果Redis没有就返回null（使用文本格式引用）
+    console.log(`[MSG_MAP] API lookup disabled (V5.3.11): wa=${waMessageId?.substring(0, 30)}`);
+    return null;
+}
+
+/**
+ * ★★★ V5.3.7改进：综合查找Chatwoot消息ID ★★★
+ * 查找顺序：
+ * 1. Redis精确匹配（最快）
+ * 2. Redis后缀索引（快速，解决ID格式不同问题）
+ * 3. Chatwoot API查找（最慢，最后兜底）
+ *
+ * @param {number} conversation_id - Chatwoot会话ID
+ * @param {string} waMessageId - WhatsApp消息ID
+ * @returns {number|null} - Chatwoot消息ID或null
+ */
+async function findCwMessageId(conversation_id, waMessageId) {
+    if (!conversation_id || !waMessageId) return null;
+
+    // 1. 先查Redis（精确匹配）
+    const fromRedis = await getMessageMapping(conversation_id, waMessageId);
+    if (fromRedis) return fromRedis;
+
+    // 2. ★★★ V5.3.7核心改进：使用后缀索引查找 ★★★
+    // 同一条消息在不同端ID不同，但后缀相同
+    if (redis) {
+        const targetSuffix = extractMessageIdSuffix(waMessageId);
+        if (targetSuffix && targetSuffix.length >= 10) {
+            try {
+                // 直接通过后缀索引查找
+                const suffixKey = `cw:msgmap:suffix:${conversation_id}:${targetSuffix}`;
+                const cwId = await redis.get(suffixKey);
+                if (cwId) {
+                    console.log(`[MSG_MAP] Found by suffix index: wa=${waMessageId.substring(0, 30)} -> cw=${cwId}, suffix=${targetSuffix.substring(0, 15)}`);
+                    // 保存精确映射以加速下次查找
+                    await saveMessageMapping(conversation_id, waMessageId, Number(cwId)).catch(() => {});
+                    return Number(cwId);
+                }
+            } catch (e) {
+                console.warn(`[MSG_MAP] Suffix lookup failed: ${e.message}`);
+            }
+        }
+    }
+
+    // 3. Redis没有，通过Chatwoot API查找
+    return await findCwMessageIdBySourceId(conversation_id, waMessageId);
 }
 
 /**
@@ -160,7 +253,7 @@ async function getWaMessageIdByCwId(conversation_id, cwMessageId) {
 }
 
 /**
- * 批量保存消息ID映射（用于同步）
+ * ★★★ V5.3.7改进：批量保存消息ID映射（包含后缀索引） ★★★
  * @param {number} conversation_id - Chatwoot会话ID
  * @param {Array} mappings - [{waMessageId, cwMessageId}, ...]
  */
@@ -168,16 +261,27 @@ async function batchSaveMessageMappings(conversation_id, mappings) {
     if (!redis || !conversation_id || !mappings?.length) return 0;
     try {
         const pipeline = redis.pipeline();
+        let suffixCount = 0;
+
         for (const { waMessageId, cwMessageId } of mappings) {
             if (waMessageId && cwMessageId) {
-                // 正向映射
+                // 1. 正向映射
                 pipeline.set(`cw:msgmap:${conversation_id}:${waMessageId}`, String(cwMessageId), 'EX', MESSAGE_MAP_TTL);
-                // 反向映射
+                // 2. 反向映射
                 pipeline.set(`cw:msgmap:rev:${conversation_id}:${cwMessageId}`, waMessageId, 'EX', MESSAGE_MAP_TTL);
+
+                // 3. ★★★ V5.3.7新增：后缀索引 ★★★
+                const suffix = extractMessageIdSuffix(waMessageId);
+                if (suffix && suffix.length >= 10) {
+                    pipeline.set(`cw:msgmap:suffix:${conversation_id}:${suffix}`, String(cwMessageId), 'EX', MESSAGE_MAP_TTL);
+                    // 4. ★★★ V5.3.13新增：全局后缀索引（用于撤回查找）★★★
+                    pipeline.set(`cw:msgmap:suffix_global:${suffix}`, `${conversation_id}:${cwMessageId}`, 'EX', MESSAGE_MAP_TTL);
+                    suffixCount++;
+                }
             }
         }
         await pipeline.exec();
-        console.log(`[MSG_MAP] Batch saved ${mappings.length} mappings for conv=${conversation_id}`);
+        console.log(`[MSG_MAP] Batch saved ${mappings.length} mappings (${suffixCount} suffixes) for conv=${conversation_id}`);
         return mappings.length;
     } catch (e) {
         console.warn(`[MSG_MAP] Batch save failed: ${e.message}`);
@@ -856,30 +960,91 @@ async function handleMessageRevoke(req, res) {
             return res.json({ ok: true, skipped: 'no messageId' });
         }
 
-        // 1) 先尝试在 Redis 中查找 CW 消息映射
+        // ★★★ V5.3.13增强：多种方式查找映射 ★★★
         let cwMessageId = null;
-        if (redis) {
-            // 尝试多种键格式
-            cwMessageId = await redis.get(`wa:msg:${messageId}`) ||
-                await redis.get(`cw:msgmap:${messageId}`);
+        let conversationId = null;
+        const suffix = extractMessageIdSuffix(messageId);
+
+        if (redis && suffix && suffix.length >= 10) {
+            // 方法1: 查找全局后缀映射（新消息）
+            const globalMapping = await redis.get(`cw:msgmap:suffix_global:${suffix}`);
+            if (globalMapping) {
+                const [convId, cwId] = globalMapping.split(':');
+                conversationId = Number(convId);
+                cwMessageId = Number(cwId);
+                console.log(`[REVOKE] Found via global suffix: conv=${conversationId}, cw=${cwMessageId}`);
+            }
+
+            // 方法2: 如果全局没找到，通过phone/phone_lid找conversation，再查会话级映射
+            if (!cwMessageId && (phone || phone_lid)) {
+                try {
+                    // 查找conversation映射
+                    const identifier = phone || phone_lid;
+                    const convKeys = await redis.keys(`cw:mapping:conv:*`);
+
+                    for (const key of convKeys) {
+                        const mapping = await redis.get(key);
+                        if (mapping) {
+                            const parsed = JSON.parse(mapping);
+                            // 检查phone或phone_lid是否匹配
+                            if (parsed.phone === identifier || parsed.phone_lid === identifier ||
+                                parsed.phone === phone || parsed.phone_lid === phone_lid) {
+                                conversationId = parsed.conversation_id;
+
+                                // 找到conversation后，查会话级后缀映射
+                                const suffixKey = `cw:msgmap:suffix:${conversationId}:${suffix}`;
+                                const cwId = await redis.get(suffixKey);
+                                if (cwId) {
+                                    cwMessageId = Number(cwId);
+                                    console.log(`[REVOKE] Found via conversation suffix: conv=${conversationId}, cw=${cwMessageId}`);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`[REVOKE] Fallback lookup failed: ${e.message}`);
+                }
+            }
         }
 
-        // 2) 如果找到了 CW 消息ID，直接删除
-        if (cwMessageId) {
+        // 3. 如果找到了映射，调用Chatwoot API删除
+        if (cwMessageId && conversationId) {
             try {
-                // 需要先找到 conversation_id
-                // 这里简化处理，记录日志
-                console.log(`[REVOKE] Found CW message mapping: ${cwMessageId}`);
-                logToCollector('[REVOKE] Message revoked (mapped)', {
-                    wa_message_id: messageId?.substring(0, 30),
+                logToCollector('[REVOKE] Calling Chatwoot delete API', {
+                    conversation_id: conversationId,
                     cw_message_id: cwMessageId,
-                    revokedBy
+                    wa_message_id: messageId?.substring(0, 30)
                 });
+
+                // 调用Chatwoot删除API（添加skip_wa_delete避免循环）
+                const deleteUrl = `${CFG.chatwoot.baseURL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages/${cwMessageId}?skip_wa_delete=true`;
+
+                const deleteResult = await axios.delete(deleteUrl, {
+                    headers: {
+                        'api_access_token': CHATWOOT_TOKEN,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 10000
+                }).catch(e => ({ status: e.response?.status, error: e.message }));
+
+                if (deleteResult.status === 200 || deleteResult.status === 204) {
+                    logToCollector('[REVOKE] Chatwoot delete success', {
+                        conversation_id: conversationId,
+                        cw_message_id: cwMessageId
+                    });
+                } else {
+                    logToCollector('[REVOKE] Chatwoot delete failed', {
+                        status: deleteResult.status,
+                        error: deleteResult.error
+                    });
+                }
             } catch (e) {
-                console.error(`[REVOKE] Failed to delete mapped message: ${e.message}`);
+                console.error(`[REVOKE] Failed to delete Chatwoot message: ${e.message}`);
+                logToCollector('[REVOKE] Chatwoot delete error', { error: e.message });
             }
         } else {
-            // 3) 没有找到映射，记录日志
+            // 没有找到映射，记录日志
             logToCollector('[REVOKE] Message revoked (no mapping)', {
                 wa_message_id: messageId?.substring(0, 30),
                 phone: phone || phone_lid,
@@ -892,7 +1057,8 @@ async function handleMessageRevoke(req, res) {
             ok: true,
             revoked: true,
             wa_message_id: messageId,
-            cw_message_id: cwMessageId || null
+            cw_message_id: cwMessageId || null,
+            conversation_id: conversationId || null
         });
 
     } catch (e) {
@@ -1152,10 +1318,10 @@ app.post('/ingest', async (req, res) => {
         });
 
 // 4) 发 incoming 消息到 Chatwoot
-        // ★★★ V5.3.3新增：查询被引用消息的Chatwoot ID以支持原生引用 ★★★
+        // ★★★ V5.3.5修复：使用综合查找函数（Redis + source_id） ★★★
         let in_reply_to = null;
         if (quotedMsg && quotedMsg.id && conversation_id) {
-            in_reply_to = await getMessageMapping(conversation_id, quotedMsg.id);
+            in_reply_to = await findCwMessageId(conversation_id, quotedMsg.id);
             if (in_reply_to) {
                 console.log(`[INGEST] Found native reply: wa=${quotedMsg.id.substring(0, 30)} -> cw=${in_reply_to}`);
             } else {
@@ -1173,6 +1339,8 @@ app.post('/ingest', async (req, res) => {
             // ★★★ V5 新增：传递引用消息和WA消息ID ★★★
             quotedMsg,
             wa_message_id: messageId,
+            // ★★★ V5.3.12修复：传递source_id确保Chatwoot保存WhatsApp消息ID ★★★
+            source_id: messageId,
             // ★★★ V5.3.3新增：原生引用 ★★★
             in_reply_to
         });
@@ -1262,6 +1430,13 @@ app.post('/ingest', async (req, res) => {
         // ★★★ 标记入站消息已同步 ★★★
         if (redis && messageId) {
             await redis.set(`wa:synced:incoming:${messageId}`, '1', 'EX', 7 * 24 * 3600).catch(() => {});
+        }
+
+        // ★★★ V5.3.6修复：保存消息ID映射（关键！支持后续引用查找） ★★★
+        const createdId = created?.id || created?.message?.id;
+        if (createdId && messageId && conversation_id) {
+            await saveMessageMapping(conversation_id, messageId, createdId);
+            console.log(`[INGEST] Message mapping saved: wa=${messageId.substring(0, 30)} -> cw=${createdId}`);
         }
 
         // 注意：新联系人的历史同步已在上方处理（直接返回），此处不再需要异步调用
@@ -1368,6 +1543,11 @@ app.post('/ingest', async (req, res) => {
                     content: retryContent,
                     attachments: retryAttachments,
                     text,
+                    // ★★★ V5.3.12修复：传递source_id和引用信息 ★★★
+                    source_id: messageId,
+                    wa_message_id: messageId,
+                    quotedMsg,
+                    in_reply_to
                 });
 
                 // 标记入站消息已同步
@@ -1375,7 +1555,14 @@ app.post('/ingest', async (req, res) => {
                     await redis.set(`wa:synced:incoming:${messageId}`, '1', 'EX', 7 * 24 * 3600).catch(() => {});
                 }
 
-                return res.json({ ok: true, conversation_id, message_id: created.id || created.message?.id || null, retried: true });
+                // ★★★ V5.3.12修复：重试后也保存消息ID映射 ★★★
+                const createdId = created?.id || created?.message?.id;
+                if (createdId && messageId) {
+                    await saveMessageMapping(conversation_id, messageId, createdId);
+                    console.log(`[INGEST] Retry mapping saved: wa=${messageId.substring(0, 30)} -> cw=${createdId}`);
+                }
+
+                return res.json({ ok: true, conversation_id, message_id: createdId || null, retried: true });
             } catch (retryErr) {
                 console.error('[INGEST] Retry failed:', retryErr?.message);
                 return res.status(500).json({ ok: false, error: retryErr?.message });
@@ -1498,6 +1685,17 @@ app.post('/ingest-outgoing', async (req, res) => {
             if (exists) {
                 logToCollector('[INGEST_OUT] Skip (Redis)', { messageId: messageId.substring(0, 35) });
                 return res.json({ ok: true, skipped: 'duplicate_redis' });
+            }
+        }
+
+        // ★★★ V5.3.11新增：处理中锁，防止同一消息被并发处理 ★★★
+        const processingKey = `wa:processing:outgoing:${messageId}`;
+        if (redis) {
+            // 尝试获取处理中锁（30秒过期，防止死锁）
+            const acquired = await redis.set(processingKey, '1', 'EX', 30, 'NX');
+            if (!acquired) {
+                logToCollector('[INGEST_OUT] Skip (Processing)', { messageId: messageId.substring(0, 35) });
+                return res.json({ ok: true, skipped: 'already_processing' });
             }
         }
 
@@ -1732,10 +1930,10 @@ app.post('/ingest-outgoing', async (req, res) => {
             hasAttachments: attachments.length > 0
         });
 
-        // ★★★ V5.3.3新增：查询被引用消息的Chatwoot ID ★★★
+        // ★★★ V5.3.5修复：使用综合查找函数（Redis + source_id） ★★★
         let in_reply_to = null;
         if (quotedMsg && quotedMsg.id && conversation_id) {
-            in_reply_to = await getMessageMapping(conversation_id, quotedMsg.id);
+            in_reply_to = await findCwMessageId(conversation_id, quotedMsg.id);
             if (in_reply_to) {
                 console.log(`[INGEST_OUT] Found native reply: wa=${quotedMsg.id.substring(0, 30)} -> cw=${in_reply_to}`);
             }
@@ -2047,6 +2245,12 @@ app.post('/ingest-outgoing', async (req, res) => {
             duration
         });
 
+        // ★★★ V5.3.11新增：标记消息已处理，并释放处理中锁 ★★★
+        if (redis && messageId) {
+            await redis.set(redisKey, '1', 'EX', 7 * 24 * 3600).catch(() => {});
+            await redis.del(processingKey).catch(() => {});
+        }
+
         // ★★★ V5.3新增：存储消息ID映射到Redis ★★★
         // 这样后续引用消息可以通过WhatsApp消息ID查找Chatwoot消息ID
         if (created?.id && messageId) {
@@ -2081,6 +2285,13 @@ app.post('/ingest-outgoing', async (req, res) => {
     } catch (e) {
         const errMsg = e?.response?.data?.error || e?.response?.data?.message || e?.message || String(e);
         const errData = e?.response?.data;
+
+        // ★★★ V5.3.11新增：错误时也释放处理中锁 ★★★
+        const messageId = req.body?.messageId;
+        if (redis && messageId) {
+            const processingKey = `wa:processing:outgoing:${messageId}`;
+            await redis.del(processingKey).catch(() => {});
+        }
 
         // 处理"已存在"错误
         if (/identifier.*already.*taken|already.*exists|duplicate/i.test(errMsg) ||
@@ -2701,9 +2912,9 @@ app.post('/sync-messages', async (req, res) => {
         let failedCount = 0;
         let skippedCount = 0;
 
-        // ========== 关键改动：使用批量创建 ==========
+        // ========== V5.3.13修复：简化同步逻辑，依靠fallbackBatchCreate实时查找 ==========
         if (useBatchCreate && toSync.length > 0) {
-            logToCollector('[SYNC] Using batch create', {
+            logToCollector('[SYNC] Using batch create with realtime lookup', {
                 total: toSync.length,
                 batchSize
             });
@@ -2714,7 +2925,8 @@ app.post('/sync-messages', async (req, res) => {
             const preparedMessages = [];
 
             for (const waMsg of toSync) {
-                const prepared = await prepareMessageForBatch(waMsg, WA_BRIDGE_URL, WA_BRIDGE_TOKEN);
+                // ★★★ V5.3.13修复：不传conversation_id，不提前查找in_reply_to ★★★
+                const prepared = await prepareMessageForBatch(waMsg, WA_BRIDGE_URL, WA_BRIDGE_TOKEN, null);
                 if (prepared) {
                     preparedMessages.push(prepared);
                 }
@@ -2738,21 +2950,17 @@ app.post('/sync-messages', async (req, res) => {
                 });
 
                 try {
+                    // ★★★ V5.3.13修复：传入findCwMessageId函数，实时查找in_reply_to ★★★
                     const result = await cw.batchCreateMessages({
                         account_id: CHATWOOT_ACCOUNT_ID,
                         conversation_id,
-                        messages: batch
+                        messages: batch,
+                        findCwMessageIdFn: findCwMessageId  // 实时查找函数
                     });
 
                     successCount += result.created || 0;
                     failedCount += result.failed || 0;
                     skippedCount += result.skipped || 0;
-
-                    if (result.created_ids) {
-                        result.created_ids.forEach(id => {
-                            syncResults.push({ id, success: true, batch: batchNum });
-                        });
-                    }
 
                     // ★★★ V5.3新增：存储消息ID映射到Redis ★★★
                     if (result.created_mappings?.length > 0) {
@@ -2818,7 +3026,7 @@ app.post('/sync-messages', async (req, res) => {
                 }
             }
 
-        } else {
+        } else if (toSync.length > 0) {
             // ========== 原有逻辑：逐条同步 ==========
             logToCollector('[SYNC] Using single create', { total: toSync.length });
 
@@ -3361,17 +3569,20 @@ app.post('/startup-sync/release/:conversation_id', (req, res) => {
 
 /**
  * 预处理消息用于批量创建
+ * V5.3.13修复：不提前查找in_reply_to，保存_quotedMsgWaId供创建时实时查找
  * @param {Object} waMsg - WhatsApp 消息
  * @param {string} waBridgeUrl - 桥接器 URL
  * @param {string} waBridgeToken - 桥接器 Token
+ * @param {number} conversation_id - Chatwoot会话ID（不再使用，保留参数兼容）
  * @returns {Object} 处理后的消息对象
  */
-async function prepareMessageForBatch(waMsg, waBridgeUrl, waBridgeToken) {
+async function prepareMessageForBatch(waMsg, waBridgeUrl, waBridgeToken, conversation_id = null) {
     const { id, fromMe, type, body, timestamp, media, quotedMsg } = waMsg;
 
-    // ★★★ V5.3.1修复：引用消息格式化（支持媒体消息） ★★★
+    // ★★★ V5.3.13修复：不提前查找in_reply_to，保存原始内容 ★★★
     let content = body || '';
     let quotedBody = '';
+    let quotedTextFallback = null;  // 文本格式引用的fallback
 
     if (quotedMsg) {
         // 根据消息类型生成引用内容预览
@@ -3391,17 +3602,17 @@ async function prepareMessageForBatch(waMsg, waBridgeUrl, waBridgeToken) {
             quotedBody = typeLabels[quotedMsg.type] || `[${quotedMsg.type || '媒体'}消息]`;
         }
 
+        // ★★★ V5.3.13修复：生成文本格式引用作为fallback ★★★
         const quotedSender = quotedMsg.fromMe ? '我' : '对方';
         const quotedPreview = quotedBody.length > 50
             ? quotedBody.substring(0, 50) + '...'
             : quotedBody;
-        // ★★★ V5.3.2优化：简洁单行引用格式 ★★★
         const quotedText = quotedPreview.replace(/\n/g, ' ').substring(0, 40);
-        content = `▎💬 ${quotedSender}：${quotedText}\n\n${body || ''}`;
+        quotedTextFallback = `▎💬 ${quotedSender}：${quotedText}\n\n${body || ''}`;
     }
 
     const prepared = {
-        content: content,
+        content: content,  // ★★★ 保存原始内容，不加文本格式引用 ★★★
         message_type: fromMe ? 1 : 0,  // 1=outgoing, 0=incoming
         timestamp: timestamp,
         source_id: id,
@@ -3419,7 +3630,11 @@ async function prepareMessageForBatch(waMsg, waBridgeUrl, waBridgeToken) {
                 fromMe: quotedMsg.fromMe,
                 type: quotedMsg.type
             } : null
-        }
+        },
+        // ★★★ V5.3.13修复：保存被引用消息的WA ID，供创建时实时查找 ★★★
+        _quotedMsgWaId: quotedMsg?.id || null,
+        _quotedTextFallback: quotedTextFallback,  // 文本格式引用fallback
+        _in_reply_to: null  // 不再提前查找，由fallbackBatchCreate实时查找
     };
 
     // 处理媒体附件
@@ -3745,6 +3960,111 @@ app.post('/api/whatsapp/revoke', async (req, res) => {
     }
 });
 
+// ★★★ V5.3.13新增: 供Chatwoot同步删除调用的API ★★★
+// Chatwoot删除消息时会先调用这个API，成功后才执行本地删除
+app.post('/delete-wa-message', async (req, res) => {
+    try {
+        const { conversation_id, cw_message_id, source_id, everyone = true } = req.body;
+
+        logToCollector('[DELETE_WA_MSG] Request', {
+            conversation_id,
+            cw_message_id,
+            source_id: source_id?.substring(0, 40) || 'none',
+            everyone
+        });
+
+        // 1. 查找WhatsApp消息ID
+        let waMessageId = source_id;
+
+        // 如果没有source_id，从Redis映射查找
+        if (!waMessageId && cw_message_id && conversation_id && redis) {
+            try {
+                const reverseKey = `cw:msgmap:rev:${conversation_id}:${cw_message_id}`;
+                waMessageId = await redis.get(reverseKey);
+                if (waMessageId) {
+                    logToCollector('[DELETE_WA_MSG] Found WA ID from mapping', {
+                        cw_message_id,
+                        wa_message_id: waMessageId.substring(0, 40)
+                    });
+                }
+            } catch (e) {
+                logToCollector('[DELETE_WA_MSG] Redis lookup failed', { error: e.message });
+            }
+        }
+
+        // 如果找不到WhatsApp消息ID，无法删除
+        if (!waMessageId) {
+            logToCollector('[DELETE_WA_MSG] No WA message ID found', {
+                cw_message_id,
+                source_id: source_id || 'none'
+            });
+            return res.json({
+                ok: false,
+                error: 'no_wa_message_id',
+                message: 'Cannot find WhatsApp message ID'
+            });
+        }
+
+        // 2. 确定session
+        let sessionId = WA_DEFAULT_SESSION.split(',')[0]?.trim();
+
+        if (conversation_id && redis) {
+            const keys = [`conv:${conversation_id}`, `cw:mapping:conv:${conversation_id}`];
+            for (const key of keys) {
+                try {
+                    const mapping = await redis.get(key);
+                    if (mapping) {
+                        const parsed = JSON.parse(mapping);
+                        if (parsed.sessionId) {
+                            sessionId = parsed.sessionId;
+                            break;
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+
+        logToCollector('[DELETE_WA_MSG] Calling Bridge', {
+            session: sessionId,
+            wa_message_id: waMessageId.substring(0, 40),
+            everyone
+        });
+
+        // 3. 调用Bridge删除
+        const headers = {};
+        if (WA_BRIDGE_TOKEN) headers['x-api-token'] = WA_BRIDGE_TOKEN;
+
+        const result = await postWithRetry(
+            `${WA_BRIDGE_URL}/delete-message/${sessionId}`,
+            { messageId: waMessageId, everyone },
+            headers,
+            2,
+            30000
+        ).catch(e => ({ ok: false, error: e.message }));
+
+        logToCollector('[DELETE_WA_MSG] Bridge result', {
+            ok: result?.ok,
+            error: result?.error || 'none',
+            wa_message_id: waMessageId.substring(0, 40)
+        });
+
+        if (result?.ok) {
+            res.json({ ok: true, deleted: true, wa_message_id: waMessageId });
+        } else {
+            res.json({
+                ok: false,
+                error: result?.error || 'WhatsApp deletion failed',
+                wa_message_id: waMessageId
+            });
+        }
+
+    } catch (error) {
+        const errorMsg = error?.message || 'unknown error';
+        logToCollector('[DELETE_WA_MSG] Error', { error: errorMsg });
+        res.status(500).json({ ok: false, error: errorMsg });
+    }
+});
+
 // ★★★ V5 新增: 获取消息的 WhatsApp ID ★★★
 // 供前端在没有 source_id 时查询
 app.get('/api/whatsapp/message-id/:conversationId/:messageId', async (req, res) => {
@@ -3838,81 +4158,126 @@ app.post('/chatwoot/webhook', async (req, res) => {
             return SKIP('unhandled event', {event});
         }
 
-        // ★★★ V5新增：处理 message_updated 事件（可能是删除操作）★★★
-        // Chatwoot 删除消息时发送的是扁平结构，message 为 null
-        if (event === 'message_updated' && !message) {
-            const sourceId = body.source_id;
-            const content = body.content;
-            const isDeleted = content === null || content === '' || content === undefined;
-            const messageType = body.message_type;
-            const isOutgoingUpdate = messageType === 'outgoing' || messageType === 1;
+        // ★★★ V5.3.13重写：处理 message_updated 事件（删除操作）★★★
+        if (event === 'message_updated') {
+            // Chatwoot删除消息时，content_attributes会包含deleted: true
+            const contentAttributes = body.content_attributes || body.data?.message?.content_attributes || {};
+            const isDeleted = contentAttributes.deleted === true;
 
-            logToCollector('[CW_WEBHOOK] message_updated (flat structure)', {
-                source_id: sourceId?.substring(0, 40),
-                content_length: content?.length,
+            // 获取消息信息
+            const cwMessageId = body.id || body.data?.message?.id;
+            const sourceId = body.source_id || body.data?.message?.source_id;
+            const messageType = body.message_type || body.data?.message?.message_type;
+            const convId = body.conversation?.id || body.data?.conversation?.id || body.conversation_id;
+            const isOutgoing = messageType === 1 || messageType === 'outgoing';
+
+            logToCollector('[CW_WEBHOOK] message_updated', {
+                cw_message_id: cwMessageId,
+                source_id: sourceId?.substring(0, 40) || 'none',
                 isDeleted,
-                isOutgoing: isOutgoingUpdate,
-                message_type: messageType
+                isOutgoing,
+                conversation_id: convId,
+                content_attributes: JSON.stringify(contentAttributes).substring(0, 100)
             });
 
-            // 只处理有 source_id 的出站消息删除
-            if (sourceId && isDeleted && isOutgoingUpdate) {
-                logToCollector('[CW_WEBHOOK] Message deleted, attempting WA revoke', {
-                    source_id: sourceId.substring(0, 40),
-                    conversation_id: body.conversation?.id
-                });
+            // 只处理删除操作 + 出站消息
+            if (!isDeleted) {
+                return SKIP('message_updated but not deleted', { isDeleted, hasDeleteAttr: !!contentAttributes.deleted });
+            }
 
-                // 尝试撤回 WhatsApp 消息
+            if (!isOutgoing) {
+                return SKIP('message_updated delete but not outgoing', { messageType });
+            }
+
+            // ★★★ 核心：查找WhatsApp消息ID ★★★
+            let waMessageId = sourceId; // 优先用source_id
+
+            // 如果没有source_id，从Redis映射中查找
+            if (!waMessageId && cwMessageId && convId && redis) {
                 try {
-                    // 确定 session
-                    let sessionId = WA_DEFAULT_SESSION.split(',')[0]?.trim();
-                    const convId = body.conversation?.id;
-
-                    if (convId && redis) {
-                        const keys = [`conv:${convId}`, `cw:mapping:conv:${convId}`];
-                        for (const key of keys) {
-                            try {
-                                const mapping = await redis.get(key);
-                                if (mapping) {
-                                    const parsed = JSON.parse(mapping);
-                                    if (parsed.sessionId) {
-                                        sessionId = parsed.sessionId;
-                                        break;
-                                    }
-                                }
-                            } catch (e) {}
-                        }
+                    const reverseKey = `cw:msgmap:rev:${convId}:${cwMessageId}`;
+                    waMessageId = await redis.get(reverseKey);
+                    if (waMessageId) {
+                        logToCollector('[CW_WEBHOOK] Found WA message ID from mapping', {
+                            cw_message_id: cwMessageId,
+                            wa_message_id: waMessageId.substring(0, 40)
+                        });
                     }
-
-                    // 调用 Bridge 删除 API
-                    const headers = {};
-                    if (WA_BRIDGE_TOKEN) headers['x-api-token'] = WA_BRIDGE_TOKEN;
-
-                    const result = await postWithRetry(
-                        `${WA_BRIDGE_URL}/delete-message/${sessionId}`,
-                        { messageId: sourceId, everyone: true },
-                        headers, 2, 30000
-                    ).catch(e => ({ ok: false, error: e.message }));
-
-                    logToCollector('[CW_WEBHOOK] WA revoke result', {
-                        ok: result?.ok,
-                        source_id: sourceId.substring(0, 40),
-                        session: sessionId
-                    });
-
-                    return res.json({ ok: true, action: 'revoke_attempted', success: result?.ok });
                 } catch (e) {
-                    logToCollector('[CW_WEBHOOK] WA revoke error', { error: e.message });
-                    return res.json({ ok: true, action: 'revoke_failed', error: e.message });
+                    logToCollector('[CW_WEBHOOK] Redis lookup failed', { error: e.message });
                 }
             }
 
-            // 不是删除操作，跳过
-            return SKIP('message_updated but not deleted or not outgoing', {
-                hasSourceId: !!sourceId,
-                isDeleted,
-                isOutgoing: isOutgoingUpdate
+            // 如果找不到WhatsApp消息ID，无法删除
+            if (!waMessageId) {
+                logToCollector('[CW_WEBHOOK] Cannot delete: no WA message ID found', {
+                    cw_message_id: cwMessageId,
+                    source_id: sourceId || 'none',
+                    conversation_id: convId
+                });
+                return res.json({
+                    ok: false,
+                    error: 'no_wa_message_id',
+                    message: 'Cannot find WhatsApp message ID for deletion'
+                });
+            }
+
+            // 查找session
+            let sessionId = WA_DEFAULT_SESSION.split(',')[0]?.trim();
+            if (convId && redis) {
+                const keys = [`conv:${convId}`, `cw:mapping:conv:${convId}`];
+                for (const key of keys) {
+                    try {
+                        const mapping = await redis.get(key);
+                        if (mapping) {
+                            const parsed = JSON.parse(mapping);
+                            if (parsed.sessionId) {
+                                sessionId = parsed.sessionId;
+                                break;
+                            }
+                        }
+                    } catch (e) {}
+                }
+            }
+
+            logToCollector('[CW_WEBHOOK] Attempting WA message delete', {
+                wa_message_id: waMessageId.substring(0, 40),
+                session: sessionId,
+                conversation_id: convId
             });
+
+            // 调用Bridge删除API
+            try {
+                const headers = {};
+                if (WA_BRIDGE_TOKEN) headers['x-api-token'] = WA_BRIDGE_TOKEN;
+
+                const result = await postWithRetry(
+                    `${WA_BRIDGE_URL}/delete-message/${sessionId}`,
+                    { messageId: waMessageId, everyone: true },
+                    headers, 2, 30000
+                ).catch(e => ({ ok: false, error: e.message }));
+
+                logToCollector('[CW_WEBHOOK] WA delete result', {
+                    ok: result?.ok,
+                    wa_message_id: waMessageId.substring(0, 40),
+                    session: sessionId,
+                    error: result?.error || 'none'
+                });
+
+                if (result?.ok) {
+                    return res.json({ ok: true, action: 'deleted', wa_message_id: waMessageId });
+                } else {
+                    return res.json({
+                        ok: false,
+                        action: 'delete_failed',
+                        error: result?.error,
+                        wa_message_id: waMessageId
+                    });
+                }
+            } catch (e) {
+                logToCollector('[CW_WEBHOOK] WA delete error', { error: e.message });
+                return res.json({ ok: false, action: 'delete_error', error: e.message });
+            }
         }
 
         if (!message || !conversation) return SKIP('no message/conversation', {
@@ -4231,13 +4596,26 @@ app.post('/chatwoot/webhook', async (req, res) => {
                 }
             }
 
+            // ★★★ V5.3.9新增：提取消息后缀用于精确查找 ★★★
+            let quotedMessageSuffix = null;
+            if (quotedMessageId) {
+                quotedMessageSuffix = extractMessageIdSuffix(quotedMessageId);
+                console.log(`[CW->WA] Quote suffix: ${quotedMessageSuffix}`);
+            }
+
+            // ★★★ V5.3.13说明：关于跨设备查找 ★★★
+            // 之前尝试在接收方设备上查找消息ID，这是错误的！
+            // sendMessage在哪个设备执行，就需要那个设备上的消息ID。
+            // 所以我们只需要传递suffix给send/reply，让它在发送方设备上查找。
+
             logToCollector('[CW->WA] SEND_TEXT', {
                 session: finalSession,
                 to: to || 'none',
                 to_lid: to_lid || 'none',
                 len: text.length,
                 message_id,
-                hasQuote: !!quotedMessageId
+                hasQuote: !!quotedMessageId,
+                quoteSuffix: quotedMessageSuffix || 'none'
             });
 
             // ★★★ 修复：改为异步模式，先返回成功给 Chatwoot ★★★
@@ -4266,12 +4644,15 @@ app.post('/chatwoot/webhook', async (req, res) => {
                             chatId = to_lid.includes('@') ? to_lid : `${to_lid}@lid`;
                         }
 
+                        // ★★★ V5.3.13修复：直接传递原始ID和suffix ★★★
+                        // send/reply会在发送方设备上用suffix查找正确的消息ID
                         result = await postWithRetry(
                             `${WA_BRIDGE_URL}/send/reply/${finalSession}`,
                             {
                                 chatIdOrPhone: chatId,
                                 text,
-                                quotedMessageId
+                                quotedMessageId,  // 原始ID（作为备用）
+                                quotedMessageSuffix  // suffix用于精确查找
                             },
                             headers,
                             3,
@@ -4285,6 +4666,7 @@ app.post('/chatwoot/webhook', async (req, res) => {
                             success,
                             msgId: result?.msgId,
                             quotedMessageId: quotedMessageId?.substring(0, 30),
+                            quoteSuffix: quotedMessageSuffix,
                             message_id,
                             duration: `${duration}ms`
                         });
