@@ -23,6 +23,15 @@ try {
     console.log('[BOOT] ContactSync module not found, sync disabled');
 }
 
+// ★★★ V5.3.12 新增：未读消息同步模块 ★★★
+let unreadSync = null;
+try {
+    unreadSync = require('./unread-sync');
+    console.log('[BOOT] UnreadSync module loaded');
+} catch (e) {
+    console.log('[BOOT] UnreadSync module not found, sync disabled');
+}
+
 // SESSIONS 现在由 SessionManager 动态管理
 // 保留解析逻辑用于后备
 const SESSIONS_ENV = (process.env.SESSIONS || '')
@@ -1609,6 +1618,11 @@ async function initSessionViaAdsPower(config) {
         // ★★★ V3.2 新增：初始化联系人同步定时任务 ★★★
         if (contactSync) {
             contactSync.initialize(sessionManager);
+        }
+
+        // ★★★ V5.3.12 新增：初始化未读消息同步定时任务 ★★★
+        if (unreadSync) {
+            unreadSync.initialize(sessionManager, sessions);
         }
 
     } catch (e) {
@@ -3860,6 +3874,49 @@ app.post('/mark-read/:sessionId/:chatId', async (req, res) => {
     } catch (e) {
         res.status(500).json({ ok:false, error: e?.message || String(e) });
     }
+});
+
+// ★★★ V5.3.12 新增：未读消息同步 API ★★★
+
+/**
+ * API: 手动触发未读消息扫描
+ * GET /trigger-unread-sync - 扫描所有 session
+ * GET /trigger-unread-sync/:sessionId - 扫描指定 session
+ */
+app.get('/trigger-unread-sync/:sessionId?', async (req, res) => {
+    try {
+        if (!unreadSync) {
+            return res.status(400).json({ ok: false, error: 'UnreadSync module not loaded' });
+        }
+
+        const { sessionId } = req.params;
+        console.log(`[API] Triggering unread sync${sessionId ? ` for ${sessionId}` : ' (all sessions)'}`);
+
+        const result = await unreadSync.triggerScan(sessionId || null);
+        res.json({ ok: true, result });
+
+    } catch (e) {
+        console.error('[API] trigger-unread-sync error:', e?.message);
+        res.status(500).json({ ok: false, error: e?.message });
+    }
+});
+
+/**
+ * API: 获取未读同步模块状态
+ */
+app.get('/unread-sync-status', (req, res) => {
+    if (!unreadSync) {
+        return res.json({ ok: false, enabled: false, error: 'Module not loaded' });
+    }
+
+    res.json({
+        ok: true,
+        enabled: unreadSync.SYNC_ENABLED,
+        intervalMin: unreadSync.SYNC_INTERVAL_MIN,
+        thresholdMin: unreadSync.SYNC_THRESHOLD_MIN,
+        maxMessages: unreadSync.SYNC_MAX_MESSAGES,
+        fallbackHours: unreadSync.SYNC_FALLBACK_HOURS
+    });
 });
 
 const PORT = process.env.BRIDGE_PORT;

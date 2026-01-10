@@ -1,3 +1,15 @@
+# curl -X POST http://192.168.11.45:7001/delete-wa-message
+#  -H "Content-Type: application/json"
+#  -H "x-api-token: your-generated-token"
+#  -d '{"conversation_id": 1095, "cw_message_id": 51191, "source_id": "true_27153387237439@lid_3EB0EAD506FF5"}'
+POST http://192.168.11.45:7001/delete-wa-message
+x-api-token: your-generated-token
+Content-Type: application/json
+
+{"conversation_id": 1095, "cw_message_id": 51191, "source_id": "true_27153387237439@lid_3EB0EAD506FF5"}
+
+###
+
 
 
 [CW_WEBHOOK] TAP {

@@ -671,10 +671,6 @@ async function syncSessionContacts(sessionId) {
  * 同步所有 Session 的联系人
  */
 async function syncAllSessions() {
-    if (!sessionManager) {
-        console.warn('[ContactSync] SessionManager not available');
-        return;
-    }
 
     // ★ 记录总开始时间
     const totalStartTime = new Date();
