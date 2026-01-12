@@ -1,25 +1,29 @@
 /**
- * unread-sync.js - 未读消息定时同步模块 V1.0
+ * unread-sync.js - 消息同步守护模块 V2.0
  *
- * 功能：
+ * 功能一：未读消息同步
  * - 每30分钟扫描所有 session 的 WA 未读消息
- * - 识别"超过30分钟未读"的异常聊天
- * - 智能增量同步：从 Chatwoot 最后一条消息之后开始同步
- * - 同步成功后自动标记 WA 已读
+ * - 筛选"超过30分钟未读"的聊天
+ * - 增量同步到 Chatwoot，成功后标记已读
  *
- * 核心逻辑：
- * 1. 扫描 WA 未读消息，筛选超过阈值的聊天
- * 2. 获取 Chatwoot 该联系人最后一条消息的 wa_message_id
- * 3. 在 WA 端定位该消息，获取其后的所有新消息
- * 4. 增量同步这些新消息到 Chatwoot
- * 5. 同步成功 → 标记 WA 已读；同步失败 → 保持未读
+ * 功能二：未回复消息同步（V2.0 新增）
+ * - 每30分钟扫描过去30分钟～24小时内有消息的聊天
+ * - 检查最后一条消息是否是客户发的（fromMe=false）
+ * - 如果客服未回复 → 增量同步确保消息不丢失
+ *
+ * 核心原则：
+ * - 以 WA 网页端时间为准（chat.lastMessage.timestamp）
+ * - 增量同步：从 Chatwoot 最后消息之后开始
+ * - 所有同步的消息都保存映射（钢印原则）
  *
  * 环境变量配置：
  * - UNREAD_SYNC_ENABLED: 是否启用 (1/0)，默认 1
  * - UNREAD_SYNC_INTERVAL_MIN: 扫描间隔（分钟），默认 30
  * - UNREAD_SYNC_THRESHOLD_MIN: 未读阈值（分钟），默认 30
- * - UNREAD_SYNC_MAX_MESSAGES: 单次同步最大消息数，默认 200
- * - UNREAD_SYNC_FALLBACK_HOURS: 无历史记录时同步的小时数，默认 12
+ * - UNREPLIED_SYNC_ENABLED: 未回复同步是否启用 (1/0)，默认 1
+ * - UNREPLIED_SYNC_MAX_HOURS: 未回复检查的最大小时数，默认 24
+ * - SYNC_MAX_MESSAGES: 单次同步最大消息数，默认 200
+ * - SYNC_FALLBACK_HOURS: 无历史记录时同步的小时数，默认 12
  */
 
 const axios = require('axios');
@@ -27,11 +31,15 @@ const axios = require('axios');
 // ============================================================
 // 配置
 // ============================================================
-const SYNC_ENABLED = process.env.UNREAD_SYNC_ENABLED !== '0';  // 默认启用
+const SYNC_ENABLED = process.env.UNREAD_SYNC_ENABLED !== '0';
 const SYNC_INTERVAL_MIN = parseInt(process.env.UNREAD_SYNC_INTERVAL_MIN || '30');
-const SYNC_THRESHOLD_MIN = parseInt(process.env.UNREAD_SYNC_THRESHOLD_MIN || '0');
-const SYNC_MAX_MESSAGES = parseInt(process.env.UNREAD_SYNC_MAX_MESSAGES || '200');
-const SYNC_FALLBACK_HOURS = parseInt(process.env.UNREAD_SYNC_FALLBACK_HOURS || '12');
+const SYNC_THRESHOLD_MIN = parseInt(process.env.UNREAD_SYNC_THRESHOLD_MIN || '30');
+const SYNC_MAX_MESSAGES = parseInt(process.env.SYNC_MAX_MESSAGES || '200');
+const SYNC_FALLBACK_HOURS = parseInt(process.env.SYNC_FALLBACK_HOURS || '12');
+
+// V2.0 新增：未回复同步配置
+const UNREPLIED_SYNC_ENABLED = process.env.UNREPLIED_SYNC_ENABLED !== '0';
+const UNREPLIED_SYNC_MAX_HOURS = parseInt(process.env.UNREPLIED_SYNC_MAX_HOURS || '24');
 
 // Collector 配置
 const COLLECTOR_BASE = process.env.COLLECTOR_BASE || `http://127.0.0.1:${process.env.COLLECTOR_PORT || 7001}`;
@@ -41,16 +49,13 @@ const COLLECTOR_TOKEN = process.env.COLLECTOR_INGEST_TOKEN || process.env.API_TO
 // 依赖注入
 // ============================================================
 let sessionManager = null;
-let sessions = null;  // whatsapp-manager 的 sessions 对象
+let sessions = null;
 let scheduledTimer = null;
 
 // ============================================================
 // 工具函数
 // ============================================================
 
-/**
- * 格式化北京时间
- */
 function formatBeijingTime(date = new Date()) {
     const beijingOffset = 8 * 60;
     const localOffset = date.getTimezoneOffset();
@@ -67,9 +72,6 @@ function formatBeijingTime(date = new Date()) {
     return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
-/**
- * 格式化持续时间
- */
 function formatDuration(ms) {
     const totalSeconds = Math.floor(ms / 1000);
     const hours = Math.floor(totalSeconds / 3600);
@@ -81,21 +83,33 @@ function formatDuration(ms) {
     return `${seconds}s`;
 }
 
-/**
- * 生成请求头
- */
 function getHeaders() {
     return COLLECTOR_TOKEN ? { 'x-api-token': COLLECTOR_TOKEN } : {};
 }
 
+/**
+ * 从 chatId 提取 phone 和 phone_lid
+ */
+function extractPhoneFromChatId(chatId) {
+    let phone = '';
+    let phone_lid = '';
+
+    if (/@c\.us$/i.test(chatId)) {
+        phone = chatId.replace(/@.*/, '').replace(/\D/g, '');
+    } else if (/@lid$/i.test(chatId)) {
+        phone_lid = chatId.replace(/@.*/, '').replace(/\D/g, '');
+    }
+
+    return { phone, phone_lid };
+}
+
 // ============================================================
-// 核心功能函数
+// 功能一：未读消息同步
 // ============================================================
 
 /**
  * 获取单个 session 的未读聊天列表
- * @param {string} sessionId
- * @returns {Array} 超过阈值的未读聊天列表
+ * 筛选条件：unreadCount > 0 且超过阈值时间
  */
 async function getUnreadChats(sessionId) {
     const session = sessionManager?.getSession(sessionId);
@@ -112,8 +126,9 @@ async function getUnreadChats(sessionId) {
         const unreadChats = [];
 
         for (const chat of chats) {
-            // 跳过群聊和广播
             const chatId = chat.id?._serialized || '';
+
+            // 跳过群聊和广播
             if (chat.isGroup || /@g\.us$/i.test(chatId) || /broadcast/i.test(chatId)) {
                 continue;
             }
@@ -122,22 +137,15 @@ async function getUnreadChats(sessionId) {
             const unreadCount = chat.unreadCount || 0;
             if (unreadCount <= 0) continue;
 
-            // 获取最后一条消息时间
+            // 获取最后一条消息时间（以 WA 时间为准）
             const lastMsgTimestamp = chat.lastMessage?.timestamp || chat.timestamp || 0;
-            const lastMsgTime = lastMsgTimestamp * 1000;  // 转毫秒
+            const lastMsgTime = lastMsgTimestamp * 1000;
 
             // 检查是否超过阈值
             const elapsed = now - lastMsgTime;
-            if (elapsed < thresholdMs) continue;  // 未超过阈值，跳过
+            if (elapsed < thresholdMs) continue;
 
-            // 提取联系人信息
-            let phone = '';
-            let phone_lid = '';
-            if (/@c\.us$/i.test(chatId)) {
-                phone = chatId.replace(/@.*/, '').replace(/\D/g, '');
-            } else if (/@lid$/i.test(chatId)) {
-                phone_lid = chatId.replace(/@.*/, '').replace(/\D/g, '');
-            }
+            const { phone, phone_lid } = extractPhoneFromChatId(chatId);
 
             unreadChats.push({
                 sessionId,
@@ -148,7 +156,9 @@ async function getUnreadChats(sessionId) {
                 contactName: chat.name || chat.pushname || phone || phone_lid || 'Unknown',
                 unreadCount,
                 lastMsgTimestamp,
-                elapsedMinutes: Math.floor(elapsed / 60000)
+                lastMsgFromMe: chat.lastMessage?.fromMe || false,
+                elapsedMinutes: Math.floor(elapsed / 60000),
+                syncType: 'unread'
             });
         }
 
@@ -160,12 +170,98 @@ async function getUnreadChats(sessionId) {
     }
 }
 
+// ============================================================
+// 功能二：未回复消息同步（V2.0 新增）
+// ============================================================
+
+/**
+ * 获取单个 session 的未回复聊天列表
+ * 筛选条件：
+ * - 最后消息时间在 [30分钟前, 24小时前] 区间
+ * - 最后一条消息是客户发的（fromMe = false）
+ * - 排除已经在未读列表中的聊天（避免重复处理）
+ */
+async function getUnrepliedChats(sessionId, excludeChatIds = new Set()) {
+    const session = sessionManager?.getSession(sessionId);
+    if (!session || session.sessionStatus !== 'ready' || !session.client) {
+        return [];
+    }
+
+    const sessionName = sessionManager.getSessionName(sessionId) || sessionId;
+    const now = Date.now();
+    const minTimeMs = SYNC_THRESHOLD_MIN * 60 * 1000;  // 30分钟
+    const maxTimeMs = UNREPLIED_SYNC_MAX_HOURS * 60 * 60 * 1000;  // 24小时
+
+    try {
+        const chats = await session.client.getChats();
+        const unrepliedChats = [];
+
+        for (const chat of chats) {
+            const chatId = chat.id?._serialized || '';
+
+            // 跳过群聊和广播
+            if (chat.isGroup || /@g\.us$/i.test(chatId) || /broadcast/i.test(chatId)) {
+                continue;
+            }
+
+            // 跳过已在未读列表中的
+            if (excludeChatIds.has(chatId)) {
+                continue;
+            }
+
+            // 获取最后一条消息信息
+            const lastMsg = chat.lastMessage;
+            if (!lastMsg) continue;
+
+            const lastMsgTimestamp = lastMsg.timestamp || chat.timestamp || 0;
+            const lastMsgTime = lastMsgTimestamp * 1000;
+            const elapsed = now - lastMsgTime;
+
+            // 检查时间范围：30分钟前 ~ 24小时前
+            if (elapsed < minTimeMs || elapsed > maxTimeMs) {
+                continue;
+            }
+
+            // 关键检查：最后一条消息是否是客户发的（fromMe = false）
+            const lastMsgFromMe = lastMsg.fromMe || false;
+            if (lastMsgFromMe) {
+                // 最后一条是客服发的，说明已回复，跳过
+                continue;
+            }
+
+            // 客户消息垫底，需要检查同步
+            const { phone, phone_lid } = extractPhoneFromChatId(chatId);
+
+            unrepliedChats.push({
+                sessionId,
+                sessionName,
+                chatId,
+                phone,
+                phone_lid,
+                contactName: chat.name || chat.pushname || phone || phone_lid || 'Unknown',
+                unreadCount: chat.unreadCount || 0,
+                lastMsgTimestamp,
+                lastMsgFromMe: false,
+                lastMsgBody: (lastMsg.body || '').substring(0, 50),
+                elapsedMinutes: Math.floor(elapsed / 60000),
+                syncType: 'unreplied'
+            });
+        }
+
+        return unrepliedChats;
+
+    } catch (e) {
+        console.error(`[UnreadSync] Error getting unreplied chats for ${sessionId}:`, e.message);
+        return [];
+    }
+}
+
+// ============================================================
+// 通用同步逻辑
+// ============================================================
+
 /**
  * 获取 Chatwoot 会话的最后一条消息信息
- * @param {string} sessionId
- * @param {string} phone
- * @param {string} phone_lid
- * @returns {Object|null} { conversation_id, wa_message_id, cw_message_id, timestamp }
  */
 async function getChatwootLastMessage(sessionId, phone, phone_lid) {
     try {
@@ -190,11 +286,6 @@ async function getChatwootLastMessage(sessionId, phone, phone_lid) {
 
 /**
  * 从 WA 获取指定消息之后的所有消息
- * @param {string} sessionId
- * @param {string} chatId
- * @param {string} afterMessageId - Chatwoot 最后一条消息的 WA ID
- * @param {number} afterTimestamp - 如果没有 messageId，使用时间戳
- * @returns {Array} 新消息列表
  */
 async function fetchMessagesAfter(sessionId, chatId, afterMessageId, afterTimestamp) {
     const session = sessionManager?.getSession(sessionId);
@@ -206,34 +297,31 @@ async function fetchMessagesAfter(sessionId, chatId, afterMessageId, afterTimest
         const chat = await session.client.getChatById(chatId);
         if (!chat) return [];
 
-        // 获取最近的消息（最多 SYNC_MAX_MESSAGES 条）
         const messages = await chat.fetchMessages({ limit: SYNC_MAX_MESSAGES });
 
-        // 按时间戳升序排列（从旧到新）
+        // 按时间戳升序排列
         messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
-        // 找到定位点
         let startIndex = 0;
 
+        // 方法1：通过消息ID定位
         if (afterMessageId) {
-            // 方法1：通过消息ID定位
             const foundIndex = messages.findIndex(m => {
                 const msgId = m.id?._serialized || '';
-                // 完全匹配
                 if (msgId === afterMessageId) return true;
-                // 后缀匹配（同一消息在不同端ID不同，但后缀相同）
+                // 后缀匹配
                 const msgSuffix = msgId.split('_').pop();
                 const targetSuffix = afterMessageId.split('_').pop();
                 return msgSuffix && targetSuffix && msgSuffix === targetSuffix;
             });
 
             if (foundIndex >= 0) {
-                startIndex = foundIndex + 1;  // 从该消息之后开始
+                startIndex = foundIndex + 1;
                 console.log(`[UnreadSync] Located by messageId at index ${foundIndex}`);
             }
         }
 
-        // 方法2：如果消息ID找不到，使用时间戳定位
+        // 方法2：通过时间戳定位
         if (startIndex === 0 && afterTimestamp) {
             const foundIndex = messages.findIndex(m => (m.timestamp || 0) > afterTimestamp);
             if (foundIndex >= 0) {
@@ -242,7 +330,6 @@ async function fetchMessagesAfter(sessionId, chatId, afterMessageId, afterTimest
             }
         }
 
-        // 提取新消息
         const newMessages = messages.slice(startIndex);
         console.log(`[UnreadSync] Found ${newMessages.length} new messages after position ${startIndex}`);
 
@@ -256,9 +343,6 @@ async function fetchMessagesAfter(sessionId, chatId, afterMessageId, afterTimest
 
 /**
  * 将消息同步到 Chatwoot
- * @param {Object} chatInfo - 聊天信息
- * @param {Array} messages - 要同步的消息列表
- * @returns {Object} { success, synced, failed }
  */
 async function syncMessagesToChatwoot(chatInfo, messages) {
     if (!messages || messages.length === 0) {
@@ -268,7 +352,6 @@ async function syncMessagesToChatwoot(chatInfo, messages) {
     const { sessionId, sessionName, chatId, phone, phone_lid, contactName } = chatInfo;
 
     try {
-        // 准备消息数据
         const preparedMessages = messages.map(msg => {
             const msgId = msg.id?._serialized || '';
             return {
@@ -278,7 +361,6 @@ async function syncMessagesToChatwoot(chatInfo, messages) {
                 timestamp: msg.timestamp || Math.floor(Date.now() / 1000),
                 type: msg.type || 'chat',
                 hasMedia: !!msg.hasMedia,
-                // 引用消息
                 quotedMsg: msg.hasQuotedMsg ? {
                     id: msg._data?.quotedStanzaID || '',
                     body: msg._data?.quotedMsg?.body || '',
@@ -287,7 +369,6 @@ async function syncMessagesToChatwoot(chatInfo, messages) {
             };
         });
 
-        // 调用 Collector 的增量同步接口
         const resp = await axios.post(
             `${COLLECTOR_BASE}/sync-incremental`,
             {
@@ -301,7 +382,7 @@ async function syncMessagesToChatwoot(chatInfo, messages) {
             },
             {
                 headers: getHeaders(),
-                timeout: 300000  // 5分钟超时
+                timeout: 300000
             }
         );
 
@@ -325,8 +406,6 @@ async function syncMessagesToChatwoot(chatInfo, messages) {
 
 /**
  * 标记聊天已读
- * @param {string} sessionId
- * @param {string} chatId
  */
 async function markChatAsRead(sessionId, chatId) {
     const session = sessionManager?.getSession(sessionId);
@@ -348,21 +427,20 @@ async function markChatAsRead(sessionId, chatId) {
 }
 
 /**
- * 同步单个未读聊天
- * @param {Object} chatInfo - 未读聊天信息
- * @returns {Object} 同步结果
+ * 同步单个聊天（通用逻辑，适用于未读和未回复）
  */
-async function syncUnreadChat(chatInfo) {
-    const { sessionId, sessionName, chatId, phone, phone_lid, contactName, unreadCount, elapsedMinutes } = chatInfo;
+async function syncChat(chatInfo) {
+    const { sessionId, sessionName, chatId, phone, phone_lid, contactName, syncType, elapsedMinutes } = chatInfo;
 
     console.log(`[UnreadSync] ----------------------------------------`);
-    console.log(`[UnreadSync] Processing: ${sessionName}>${contactName}`);
-    console.log(`[UnreadSync] ChatId: ${chatId}, Unread: ${unreadCount}, Elapsed: ${elapsedMinutes}min`);
+    console.log(`[UnreadSync] [${syncType.toUpperCase()}] Processing: ${sessionName}>${contactName}`);
+    console.log(`[UnreadSync] ChatId: ${chatId}, Elapsed: ${elapsedMinutes}min`);
 
     const result = {
         sessionId,
         chatId,
         contactName,
+        syncType,
         action: 'unknown',
         synced: 0,
         markedRead: false,
@@ -381,7 +459,7 @@ async function syncUnreadChat(chatInfo) {
             afterTimestamp = lastSynced.timestamp;
             console.log(`[UnreadSync] Last synced: wa_id=${afterMessageId?.substring(0, 30)}, ts=${afterTimestamp}`);
         } else {
-            // Chatwoot 没有该联系人的消息记录，使用回退时间
+            // Chatwoot 没有该联系人的消息记录
             afterTimestamp = Math.floor(Date.now() / 1000) - (SYNC_FALLBACK_HOURS * 3600);
             console.log(`[UnreadSync] No history in Chatwoot, fallback to ${SYNC_FALLBACK_HOURS}h ago`);
         }
@@ -392,8 +470,11 @@ async function syncUnreadChat(chatInfo) {
         if (newMessages.length === 0) {
             console.log(`[UnreadSync] No new messages to sync`);
             result.action = 'no_new_messages';
-            // 即使没有新消息，也标记已读
-            result.markedRead = await markChatAsRead(sessionId, chatId);
+
+            // 未读类型：即使没有新消息也标记已读
+            if (syncType === 'unread') {
+                result.markedRead = await markChatAsRead(sessionId, chatId);
+            }
             return result;
         }
 
@@ -408,63 +489,101 @@ async function syncUnreadChat(chatInfo) {
 
         if (syncResult.success && syncResult.synced > 0) {
             result.action = 'synced';
-            // 4. 同步成功，标记已读
-            result.markedRead = await markChatAsRead(sessionId, chatId);
+            // 未读类型：同步成功后标记已读
+            if (syncType === 'unread') {
+                result.markedRead = await markChatAsRead(sessionId, chatId);
+            }
             console.log(`[UnreadSync] Sync OK: ${syncResult.synced} messages, markedRead=${result.markedRead}`);
         } else if (syncResult.synced === 0 && (syncResult.skipped || 0) > 0) {
             result.action = 'all_skipped';
-            // 全部跳过（已存在），也标记已读
-            result.markedRead = await markChatAsRead(sessionId, chatId);
+            if (syncType === 'unread') {
+                result.markedRead = await markChatAsRead(sessionId, chatId);
+            }
             console.log(`[UnreadSync] All skipped (already synced), markedRead=${result.markedRead}`);
         } else {
             result.action = 'failed';
             result.error = syncResult.error;
-            // 同步失败，保持未读，下次重试
-            console.log(`[UnreadSync] Sync FAILED: ${syncResult.error}, keeping unread for retry`);
+            console.log(`[UnreadSync] Sync FAILED: ${syncResult.error}`);
         }
 
         return result;
 
     } catch (e) {
-        console.error(`[UnreadSync] syncUnreadChat error:`, e.message);
+        console.error(`[UnreadSync] syncChat error:`, e.message);
         result.action = 'error';
         result.error = e.message;
         return result;
     }
 }
 
-/**
- * 扫描单个 session 的未读消息
- */
-async function scanSessionUnread(sessionId) {
-    const sessionName = sessionManager?.getSessionName(sessionId) || sessionId;
+// ============================================================
+// 主扫描逻辑
+// ============================================================
 
+/**
+ * 扫描单个 session
+ */
+async function scanSession(sessionId) {
+    const sessionName = sessionManager?.getSessionName(sessionId) || sessionId;
     console.log(`[UnreadSync] Scanning session: ${sessionName} (${sessionId})`);
 
-    const unreadChats = await getUnreadChats(sessionId);
+    const results = {
+        sessionId,
+        sessionName,
+        unread: { processed: 0, synced: 0, failed: 0 },
+        unreplied: { processed: 0, synced: 0, failed: 0 },
+        details: []
+    };
 
-    if (unreadChats.length === 0) {
-        console.log(`[UnreadSync] [${sessionName}] No unread chats exceeding threshold`);
-        return { sessionId, sessionName, processed: 0, results: [] };
+    // 1. 获取未读聊天
+    const unreadChats = await getUnreadChats(sessionId);
+    const unreadChatIds = new Set(unreadChats.map(c => c.chatId));
+
+    console.log(`[UnreadSync] [${sessionName}] Unread chats: ${unreadChats.length}`);
+
+    // 2. 获取未回复聊天（排除未读的，避免重复）
+    let unrepliedChats = [];
+    if (UNREPLIED_SYNC_ENABLED) {
+        unrepliedChats = await getUnrepliedChats(sessionId, unreadChatIds);
+        console.log(`[UnreadSync] [${sessionName}] Unreplied chats: ${unrepliedChats.length}`);
     }
 
-    console.log(`[UnreadSync] [${sessionName}] Found ${unreadChats.length} unread chats exceeding ${SYNC_THRESHOLD_MIN}min`);
+    // 3. 合并处理
+    const allChats = [...unreadChats, ...unrepliedChats];
 
-    const results = [];
+    if (allChats.length === 0) {
+        console.log(`[UnreadSync] [${sessionName}] No chats to process`);
+        return results;
+    }
 
-    for (const chat of unreadChats) {
-        const result = await syncUnreadChat(chat);
-        results.push(result);
+    // 4. 逐个同步
+    for (const chat of allChats) {
+        const result = await syncChat(chat);
+        results.details.push(result);
+
+        if (chat.syncType === 'unread') {
+            results.unread.processed++;
+            results.unread.synced += result.synced || 0;
+            if (result.action === 'failed' || result.action === 'error') {
+                results.unread.failed++;
+            }
+        } else {
+            results.unreplied.processed++;
+            results.unreplied.synced += result.synced || 0;
+            if (result.action === 'failed' || result.action === 'error') {
+                results.unreplied.failed++;
+            }
+        }
 
         // 每个聊天之间稍微延迟
         await new Promise(r => setTimeout(r, 500));
     }
 
-    return { sessionId, sessionName, processed: unreadChats.length, results };
+    return results;
 }
 
 /**
- * 扫描所有 session 的未读消息
+ * 扫描所有 session
  */
 async function scanAllSessions() {
     if (!sessionManager) {
@@ -476,9 +595,10 @@ async function scanAllSessions() {
     const startTimeStr = formatBeijingTime(new Date(startTime));
 
     console.log('[UnreadSync] ========================================');
-    console.log('[UnreadSync] ★★★ 未读消息扫描开始 ★★★');
+    console.log('[UnreadSync] ★★★ 消息同步守护扫描开始 ★★★');
     console.log(`[UnreadSync] 时间: ${startTimeStr}`);
-    console.log(`[UnreadSync] 配置: 间隔=${SYNC_INTERVAL_MIN}min, 阈值=${SYNC_THRESHOLD_MIN}min, 最大=${SYNC_MAX_MESSAGES}条`);
+    console.log(`[UnreadSync] 配置: 间隔=${SYNC_INTERVAL_MIN}min, 未读阈值=${SYNC_THRESHOLD_MIN}min`);
+    console.log(`[UnreadSync] 未回复检查: ${UNREPLIED_SYNC_ENABLED ? `启用 (最大${UNREPLIED_SYNC_MAX_HOURS}小时)` : '禁用'}`);
     console.log('[UnreadSync] ========================================');
 
     const allSessions = sessionManager.getAllSessions();
@@ -487,9 +607,8 @@ async function scanAllSessions() {
     console.log(`[UnreadSync] 共 ${sessionIds.length} 个 session`);
 
     const allResults = [];
-    let totalProcessed = 0;
-    let totalSynced = 0;
-    let totalFailed = 0;
+    let totalUnreadProcessed = 0, totalUnreadSynced = 0;
+    let totalUnrepliedProcessed = 0, totalUnrepliedSynced = 0;
 
     for (const sessionId of sessionIds) {
         const session = allSessions[sessionId];
@@ -498,16 +617,14 @@ async function scanAllSessions() {
             continue;
         }
 
-        const scanResult = await scanSessionUnread(sessionId);
+        const scanResult = await scanSession(sessionId);
         allResults.push(scanResult);
 
-        totalProcessed += scanResult.processed;
-        for (const r of scanResult.results) {
-            totalSynced += r.synced || 0;
-            totalFailed += r.failed || 0;
-        }
+        totalUnreadProcessed += scanResult.unread.processed;
+        totalUnreadSynced += scanResult.unread.synced;
+        totalUnrepliedProcessed += scanResult.unreplied.processed;
+        totalUnrepliedSynced += scanResult.unreplied.synced;
 
-        // session 之间延迟
         await new Promise(r => setTimeout(r, 1000));
     }
 
@@ -515,10 +632,11 @@ async function scanAllSessions() {
     const endTimeStr = formatBeijingTime(new Date());
 
     console.log('[UnreadSync] ========================================');
-    console.log('[UnreadSync] ★★★ 未读消息扫描完成 ★★★');
+    console.log('[UnreadSync] ★★★ 消息同步守护扫描完成 ★★★');
     console.log(`[UnreadSync] 结束时间: ${endTimeStr}`);
     console.log(`[UnreadSync] 耗时: ${formatDuration(duration)}`);
-    console.log(`[UnreadSync] 处理聊天: ${totalProcessed}, 同步消息: ${totalSynced}, 失败: ${totalFailed}`);
+    console.log(`[UnreadSync] 未读: 处理${totalUnreadProcessed}个聊天, 同步${totalUnreadSynced}条消息`);
+    console.log(`[UnreadSync] 未回复: 处理${totalUnrepliedProcessed}个聊天, 同步${totalUnrepliedSynced}条消息`);
     console.log('[UnreadSync] ========================================');
 
     return {
@@ -526,16 +644,16 @@ async function scanAllSessions() {
         endTime: endTimeStr,
         duration: formatDuration(duration),
         sessions: sessionIds.length,
-        totalProcessed,
-        totalSynced,
-        totalFailed,
+        unread: { processed: totalUnreadProcessed, synced: totalUnreadSynced },
+        unreplied: { processed: totalUnrepliedProcessed, synced: totalUnrepliedSynced },
         results: allResults
     };
 }
 
-/**
- * 调度下次扫描
- */
+// ============================================================
+// 定时调度
+// ============================================================
+
 function scheduleNextScan() {
     const intervalMs = SYNC_INTERVAL_MIN * 60 * 1000;
 
@@ -547,7 +665,6 @@ function scheduleNextScan() {
         } catch (e) {
             console.error('[UnreadSync] Scan error:', e.message);
         } finally {
-            // 完成后调度下一次
             scheduleNextScan();
         }
     }, intervalMs);
@@ -555,8 +672,6 @@ function scheduleNextScan() {
 
 /**
  * 初始化模块
- * @param {Object} sm - SessionManager 实例
- * @param {Object} sessionsObj - whatsapp-manager 的 sessions 对象
  */
 function initialize(sm, sessionsObj) {
     sessionManager = sm;
@@ -568,31 +683,34 @@ function initialize(sm, sessionsObj) {
     }
 
     console.log('[UnreadSync] ========================================');
-    console.log('[UnreadSync] Module initialized');
-    console.log(`[UnreadSync] Interval: ${SYNC_INTERVAL_MIN} minutes`);
-    console.log(`[UnreadSync] Threshold: ${SYNC_THRESHOLD_MIN} minutes`);
-    console.log(`[UnreadSync] Max messages: ${SYNC_MAX_MESSAGES}`);
-    console.log(`[UnreadSync] Fallback hours: ${SYNC_FALLBACK_HOURS}`);
+    console.log('[UnreadSync] 消息同步守护模块 V2.0 已启动');
+    console.log(`[UnreadSync] 扫描间隔: ${SYNC_INTERVAL_MIN} 分钟`);
+    console.log(`[UnreadSync] 未读阈值: ${SYNC_THRESHOLD_MIN} 分钟`);
+    console.log(`[UnreadSync] 未回复同步: ${UNREPLIED_SYNC_ENABLED ? '启用' : '禁用'}`);
+    if (UNREPLIED_SYNC_ENABLED) {
+        console.log(`[UnreadSync] 未回复检查范围: ${SYNC_THRESHOLD_MIN}分钟 ~ ${UNREPLIED_SYNC_MAX_HOURS}小时`);
+    }
+    console.log(`[UnreadSync] 单次最大消息数: ${SYNC_MAX_MESSAGES}`);
+    console.log(`[UnreadSync] 回退同步小时数: ${SYNC_FALLBACK_HOURS}`);
     console.log('[UnreadSync] ========================================');
 
-    // 启动后延迟 2 分钟执行第一次扫描（等待 sessions 就绪）
+    // 启动后延迟 2 分钟执行第一次扫描
     setTimeout(() => {
         console.log('[UnreadSync] Starting first scan...');
         scanAllSessions().catch(e => {
             console.error('[UnreadSync] First scan error:', e.message);
         }).finally(() => {
-            // 开始定时调度
             scheduleNextScan();
         });
     }, 2 * 60 * 1000);
 }
 
 /**
- * 手动触发扫描（可通过 API 调用）
+ * 手动触发扫描
  */
 async function triggerScan(sessionId = null) {
     if (sessionId) {
-        return scanSessionUnread(sessionId);
+        return scanSession(sessionId);
     }
     return scanAllSessions();
 }
@@ -614,14 +732,16 @@ function stop() {
 module.exports = {
     initialize,
     scanAllSessions,
-    scanSessionUnread,
-    syncUnreadChat,
+    scanSession,
+    syncChat,
     triggerScan,
     stop,
-    // 配置常量导出（便于外部读取）
+    // 配置常量导出
     SYNC_ENABLED,
     SYNC_INTERVAL_MIN,
     SYNC_THRESHOLD_MIN,
     SYNC_MAX_MESSAGES,
-    SYNC_FALLBACK_HOURS
+    SYNC_FALLBACK_HOURS,
+    UNREPLIED_SYNC_ENABLED,
+    UNREPLIED_SYNC_MAX_HOURS
 };

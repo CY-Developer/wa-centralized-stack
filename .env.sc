@@ -10,7 +10,7 @@ BRIDGE_BASE=http://192.168.11.45:5010
 # SESSIONS 变量：
 # - 如果留空，将管理 AdsPower 中的所有 profile
 # - 如果指定，只管理列出的 profile ID
-SESSIONS=k16f9wid,k17se6o0,k18dh83n,k18dgrox
+SESSIONS=k16f9wid,k17se6o0,k18dgrox,k189iu19,k189it3r
 
 ######## 历史消息同步配置 ########
 # 启动时是否同步历史消息（1=是，0=否）
@@ -109,3 +109,16 @@ RESTART_COOLDOWN_MS=60000
 CONTACT_SYNC_ENABLED=1# 启用
 CONTACT_SYNC_HOUR=17# 北京时间小时（可选，默认17）
 CONTACT_SYNC_MINUTE=30# 分钟（可选，默认30）
+
+
+MESSAGE_MAP_TTL_DAYS=360
+UNREAD_SYNC_ENABLED=1# 是否启用，默认 1
+UNREAD_SYNC_INTERVAL_MIN=30# 扫描间隔（分钟），默认30
+UNREAD_SYNC_THRESHOLD_MIN=0# 未读阈值（分钟），默认30
+UNREAD_SYNC_MAX_MESSAGES=200# 单次同步最大消息数，默认200
+UNREAD_SYNC_FALLBACK_HOURS=12# 无历史时回退同步小时数，默认 12
+
+UNREPLIED_SYNC_ENABLED=1# 未回复同步是否启用，默认 1
+UNREPLIED_SYNC_MAX_HOURS=24# 未回复检查最大小时数，默认 24
+SYNC_MAX_MESSAGES=200# 单次同步最大消息数，默认 200
+SYNC_FALLBACK_HOURS=12# 无历史时回退同步小时数，默认 12
