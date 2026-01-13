@@ -23,15 +23,6 @@ try {
     console.log('[BOOT] ContactSync module not found, sync disabled');
 }
 
-// ★★★ V5.3.12 新增：未读消息同步模块 ★★★
-let unreadSync = null;
-try {
-    unreadSync = require('./unread-sync');
-    console.log('[BOOT] UnreadSync module loaded');
-} catch (e) {
-    console.log('[BOOT] UnreadSync module not found, sync disabled');
-}
-
 // SESSIONS 现在由 SessionManager 动态管理
 // 保留解析逻辑用于后备
 const SESSIONS_ENV = (process.env.SESSIONS || '')
@@ -1305,8 +1296,8 @@ async function initSessionViaAdsPower(config) {
                             let media = null;
                             const maxRetries = 3;
 
-                            // 等待一小段时间，让媒体有时间加载
-                            await new Promise(r => setTimeout(r, 1000));
+                            // ★★★ V5.3.15：增加初始等待时间，让媒体有时间加载 ★★★
+                            await new Promise(r => setTimeout(r, 2000));
 
                             // 重试下载媒体
                             for (let attempt = 1; attempt <= maxRetries && !media?.data; attempt++) {
@@ -1323,89 +1314,128 @@ async function initSessionViaAdsPower(config) {
                                         break;
                                     }
                                 } catch (e1) {
-                                    console.log(`[${sessionId}] Media download attempt ${attempt} failed: ${e1?.message || 'unknown'}`);
+                                    const errMsg = e1?.message || 'unknown';
+                                    console.log(`[${sessionId}] Media download attempt ${attempt} failed: ${errMsg}`);
+
+                                    // ★★★ V5.3.14修复：如果是 addAnnotations 错误，直接跳到 DOM 提取 ★★★
+                                    if (errMsg.includes('addAnnotations') || errMsg.includes('Evaluation failed')) {
+                                        console.log(`[${sessionId}] Detected library internal error, skipping to DOM extraction`);
+                                        break;  // 不再重试 API，直接尝试 DOM 提取
+                                    }
+
                                     if (attempt < maxRetries) {
                                         await new Promise(r => setTimeout(r, 2000));  // 等待 2 秒后重试
                                     }
                                 }
                             }
 
-                            // ★★★ 如果 API 失败，尝试 DOM 提取 ★★★
+                            // ★★★ 如果 API 失败，尝试 DOM 提取（V5.3.15增强：多次重试）★★★
                             if (!media?.data && (message.type === 'image' || message.type === 'sticker')) {
                                 console.log(`[${sessionId}] API failed, extracting from DOM...`);
 
-                                try {
-                                    const clientRef = sessions[sessionId]?.client;
-                                    if (clientRef?.pupPage) {
-                                        // 等待一下让 DOM 加载
-                                        await new Promise(r => setTimeout(r, 2000));
+                                const clientRef = sessions[sessionId]?.client;
+                                if (clientRef?.pupPage) {
+                                    // ★★★ V5.3.15：DOM 提取重试机制 ★★★
+                                    const domRetries = 3;
+                                    const domRetryDelays = [2000, 3000, 5000];  // 逐渐增加等待时间
 
-                                        const extracted = await clientRef.pupPage.evaluate(async (msgId) => {
-                                            // 尝试多种选择器找到消息元素
-                                            let msgEl = document.querySelector(`[data-id="${msgId}"]`);
+                                    for (let domAttempt = 1; domAttempt <= domRetries && !media?.data; domAttempt++) {
+                                        try {
+                                            // 等待 DOM 渲染
+                                            const waitTime = domRetryDelays[domAttempt - 1] || 5000;
+                                            console.log(`[${sessionId}] DOM extraction attempt ${domAttempt}/${domRetries}, waiting ${waitTime}ms...`);
+                                            await new Promise(r => setTimeout(r, waitTime));
 
-                                            // 如果找不到，尝试其他方式
-                                            if (!msgEl) {
-                                                // 尝试通过部分 ID 匹配
-                                                const partialId = msgId.split('_').pop();
-                                                msgEl = document.querySelector(`[data-id*="${partialId}"]`);
-                                            }
-
-                                            if (!msgEl) return {error: 'msg_not_found'};
-
-                                            // 检查是否需要点击下载
-                                            const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
-                                                || msgEl.querySelector('[data-icon="download"]')
-                                                || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
-
-                                            if (downloadBtn) {
-                                                downloadBtn.click();
-                                                await new Promise(r => setTimeout(r, 8000));  // 等待下载完成
-                                            }
-
-                                            // 尝试多种方式获取图片
-                                            const img = msgEl.querySelector('img[src^="blob:"]')
-                                                || msgEl.querySelector('img[draggable="false"][src^="blob:"]')
-                                                || msgEl.querySelector('img[data-plain-text]')
-                                                || msgEl.querySelector('div[data-testid="image-thumb"] img');
-
-                                            if (img?.src?.startsWith('blob:')) {
-                                                try {
-                                                    const response = await fetch(img.src);
-                                                    const blob = await response.blob();
-                                                    return new Promise((resolve) => {
-                                                        const reader = new FileReader();
-                                                        reader.onloadend = () => {
-                                                            const base64 = reader.result;
-                                                            const matches = base64.match(/^data:(.+);base64,(.+)$/);
-                                                            if (matches) {
-                                                                resolve({mimetype: matches[1], data: matches[2]});
-                                                            } else {
-                                                                resolve({error: 'invalid_base64'});
-                                                            }
-                                                        };
-                                                        reader.onerror = () => resolve({error: 'reader_error'});
-                                                        reader.readAsDataURL(blob);
-                                                    });
-                                                } catch (e) {
-                                                    return {error: 'blob_fetch_failed: ' + e.message};
+                                            const extracted = await clientRef.pupPage.evaluate(async (msgId) => {
+                                                // ★★★ V5.3.15：先尝试滚动到最新消息区域 ★★★
+                                                const scrollContainer = document.querySelector('[data-testid="conversation-panel-messages"]')
+                                                    || document.querySelector('div[class*="message-list"]')
+                                                    || document.querySelector('div[role="region"][tabindex="-1"]');
+                                                if (scrollContainer) {
+                                                    scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                                                    await new Promise(r => setTimeout(r, 500));  // 等待滚动完成
                                                 }
+
+                                                // 尝试多种选择器找到消息元素
+                                                let msgEl = document.querySelector(`[data-id="${msgId}"]`);
+
+                                                // 如果找不到，尝试其他方式
+                                                if (!msgEl) {
+                                                    // 尝试通过部分 ID 匹配
+                                                    const partialId = msgId.split('_').pop();
+                                                    msgEl = document.querySelector(`[data-id*="${partialId}"]`);
+                                                }
+
+                                                // ★★★ V5.3.15：如果还找不到，尝试查找最近的图片消息 ★★★
+                                                if (!msgEl) {
+                                                    // 获取所有消息元素
+                                                    const allMsgs = document.querySelectorAll('[data-id]');
+                                                    // 找到最后一个包含图片的消息
+                                                    for (let i = allMsgs.length - 1; i >= 0; i--) {
+                                                        const msg = allMsgs[i];
+                                                        if (msg.querySelector('img[src^="blob:"]')) {
+                                                            msgEl = msg;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+
+                                                if (!msgEl) return {error: 'msg_not_found'};
+
+                                                // 检查是否需要点击下载
+                                                const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
+                                                    || msgEl.querySelector('[data-icon="download"]')
+                                                    || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
+
+                                                if (downloadBtn) {
+                                                    downloadBtn.click();
+                                                    await new Promise(r => setTimeout(r, 8000));  // 等待下载完成
+                                                }
+
+                                                // 尝试多种方式获取图片
+                                                const img = msgEl.querySelector('img[src^="blob:"]')
+                                                    || msgEl.querySelector('img[draggable="false"][src^="blob:"]')
+                                                    || msgEl.querySelector('img[data-plain-text]')
+                                                    || msgEl.querySelector('div[data-testid="image-thumb"] img');
+
+                                                if (img?.src?.startsWith('blob:')) {
+                                                    try {
+                                                        const response = await fetch(img.src);
+                                                        const blob = await response.blob();
+                                                        return new Promise((resolve) => {
+                                                            const reader = new FileReader();
+                                                            reader.onloadend = () => {
+                                                                const base64 = reader.result;
+                                                                const matches = base64.match(/^data:(.+);base64,(.+)$/);
+                                                                if (matches) {
+                                                                    resolve({mimetype: matches[1], data: matches[2]});
+                                                                } else {
+                                                                    resolve({error: 'invalid_base64'});
+                                                                }
+                                                            };
+                                                            reader.onerror = () => resolve({error: 'reader_error'});
+                                                            reader.readAsDataURL(blob);
+                                                        });
+                                                    } catch (e) {
+                                                        return {error: 'blob_fetch_failed: ' + e.message};
+                                                    }
+                                                }
+
+                                                // 返回更详细的错误信息
+                                                const hasImg = !!msgEl.querySelector('img');
+                                                return {error: `no_blob_src (hasImg: ${hasImg})`};
+                                            }, message.id._serialized);
+
+                                            if (extracted?.data) {
+                                                media = extracted;
+                                                console.log(`[${sessionId}] DOM extraction OK on attempt ${domAttempt}`);
+                                            } else {
+                                                console.log(`[${sessionId}] DOM extraction attempt ${domAttempt} failed: ${extracted?.error || 'unknown'}`);
                                             }
-
-                                            // 返回更详细的错误信息
-                                            const hasImg = !!msgEl.querySelector('img');
-                                            return {error: `no_blob_src (hasImg: ${hasImg})`};
-                                        }, message.id._serialized);
-
-                                        if (extracted?.data) {
-                                            media = extracted;
-                                            console.log(`[${sessionId}] DOM extraction OK`);
-                                        } else {
-                                            console.log(`[${sessionId}] DOM extraction failed: ${extracted?.error || 'unknown'}`);
+                                        } catch (domErr) {
+                                            console.log(`[${sessionId}] DOM extraction attempt ${domAttempt} error: ${domErr?.message}`);
                                         }
                                     }
-                                } catch (domErr) {
-                                    console.log(`[${sessionId}] DOM extraction error: ${domErr?.message}`);
                                 }
                             }
 
@@ -1618,11 +1648,6 @@ async function initSessionViaAdsPower(config) {
         // ★★★ V3.2 新增：初始化联系人同步定时任务 ★★★
         if (contactSync) {
             contactSync.initialize(sessionManager);
-        }
-
-        // ★★★ V5.3.12 新增：初始化未读消息同步定时任务 ★★★
-        if (unreadSync) {
-            unreadSync.initialize(sessionManager, sessions);
         }
 
     } catch (e) {
@@ -3874,49 +3899,6 @@ app.post('/mark-read/:sessionId/:chatId', async (req, res) => {
     } catch (e) {
         res.status(500).json({ ok:false, error: e?.message || String(e) });
     }
-});
-
-// ★★★ V5.3.12 新增：未读消息同步 API ★★★
-
-/**
- * API: 手动触发未读消息扫描
- * GET /trigger-unread-sync - 扫描所有 session
- * GET /trigger-unread-sync/:sessionId - 扫描指定 session
- */
-app.get('/trigger-unread-sync/:sessionId?', async (req, res) => {
-    try {
-        if (!unreadSync) {
-            return res.status(400).json({ ok: false, error: 'UnreadSync module not loaded' });
-        }
-
-        const { sessionId } = req.params;
-        console.log(`[API] Triggering unread sync${sessionId ? ` for ${sessionId}` : ' (all sessions)'}`);
-
-        const result = await unreadSync.triggerScan(sessionId || null);
-        res.json({ ok: true, result });
-
-    } catch (e) {
-        console.error('[API] trigger-unread-sync error:', e?.message);
-        res.status(500).json({ ok: false, error: e?.message });
-    }
-});
-
-/**
- * API: 获取未读同步模块状态
- */
-app.get('/unread-sync-status', (req, res) => {
-    if (!unreadSync) {
-        return res.json({ ok: false, enabled: false, error: 'Module not loaded' });
-    }
-
-    res.json({
-        ok: true,
-        enabled: unreadSync.SYNC_ENABLED,
-        intervalMin: unreadSync.SYNC_INTERVAL_MIN,
-        thresholdMin: unreadSync.SYNC_THRESHOLD_MIN,
-        maxMessages: unreadSync.SYNC_MAX_MESSAGES,
-        fallbackHours: unreadSync.SYNC_FALLBACK_HOURS
-    });
 });
 
 const PORT = process.env.BRIDGE_PORT;

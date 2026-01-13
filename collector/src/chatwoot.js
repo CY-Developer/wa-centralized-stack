@@ -501,6 +501,9 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
   const finalPhone = effectivePhone || rawPhone_lid || getLidDigits(messageId);
   const digits = (String(finalPhone || '').match(/\d+/g) || []).join('');
 
+  // ★★★ V5.3.14修复：保留原始 LID 数字，用于双向搜索 ★★★
+  const lidDigits = (String(rawPhone_lid || getLidDigits(messageId) || '').match(/\d+/g) || []).join('');
+
   // ★★★ 修改 identifier 格式，区分 phone 和 lid ★★★
   // 新格式: wa:sessionId:phone:123456 或 wa:sessionId:lid:123456
   // 如果从名称中提取到电话，使用 phone 类型
@@ -514,8 +517,14 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
     phone_e164 = '+' + extractedPhoneFromName;
   }
 
-  // ★★★ 缓存 key 改为 digits:sessionId，区分不同 WhatsApp 账号 ★★★
+  // ★★★ V5.3.14修复：双缓存查找 - 先查电话号码，再查 LID ★★★
   let contact = getCachedContact(digits, sessionId);
+  if (!contact && lidDigits && lidDigits !== digits) {
+    contact = getCachedContact(lidDigits, sessionId);
+    if (contact) {
+      console.log(`[ensureContact] Found in cache by LID: id=${contact.id}, name=${contact.name}`);
+    }
+  }
   if (contact) {
     console.log(`[ensureContact] Found in cache: id=${contact.id}, name=${contact.name}`);
     // 缓存命中，但还是更新一下信息
@@ -530,6 +539,10 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
         if (updated && updated.id) {
           contact = updated;
           cacheContact(digits, sessionId, contact);  // 更新缓存
+          // ★★★ V5.3.14修复：同时缓存 LID ★★★
+          if (lidDigits && lidDigits !== digits) {
+            cacheContact(lidDigits, sessionId, contact);
+          }
         } else {
           contact = originalContact;  // 恢复原来的 contact
         }
@@ -543,8 +556,11 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
   // ★★★ 使用锁防止并发创建多个联系人（锁 key 也要包含 sessionId）★★★
   const lockKey = sessionId ? `${digits}:${sessionId}` : digits;
   return withContactLock(lockKey, async () => {
-    // 再次检查缓存（可能在等待锁期间被其他请求创建了）
+    // ★★★ V5.3.14修复：再次检查缓存（双缓存查找）★★★
     let contact = getCachedContact(digits, sessionId);
+    if (!contact && lidDigits && lidDigits !== digits) {
+      contact = getCachedContact(lidDigits, sessionId);
+    }
     if (contact) {
       console.log(`[ensureContact] Found in cache after lock: id=${contact.id}, name=${contact.name}`);
       return contact;
@@ -564,6 +580,15 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
       contact = await searchContact({ account_id, identifier: oldIdentifier });
       if (contact) {
         console.log(`[ensureContact] Found by old identifier: id=${contact.id}, name=${contact.name}`);
+      }
+    }
+
+    // ★★★ V5.3.14修复：如果有 LID，也要搜索 LID 格式的 identifier ★★★
+    if (!contact && lidDigits && lidDigits !== digits && sessionId) {
+      const lidIdentifier = `wa:${sessionId}:lid:${lidDigits}`;
+      contact = await searchContact({ account_id, identifier: lidIdentifier });
+      if (contact) {
+        console.log(`[ensureContact] Found by LID identifier: id=${contact.id}, name=${contact.name}`);
       }
     }
 
@@ -595,6 +620,21 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
           // 不使用这个联系人
         } else {
           console.log(`[ensureContact] Found by digits: id=${searchResult.id}, name=${searchResult.name}`);
+          contact = searchResult;
+        }
+      }
+    }
+
+    // ★★★ V5.3.14修复：如果有 LID 且与 digits 不同，也要按 LID 搜索 ★★★
+    if (!contact && lidDigits && lidDigits !== digits) {
+      console.log(`[ensureContact] Searching by LID digits: ${lidDigits}`);
+      const searchResult = await findContactByDigits({ account_id, digits: lidDigits });
+      if (searchResult) {
+        const contactSessionId = searchResult.identifier?.split(':')[1];
+        if (sessionId && contactSessionId && contactSessionId !== sessionId) {
+          console.log(`[ensureContact] Found by LID digits but different session: ${contactSessionId} vs ${sessionId}, skipping`);
+        } else {
+          console.log(`[ensureContact] Found by LID digits: id=${searchResult.id}, name=${searchResult.name}`);
           contact = searchResult;
         }
       }
@@ -674,9 +714,14 @@ async function ensureContact({ account_id = DEFAULT_ACCOUNT_ID, rawPhone, rawPho
       }
     }
 
-    // ★★★ 新增：将联系人添加到缓存（包含 sessionId）★★★
+    // ★★★ V5.3.14修复：将联系人添加到缓存（同时缓存电话和 LID）★★★
     if (contact && digits) {
       cacheContact(digits, sessionId, contact);
+      // 如果有 LID 且不同于 digits，也缓存 LID
+      if (lidDigits && lidDigits !== digits) {
+        cacheContact(lidDigits, sessionId, contact);
+        console.log(`[ensureContact] Cached contact for both phone=${digits} and lid=${lidDigits}`);
+      }
     }
 
     return contact;
@@ -1927,9 +1972,12 @@ async function updateMessageSourceId({ account_id, conversation_id, message_id, 
     console.log(`[updateMessageSourceId] Success: message ${message_id} -> source_id ${source_id.substring(0, 40)}`);
     return res;
   } catch (e) {
-    // 如果新 API 不存在（404），尝试旧方式
-    if (e.response?.status === 404) {
-      console.warn(`[updateMessageSourceId] New API not found, trying legacy method...`);
+    const status = e.response?.status;
+
+    // ★★★ V5.3.15：改进错误处理 ★★★
+    // 404 可能是 API 不存在或消息已删除，尝试 legacy 方式
+    if (status === 404) {
+      console.warn(`[updateMessageSourceId] API returned 404, trying legacy method...`);
       try {
         const res = await cwRequest('patch',
             `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages/${message_id}`,
@@ -1942,12 +1990,19 @@ async function updateMessageSourceId({ account_id, conversation_id, message_id, 
         console.log(`[updateMessageSourceId] Legacy success (content_attributes): message ${message_id}`);
         return res;
       } catch (legacyErr) {
-        console.error(`[updateMessageSourceId] Legacy method also failed: ${legacyErr.message}`);
+        const legacyStatus = legacyErr.response?.status;
+        // 如果 legacy 也是 404，说明消息已被删除，不再抛出错误
+        if (legacyStatus === 404) {
+          console.warn(`[updateMessageSourceId] Message ${message_id} not found (deleted?), skipping source_id update`);
+          return null;  // 返回 null 而不是抛出错误
+        }
+        console.error(`[updateMessageSourceId] Legacy method failed: ${legacyErr.message}`);
         throw legacyErr;
       }
     }
 
-    console.error(`[updateMessageSourceId] Failed: ${e.message}`);
+    // 其他错误（非 404）仍然抛出
+    console.error(`[updateMessageSourceId] Failed (${status}): ${e.message}`);
     throw e;
   }
 }

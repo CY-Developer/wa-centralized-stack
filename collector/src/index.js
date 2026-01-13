@@ -3932,6 +3932,22 @@ app.post('/api/whatsapp/revoke', async (req, res) => {
             sessionId = WA_DEFAULT_SESSION.split(',')[0]?.trim() || 'default';
         }
 
+        // ★★★ V5.3.14：暂时禁用 Bridge 删除 API（Bridge 未实现此功能）★★★
+        logToCollector('[WA_REVOKE] Bridge delete-message API not implemented, skipping', {
+            sessionId,
+            messageId: wa_message_id.substring(0, 40),
+            everyone
+        });
+
+        // 返回成功但标记为未执行
+        return res.json({
+            ok: true,
+            skipped: true,
+            reason: 'Bridge delete-message API not implemented',
+            wa_message_id
+        });
+
+        /* 原代码暂时注释
         // 调用 Bridge 删除 API
         const bridgeUrl = `${WA_BRIDGE_URL}/delete-message/${sessionId}`;
 
@@ -3970,6 +3986,7 @@ app.post('/api/whatsapp/revoke', async (req, res) => {
                 wa_message_id
             });
         }
+        原代码暂时注释结束 */
 
     } catch (error) {
         const errorMsg = error?.response?.data?.error || error?.message || 'unknown error';
@@ -4049,6 +4066,21 @@ app.post('/delete-wa-message', async (req, res) => {
             everyone
         });
 
+        // ★★★ V5.3.14：暂时禁用 Bridge 删除 API（Bridge 未实现此功能）★★★
+        logToCollector('[DELETE_WA_MSG] Bridge delete-message API not implemented, skipping', {
+            sessionId,
+            wa_message_id: waMessageId.substring(0, 40),
+            everyone
+        });
+
+        return res.json({
+            ok: true,
+            skipped: true,
+            reason: 'Bridge delete-message API not implemented',
+            wa_message_id: waMessageId
+        });
+
+        /* 原代码暂时注释
         // 3. 调用Bridge删除
         const headers = {};
         if (WA_BRIDGE_TOKEN) headers['x-api-token'] = WA_BRIDGE_TOKEN;
@@ -4076,6 +4108,7 @@ app.post('/delete-wa-message', async (req, res) => {
                 wa_message_id: waMessageId
             });
         }
+        原代码暂时注释结束 */
 
     } catch (error) {
         const errorMsg = error?.message || 'unknown error';
@@ -4266,6 +4299,20 @@ app.post('/chatwoot/webhook', async (req, res) => {
                 conversation_id: convId
             });
 
+            // ★★★ V5.3.14：暂时禁用 Bridge 删除 API（Bridge 未实现此功能）★★★
+            logToCollector('[CW_WEBHOOK] Bridge delete-message API not implemented, skipping', {
+                sessionId,
+                wa_message_id: waMessageId.substring(0, 40)
+            });
+
+            return res.json({
+                ok: true,
+                skipped: true,
+                reason: 'Bridge delete-message API not implemented',
+                wa_message_id: waMessageId
+            });
+
+            /* 原代码暂时注释
             // 调用Bridge删除API
             try {
                 const headers = {};
@@ -4298,6 +4345,7 @@ app.post('/chatwoot/webhook', async (req, res) => {
                 logToCollector('[CW_WEBHOOK] WA delete error', {error: e.message});
                 return res.json({ok: false, action: 'delete_error', error: e.message});
             }
+            原代码暂时注释结束 */
         }
 
         if (!message || !conversation) return SKIP('no message/conversation', {
@@ -4538,26 +4586,37 @@ app.post('/chatwoot/webhook', async (req, res) => {
                             console.log(`[MEDIA_ASYNC] ✓ 发送成功: message_id=${message_id}, count=${mediaList.length}, duration=${duration}ms`);
 
 
-                            // 使用第一条消息的 msgId 作为 source_id
+                            // ★★★ V5.3.14修复：Bridge 返回的字段是 id 而不是 msgId ★★★
                             const firstResult = (result?.results || [])[0];
-                            const firstMsgId = firstResult?.msgId || result?.msgId;
+                            const firstMsgId = firstResult?.id || firstResult?.msgId || result?.msgId;
+
+                            console.log(`[MEDIA_ASYNC] firstResult: ${JSON.stringify(firstResult)}, firstMsgId: ${firstMsgId?.substring(0, 40)}`);
+
                             if (firstMsgId && message_id && conversation_id) {
+                                // ★★★ V5.3.15：改进 source_id 回写错误处理 ★★★
                                 try {
-                                    await cw.updateMessageSourceId({
+                                    const updateResult = await cw.updateMessageSourceId({
                                         account_id: CHATWOOT_ACCOUNT_ID,
                                         conversation_id: conversation_id,
                                         message_id: message_id,
                                         source_id: firstMsgId
                                     });
-                                    console.log(`[MEDIA_ASYNC] ✓ source_id 已回写: message_id=${message_id}`);
+                                    if (updateResult) {
+                                        console.log(`[MEDIA_ASYNC] ✓ source_id 已回写: message_id=${message_id}`);
+                                    } else {
+                                        console.log(`[MEDIA_ASYNC] ⚠ source_id 回写跳过（消息可能已删除）: message_id=${message_id}`);
+                                    }
                                 } catch (updateErr) {
+                                    // 非 404 错误才记录为失败
                                     console.error(`[MEDIA_ASYNC] ✗ source_id 回写失败: ${updateErr.message}`);
                                 }
 
 
-                                // 问题：媒体消息发送后没有保存映射，导致引用该消息时找不到 WA ID
+                                // ★★★ V5.3.13修复：媒体消息也要保存 Redis 映射（钢印原则）★★★
                                 await saveMessageMapping(conversation_id, firstMsgId, message_id);
                                 console.log(`[MEDIA_ASYNC] ✓ 消息映射已保存: wa=${firstMsgId.substring(0, 35)} -> cw=${message_id}`);
+                            } else {
+                                console.error(`[MEDIA_ASYNC] ✗ 无法保存映射: firstMsgId=${firstMsgId}, message_id=${message_id}, conversation_id=${conversation_id}`);
                             }
                         } else {
                             const errorMsg = failedItems.map(f => f.error).join('; ') || 'partial failure';
@@ -5271,6 +5330,7 @@ app.get('/get-last-synced-message', async (req, res) => {
             const sortedMsgs = messages.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
             const lastMsg = sortedMsgs[0];
 
+            // ★★★ V5.3.14修复：多层查找 wa_message_id ★★★
             let wa_message_id = lastMsg.source_id || lastMsg.content_attributes?.wa_message_id || null;
 
             // 如果 Chatwoot 消息没有 source_id，尝试从 Redis 反向映射查找
@@ -5286,6 +5346,7 @@ app.get('/get-last-synced-message', async (req, res) => {
                 }
             }
 
+            // ★★★ 如果还是找不到，向前查找最近一条有映射的消息 ★★★
             if (!wa_message_id && redis && sortedMsgs.length > 1) {
                 console.log(`[GET_LAST_MSG] Last message has no wa_id, searching previous messages...`);
                 for (let i = 1; i < Math.min(sortedMsgs.length, 20); i++) {
