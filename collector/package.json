@@ -14,7 +14,9 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "ioredis": "^5.4.1",
-    "morgan": "^1.10.0"
+    "lru-cache": "^10.0.0",
+    "morgan": "^1.10.0",
+    "wa-centralized-stack": "file:.."
   },
   "devDependencies": {
     "pino-pretty": "^13.1.2"

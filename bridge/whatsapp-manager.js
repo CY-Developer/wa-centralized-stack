@@ -108,6 +108,92 @@ const CHAT_COOLDOWN_MS = Number(process.env.SAME_CHAT_COOLDOWN_MS || process.env
 const lastSendAtByChat    = new Map(); // `${sessionId}|${jid}` -> ts
 let   sendTokens          = SEND_RPM;
 let   lastFill            = Date.now();
+
+// ★★★ V5.3.21：markedUnread 错误处理（立即重启 + 冷却期）★★★
+const markedUnreadRestartState = new Map(); // sessionId -> { restartPending, lastRestartTime }
+const MARKED_UNREAD_RESTART_COOLDOWN_MS = 90000; // 重启冷却时间，90秒内不重复触发（给 session 足够时间恢复）
+
+/**
+ * 检测到 markedUnread 错误时触发重启
+ * - 立即触发重启（不需要多次计数）
+ * - 有90秒冷却期防止重复重启
+ * @param {string} sessionId
+ * @param {string} errorMsg
+ * @param {string} messageId - 可选，消息ID，用于日志
+ * @returns {boolean} 是否触发了重启
+ */
+function trackMarkedUnreadError(sessionId, errorMsg, messageId = null) {
+    if (!errorMsg || !errorMsg.includes('markedUnread')) {
+        return false;
+    }
+
+    const now = Date.now();
+    let state = markedUnreadRestartState.get(sessionId);
+
+    if (!state) {
+        state = { restartPending: false, lastRestartTime: 0 };
+    }
+
+    // 如果正在重启中，忽略
+    if (state.restartPending) {
+        console.log(`[${sessionId}] markedUnread error ignored (restart in progress), msg=${messageId?.substring(0, 20) || 'unknown'}`);
+        return false;
+    }
+
+    // 如果在重启冷却期内，忽略（session 可能还在恢复中）
+    const cooldownRemaining = MARKED_UNREAD_RESTART_COOLDOWN_MS - (now - state.lastRestartTime);
+    if (cooldownRemaining > 0) {
+        console.log(`[${sessionId}] markedUnread error ignored (cooldown: ${Math.round(cooldownRemaining / 1000)}s remaining), msg=${messageId?.substring(0, 20) || 'unknown'}`);
+        return false;
+    }
+
+    // ★★★ 立即触发重启（markedUnread 说明页面状态异常，必须重启）★★★
+    console.error(`[${sessionId}] markedUnread error detected, triggering immediate restart... msg=${messageId?.substring(0, 20) || 'unknown'}`);
+
+    // 设置重启标志
+    state.restartPending = true;
+    state.lastRestartTime = now;
+    markedUnreadRestartState.set(sessionId, state);
+
+    // 延迟2秒后重启（让当前请求先返回错误响应）
+    setTimeout(() => {
+        console.log(`[${sessionId}] Executing auto-restart for markedUnread error...`);
+        sessionManager.safeRestartSession(sessionId, 'markedUnread_error').then(result => {
+            if (result.success) {
+                console.log(`[${sessionId}] Auto-restart SUCCESS - session will be ready soon`);
+            } else {
+                console.error(`[${sessionId}] Auto-restart FAILED: ${result.error}`);
+            }
+        }).catch(err => {
+            console.error(`[${sessionId}] Auto-restart EXCEPTION: ${err.message}`);
+        }).finally(() => {
+            // 重启流程结束后清除 pending 标志
+            const s = markedUnreadRestartState.get(sessionId);
+            if (s) {
+                s.restartPending = false;
+                markedUnreadRestartState.set(sessionId, s);
+            }
+        });
+    }, 2000);
+
+    return true;
+}
+
+/**
+ * 重置 markedUnread 重启状态（在会话恢复正常时调用）
+ * @param {string} sessionId
+ */
+function resetMarkedUnreadErrorCount(sessionId) {
+    if (markedUnreadRestartState.has(sessionId)) {
+        const state = markedUnreadRestartState.get(sessionId);
+        // 只重置 pending 标志，保留 lastRestartTime 用于冷却期判断
+        if (state.restartPending) {
+            state.restartPending = false;
+            markedUnreadRestartState.set(sessionId, state);
+            console.log(`[${sessionId}] markedUnread restart state reset (session recovered)`);
+        }
+    }
+}
 async function takeSendToken(){
     const now = Date.now();
     const refill = ((now - lastFill)/60000) * SEND_RPM;
@@ -765,6 +851,9 @@ async function initSessionViaAdsPower(config) {
             sessionManager.updateStatus(sessionId, 'ready');
             console.log(`[${sessionId}] Client is ready (AdsPower profile: ${sessionName}).`);
 
+            // ★★★ V5.3.19：重置 markedUnread 错误计数 ★★★
+            resetMarkedUnreadErrorCount(sessionId);
+
             await pageGuard();
             try {
                 if (client.pupPage) {
@@ -772,6 +861,54 @@ async function initSessionViaAdsPower(config) {
                     client.pupPage.setDefaultNavigationTimeout(PROTOCOL_TIMEOUT_MS);
                 }
             } catch (_) {
+            }
+
+            // ★★★ V5.3.18：注入 sendSeen 补丁，修复 markedUnread undefined 错误 ★★★
+            try {
+                if (client.pupPage) {
+                    await client.pupPage.evaluate(() => {
+                        // 保存原始 sendSeen 函数
+                        const originalSendSeen = window.WWebJS.sendSeen;
+
+                        // 重写 sendSeen 函数，使其在失败时静默处理
+                        window.WWebJS.sendSeen = async function(chatId) {
+                            try {
+                                // 先检查 chat 对象是否存在且有效
+                                const chat = window.Store.Chat.get(chatId);
+                                if (!chat) {
+                                    console.log('[sendSeen patch] Chat not found, skipping sendSeen');
+                                    return true;
+                                }
+
+                                // 检查 markedUnread 属性是否存在
+                                if (typeof chat.markedUnread === 'undefined') {
+                                    console.log('[sendSeen patch] markedUnread undefined, using alternative method');
+                                    // 尝试直接标记为已读（如果可用）
+                                    try {
+                                        if (window.Store.SendSeen && typeof window.Store.SendSeen.sendSeen === 'function') {
+                                            await window.Store.SendSeen.sendSeen(chat, false);
+                                        }
+                                    } catch (_) {
+                                        // 静默忽略
+                                    }
+                                    return true;
+                                }
+
+                                // 调用原始函数
+                                return await originalSendSeen.call(this, chatId);
+                            } catch (e) {
+                                // 静默处理错误，sendSeen 失败不应阻止消息发送
+                                console.log('[sendSeen patch] Error (ignored):', e?.message);
+                                return true;
+                            }
+                        };
+
+                        console.log('[sendSeen patch] Patch applied successfully');
+                    });
+                    console.log(`[${sessionId}] sendSeen patch applied`);
+                }
+            } catch (patchErr) {
+                console.warn(`[${sessionId}] Failed to apply sendSeen patch:`, patchErr.message);
             }
 
             await waitConnected(client, sessionId);
@@ -1329,13 +1466,16 @@ async function initSessionViaAdsPower(config) {
                                 }
                             }
 
-                            // ★★★ 如果 API 失败，尝试 DOM 提取（V5.3.15增强：多次重试）★★★
+                            // ★★★ 如果 API 失败，尝试 DOM 提取（V5.3.18增强：先切换聊天窗口）★★★
                             if (!media?.data && (message.type === 'image' || message.type === 'sticker')) {
                                 console.log(`[${sessionId}] API failed, extracting from DOM...`);
 
                                 const clientRef = sessions[sessionId]?.client;
                                 if (clientRef?.pupPage) {
-                                    // ★★★ V5.3.15：DOM 提取重试机制 ★★★
+                                    // ★★★ V5.3.18：获取聊天 ID 用于切换 ★★★
+                                    const targetChatId = chat?.id?._serialized || message.from || '';
+
+                                    // ★★★ V5.3.18：DOM 提取重试机制（增强版：先切换聊天）★★★
                                     const domRetries = 3;
                                     const domRetryDelays = [2000, 3000, 5000];  // 逐渐增加等待时间
 
@@ -1346,7 +1486,26 @@ async function initSessionViaAdsPower(config) {
                                             console.log(`[${sessionId}] DOM extraction attempt ${domAttempt}/${domRetries}, waiting ${waitTime}ms...`);
                                             await new Promise(r => setTimeout(r, waitTime));
 
-                                            const extracted = await clientRef.pupPage.evaluate(async (msgId) => {
+                                            const extracted = await clientRef.pupPage.evaluate(async (msgId, chatId) => {
+                                                // ★★★ V5.3.18：关键修复 - 先切换到目标聊天窗口 ★★★
+                                                // 新联系人的消息可能不在当前聊天视图中
+                                                try {
+                                                    if (chatId && window.Store?.Chat) {
+                                                        const targetChat = await window.Store.Chat.find(
+                                                            window.Store.WidFactory.createWid(chatId)
+                                                        ).catch(() => null);
+
+                                                        if (targetChat) {
+                                                            // 打开聊天窗口
+                                                            await window.Store.Cmd.openChatBottom(targetChat).catch(() => null);
+                                                            // 等待聊天加载
+                                                            await new Promise(r => setTimeout(r, 1500));
+                                                        }
+                                                    }
+                                                } catch (switchErr) {
+                                                    console.log('[DOM extract] Switch chat failed:', switchErr?.message);
+                                                }
+
                                                 // ★★★ V5.3.15：先尝试滚动到最新消息区域 ★★★
                                                 const scrollContainer = document.querySelector('[data-testid="conversation-panel-messages"]')
                                                     || document.querySelector('div[class*="message-list"]')
@@ -1366,37 +1525,36 @@ async function initSessionViaAdsPower(config) {
                                                     msgEl = document.querySelector(`[data-id*="${partialId}"]`);
                                                 }
 
-                                                // ★★★ V5.3.15：如果还找不到，尝试查找最近的图片消息 ★★★
-                                                if (!msgEl) {
-                                                    // 获取所有消息元素
-                                                    const allMsgs = document.querySelectorAll('[data-id]');
-                                                    // 找到最后一个包含图片的消息
-                                                    for (let i = allMsgs.length - 1; i >= 0; i--) {
-                                                        const msg = allMsgs[i];
-                                                        if (msg.querySelector('img[src^="blob:"]')) {
-                                                            msgEl = msg;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
+                                                // ★★★ V5.3.17 修复：删除危险的"查找任意最近图片"逻辑 ★★★
+                                                // 原代码会在找不到精确匹配时获取任意最近图片，导致图片错乱
+                                                // 现在严格匹配：找不到就返回错误，由补偿队列稍后重试
+                                                if (!msgEl) return {error: 'msg_not_found_strict', msgId: msgId?.substring(0, 40)};
 
-                                                if (!msgEl) return {error: 'msg_not_found'};
-
-                                                // 检查是否需要点击下载
+                                                // ★★★ V5.3.18：检查是否需要点击下载（新联系人图片需要点击） ★★★
                                                 const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
                                                     || msgEl.querySelector('[data-icon="download"]')
-                                                    || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]');
+                                                    || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]')
+                                                    || msgEl.querySelector('[data-testid="media-download"]');
 
                                                 if (downloadBtn) {
+                                                    console.log('[DOM extract] Found download button, clicking...');
                                                     downloadBtn.click();
-                                                    await new Promise(r => setTimeout(r, 8000));  // 等待下载完成
+                                                    // 等待下载完成（新联系人图片可能需要更长时间）
+                                                    await new Promise(r => setTimeout(r, 10000));
                                                 }
 
                                                 // 尝试多种方式获取图片
-                                                const img = msgEl.querySelector('img[src^="blob:"]')
+                                                let img = msgEl.querySelector('img[src^="blob:"]')
                                                     || msgEl.querySelector('img[draggable="false"][src^="blob:"]')
                                                     || msgEl.querySelector('img[data-plain-text]')
                                                     || msgEl.querySelector('div[data-testid="image-thumb"] img');
+
+                                                // ★★★ V5.3.18：如果第一次没找到 blob，再等待一下再试 ★★★
+                                                if (!img?.src?.startsWith('blob:')) {
+                                                    await new Promise(r => setTimeout(r, 2000));
+                                                    img = msgEl.querySelector('img[src^="blob:"]')
+                                                        || msgEl.querySelector('img[draggable="false"][src^="blob:"]');
+                                                }
 
                                                 if (img?.src?.startsWith('blob:')) {
                                                     try {
@@ -1423,8 +1581,9 @@ async function initSessionViaAdsPower(config) {
 
                                                 // 返回更详细的错误信息
                                                 const hasImg = !!msgEl.querySelector('img');
-                                                return {error: `no_blob_src (hasImg: ${hasImg})`};
-                                            }, message.id._serialized);
+                                                const hasDownloadBtn = !!downloadBtn;
+                                                return {error: `no_blob_src (hasImg: ${hasImg}, hadDownloadBtn: ${hasDownloadBtn})`};
+                                            }, message.id._serialized, targetChatId);
 
                                             if (extracted?.data) {
                                                 media = extracted;
@@ -1447,7 +1606,10 @@ async function initSessionViaAdsPower(config) {
                                 };
                                 console.log(`[${sessionId}] media OK: ${media.mimetype}, ${media.data.length} bytes`);
                             } else {
-                                console.log(`[${sessionId}] media unavailable after all attempts`);
+                                // ★★★ V5.3.17：标记媒体获取失败，让 Collector 触发补偿队列 ★★★
+                                payload.mediaFailed = true;
+                                payload.mediaType = message.type;
+                                console.log(`[${sessionId}] media FAILED, marked for compensation queue (type=${message.type})`);
                             }
                         } catch (mediaErr) {
                             console.log(`[${sessionId}] media error: ${mediaErr?.message}`);
@@ -2921,20 +3083,75 @@ app.post('/fetch-media', async (req, res) => {
             console.log(`[fetch-media] Chat fetch method failed: ${e?.message}`);
         }
 
-        // 方法2：DOM 提取（如果上面失败）
+        // 方法2：DOM 提取（如果上面失败）- V5.3.18 增强版：先切换聊天再点击下载
         if (!media?.data) {
             try {
                 const page = session.client.pupPage;
                 if (page) {
-                    console.log(`[fetch-media] Trying DOM extraction...`);
+                    console.log(`[fetch-media] Trying DOM extraction (V5.3.18 enhanced)...`);
 
-                    const extracted = await page.evaluate(async (msgId) => {
-                        const msgEl = document.querySelector(`[data-id="${msgId}"]`);
+                    // 从 messageId 提取 chatId 用于切换聊天
+                    const chatIdMatch = messageId.match(/(?:true|false)_(.+?)_/);
+                    const chatId = chatIdMatch ? chatIdMatch[1] : null;
+
+                    const extracted = await page.evaluate(async (msgId, targetChatId) => {
+                        // ★★★ V5.3.18：关键修复 - 先切换到目标聊天窗口 ★★★
+                        try {
+                            if (targetChatId && window.Store?.Chat) {
+                                const targetChat = await window.Store.Chat.find(
+                                    window.Store.WidFactory.createWid(targetChatId)
+                                ).catch(() => null);
+
+                                if (targetChat) {
+                                    console.log('[fetch-media DOM] Switching to chat:', targetChatId);
+                                    await window.Store.Cmd.openChatBottom(targetChat).catch(() => null);
+                                    await new Promise(r => setTimeout(r, 2000));  // 等待聊天加载
+                                }
+                            }
+                        } catch (switchErr) {
+                            console.log('[fetch-media DOM] Switch chat failed:', switchErr?.message);
+                        }
+
+                        // 滚动到最新消息
+                        const scrollContainer = document.querySelector('[data-testid="conversation-panel-messages"]')
+                            || document.querySelector('div[class*="message-list"]');
+                        if (scrollContainer) {
+                            scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                            await new Promise(r => setTimeout(r, 500));
+                        }
+
+                        let msgEl = document.querySelector(`[data-id="${msgId}"]`);
+
+                        // 尝试通过部分 ID 匹配
+                        if (!msgEl) {
+                            const partialId = msgId.split('_').pop();
+                            msgEl = document.querySelector(`[data-id*="${partialId}"]`);
+                        }
+
                         if (!msgEl) return { error: 'msg_not_found' };
 
-                        const img = msgEl.querySelector('img[src^="blob:"]')
-                            || msgEl.querySelector('img[draggable="false"]')
+                        // ★★★ V5.3.18：检查并点击下载按钮（新联系人图片需要）★★★
+                        const downloadBtn = msgEl.querySelector('[data-icon="media-download"]')
+                            || msgEl.querySelector('[data-icon="download"]')
+                            || msgEl.querySelector('span[data-icon="media-download"]')?.closest('button, div[role="button"]')
+                            || msgEl.querySelector('[data-testid="media-download"]');
+
+                        if (downloadBtn) {
+                            console.log('[fetch-media DOM] Found download button, clicking...');
+                            downloadBtn.click();
+                            await new Promise(r => setTimeout(r, 10000));  // 等待下载完成
+                        }
+
+                        // 尝试获取图片
+                        let img = msgEl.querySelector('img[src^="blob:"]')
+                            || msgEl.querySelector('img[draggable="false"][src^="blob:"]')
                             || msgEl.querySelector('img:not([src^="data:image/svg"])');
+
+                        // 如果第一次没找到 blob，再等待
+                        if (!img?.src?.startsWith('blob:')) {
+                            await new Promise(r => setTimeout(r, 2000));
+                            img = msgEl.querySelector('img[src^="blob:"]');
+                        }
 
                         if (img?.src?.startsWith('blob:')) {
                             try {
@@ -2951,18 +3168,24 @@ app.post('/fetch-media', async (req, res) => {
                                             resolve({ error: 'invalid_base64' });
                                         }
                                     };
+                                    reader.onerror = () => resolve({ error: 'reader_error' });
                                     reader.readAsDataURL(blob);
                                 });
                             } catch (e) {
-                                return { error: 'blob_fetch_failed' };
+                                return { error: 'blob_fetch_failed: ' + e.message };
                             }
                         }
-                        return { error: 'no_image_src' };
-                    }, messageId);
+
+                        const hasImg = !!msgEl.querySelector('img');
+                        const hadDownloadBtn = !!downloadBtn;
+                        return { error: `no_image_src (hasImg: ${hasImg}, hadDownloadBtn: ${hadDownloadBtn})` };
+                    }, messageId, chatId);
 
                     if (extracted?.data) {
                         media = extracted;
                         console.log(`[fetch-media] DOM extraction successful`);
+                    } else {
+                        console.log(`[fetch-media] DOM extraction failed: ${extracted?.error}`);
                     }
                 }
             } catch (e) {
@@ -2990,6 +3213,57 @@ app.post('/fetch-media', async (req, res) => {
 });
 
 // ========== 发文本 ==========
+
+/**
+ * ★★★ V5.3.17：底层发送函数，绕过 sendSeen 避免 markedUnread 错误 ★★★
+ * 直接使用 WhatsApp Store API 发送消息
+ */
+async function sendMessageDirect(client, chatId, text) {
+    try {
+        // 方法1：使用 pupPage.evaluate 直接调用 Store API
+        const result = await client.pupPage.evaluate(async (chatId, text) => {
+            try {
+                // 获取聊天对象
+                const chat = await window.Store.Chat.get(chatId);
+                if (!chat) {
+                    // 如果找不到，尝试创建
+                    const wid = window.Store.WidFactory.createWid(chatId);
+                    const newChat = await window.Store.Chat.find(wid);
+                    if (!newChat) {
+                        return { ok: false, error: 'chat_not_found' };
+                    }
+                }
+
+                // 直接发送消息，不调用 sendSeen
+                const msg = await window.WWebJS.sendMessage(
+                    window.Store.Chat.get(chatId),
+                    text,
+                    {},
+                    {}
+                );
+
+                return {
+                    ok: true,
+                    id: msg?.id?._serialized || null
+                };
+            } catch (e) {
+                return { ok: false, error: e?.message || String(e) };
+            }
+        }, chatId, text);
+
+        return result;
+    } catch (e) {
+        // 方法2：回退到标准方法但捕获 sendSeen 错误
+        console.log(`[sendMessageDirect] Evaluate failed: ${e?.message}, trying standard method`);
+        try {
+            const msg = await client.sendMessage(chatId, text);
+            return { ok: true, id: msg?.id?._serialized || null };
+        } catch (sendErr) {
+            return { ok: false, error: sendErr?.message || String(sendErr) };
+        }
+    }
+}
+
 app.post('/send/text', async (req, res) => {
     const ok  = (code, data) => res.status(code).json(data);
     const bad = (code, msg)  => ok(code, { ok: false, error: msg });
@@ -3047,9 +3321,24 @@ app.post('/send/text', async (req, res) => {
 
         const safeText = escapeWhatsAppMarkdown(String(text));
 
-        // ★★★ 发送逻辑：优先电话，失败后回退到 LID ★★★
-        const MAX_RETRIES = 2;
+        // ★★★ V5.3.17：改进的发送逻辑，处理 markedUnread 错误 ★★★
+        const MAX_RETRIES = 3;
         let lastError = null;
+
+        // ★★★ 辅助函数：检测是否为可恢复的错误 ★★★
+        const isRecoverableError = (errMsg) => {
+            const isRecoverable = errMsg.includes('getChat') ||
+                errMsg.includes('undefined') ||
+                errMsg.includes('markedUnread') ||
+                errMsg.includes('sendSeen');
+
+            // ★★★ V5.3.19：追踪 markedUnread 错误 ★★★
+            if (isRecoverable && errMsg.includes('markedUnread')) {
+                trackMarkedUnreadError(sessionId, errMsg);
+            }
+
+            return isRecoverable;
+        };
 
         // 第一优先：使用电话号码发送
         if (hasPhone) {
@@ -3057,6 +3346,7 @@ app.post('/send/text', async (req, res) => {
 
             for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
                 try {
+                    // ★★★ V5.3.17：先尝试标准方法 ★★★
                     const msg = await session.client.sendMessage(phoneJid, safeText);
                     const msgId = msg?.id?._serialized || null;
 
@@ -3068,17 +3358,26 @@ app.post('/send/text', async (req, res) => {
                     lastError = sendErr;
                     const errMsg = sendErr?.message || '';
 
-                    // 检查是否是 getChat undefined 错误
-                    if (errMsg.includes('getChat') || errMsg.includes('undefined')) {
+                    if (isRecoverableError(errMsg)) {
                         console.warn(`[send/text] Phone attempt ${attempt}/${MAX_RETRIES} failed: ${errMsg}`);
 
+                        // ★★★ V5.3.17：尝试底层发送方法 ★★★
+                        if (attempt === MAX_RETRIES) {
+                            console.log(`[send/text] Trying direct send method for ${phoneJid}`);
+                            const directResult = await sendMessageDirect(session.client, phoneJid, safeText);
+                            if (directResult.ok) {
+                                markSentFromChatwoot(directResult.id);
+                                console.log(`[send/text] SUCCESS via phone (direct): ${phoneJid}`);
+                                return ok(200, { ok: true, to: phoneJid, msgId: directResult.id, method: 'phone_direct' });
+                            }
+                        }
+
                         if (attempt < MAX_RETRIES) {
-                            await new Promise(r => setTimeout(r, 1000));
+                            await new Promise(r => setTimeout(r, 2000));
                             const state = await session.client.getState().catch(() => null);
                             if (state !== 'CONNECTED') break;
                         }
                     } else {
-                        // 其他错误，如果有 LID 可以回退，否则抛出
                         console.warn(`[send/text] Phone send error: ${errMsg}`);
                         break;
                     }
@@ -3097,22 +3396,35 @@ app.post('/send/text', async (req, res) => {
 
             for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
                 try {
-                    const msg = await session.client.sendMessage(lidJid, safeText);
-                    const msgId = msg?.id?._serialized || null;
+                    // ★★★ V5.3.17：对于 LID，优先使用底层发送方法 ★★★
+                    let result = null;
 
-                    markSentFromChatwoot(msgId);
-                    console.log(`[send/text] SUCCESS via LID: ${lidJid}`);
+                    if (attempt <= 2) {
+                        // 前两次尝试标准方法
+                        const msg = await session.client.sendMessage(lidJid, safeText);
+                        result = { ok: true, id: msg?.id?._serialized || null };
+                    } else {
+                        // 第三次使用底层方法
+                        result = await sendMessageDirect(session.client, lidJid, safeText);
+                    }
 
-                    return ok(200, { ok: true, to: lidJid, msgId, method: 'lid' });
+                    if (result.ok) {
+                        const msgId = result.id;
+                        markSentFromChatwoot(msgId);
+                        console.log(`[send/text] SUCCESS via LID: ${lidJid} (attempt ${attempt})`);
+                        return ok(200, { ok: true, to: lidJid, msgId, method: attempt <= 2 ? 'lid' : 'lid_direct' });
+                    } else {
+                        throw new Error(result.error || 'direct send failed');
+                    }
                 } catch (sendErr) {
                     lastError = sendErr;
                     const errMsg = sendErr?.message || '';
 
-                    if (errMsg.includes('getChat') || errMsg.includes('undefined')) {
+                    if (isRecoverableError(errMsg)) {
                         console.warn(`[send/text] LID attempt ${attempt}/${MAX_RETRIES} failed: ${errMsg}`);
 
                         if (attempt < MAX_RETRIES) {
-                            await new Promise(r => setTimeout(r, 1000));
+                            await new Promise(r => setTimeout(r, 2000));
                             const state = await session.client.getState().catch(() => null);
                             if (state !== 'CONNECTED') break;
                         }
@@ -3805,8 +4117,13 @@ app.post('/send/media', async (req, res) => {
                                 method = 'chat.sendMessage';
                             }
                         } catch (e) {
-                            console.error(`[send/media] Item ${i} failed:`, e?.message);
-                            results.push({ ok: false, error: e?.message, index: i });
+                            const errMsg = e?.message || '';
+                            console.error(`[send/media] Item ${i} failed:`, errMsg);
+                            // ★★★ V5.3.20：追踪 markedUnread 错误，传入 message_id 避免重复计数 ★★★
+                            if (errMsg.includes('markedUnread')) {
+                                trackMarkedUnreadError(sessionId, errMsg, message_id);
+                            }
+                            results.push({ ok: false, error: errMsg, index: i });
                             continue;
                         }
                     }
@@ -3828,8 +4145,13 @@ app.post('/send/media', async (req, res) => {
 
                     if (i < mediaItems.length - 1) await sleep(rnd(800, 1500));
                 } catch (e) {
-                    console.error(`[send/media] Item ${i} exception:`, e?.message);
-                    results.push({ ok: false, error: e?.message, index: i });
+                    const errMsg = e?.message || '';
+                    console.error(`[send/media] Item ${i} exception:`, errMsg);
+                    // ★★★ V5.3.20：追踪 markedUnread 错误，传入 message_id 避免重复计数 ★★★
+                    if (errMsg.includes('markedUnread')) {
+                        trackMarkedUnreadError(sessionId, errMsg, message_id);
+                    }
+                    results.push({ ok: false, error: errMsg, index: i });
                 }
             }
 

@@ -45,6 +45,12 @@ const INGEST_TOKEN = process.env.COLLECTOR_INGEST_TOKEN || process.env.API_TOKEN
 const REDIS_URL = process.env.REDIS_URL || '';
 const redis = REDIS_URL ? new IORedis(REDIS_URL, {maxRetriesPerRequest: null}) : null;
 
+// ★★★ V5.3.16：媒体补偿队列配置 ★★★
+const MEDIA_COMPENSATION_ENABLED = process.env.MEDIA_COMPENSATION_ENABLED !== 'false';  // 默认开启
+const MEDIA_COMPENSATION_DELAY = parseInt(process.env.MEDIA_COMPENSATION_DELAY || '30000');  // 首次重试延迟 30 秒
+const MEDIA_COMPENSATION_MAX_RETRIES = parseInt(process.env.MEDIA_COMPENSATION_MAX_RETRIES || '3');  // 最大重试 3 次
+const MEDIA_COMPENSATION_INTERVAL = parseInt(process.env.MEDIA_COMPENSATION_INTERVAL || '15000');  // 队列检查间隔 15 秒
+
 function ensureDir(p) {
     if (!fs.existsSync(p)) fs.mkdirSync(p, {recursive: true});
 }
@@ -850,6 +856,186 @@ async function syncNewContactHistory({sessionId, sessionName, chatId, phone, pho
     }
 }
 
+// ★★★ V5.3.16：媒体补偿队列 ★★★
+// 用于处理实时消息中媒体下载失败的情况，稍后重试并更新消息附件
+
+const MEDIA_COMPENSATION_KEY = 'wa:media:compensation:queue';
+
+/**
+ * 将失败的媒体消息加入补偿队列
+ */
+async function addToMediaCompensationQueue({
+                                               sessionId,
+                                               messageId,
+                                               conversationId,
+                                               cwMessageId,
+                                               mediaType,
+                                               retryCount = 0
+                                           }) {
+    if (!redis || !MEDIA_COMPENSATION_ENABLED) return false;
+
+    const item = {
+        sessionId,
+        messageId,
+        conversationId,
+        cwMessageId,
+        mediaType,
+        retryCount,
+        createdAt: Date.now(),
+        nextRetryAt: Date.now() + MEDIA_COMPENSATION_DELAY
+    };
+
+    await redis.zadd(MEDIA_COMPENSATION_KEY, item.nextRetryAt, JSON.stringify(item));
+    console.log(`[MEDIA_COMP] Added to queue: cw=${cwMessageId}, wa=${messageId?.substring(0, 30)}, type=${mediaType}, retry=${retryCount}`);
+    return true;
+}
+
+/**
+ * ★★★ V5.3.17：媒体下载最终失败时通知客服 ★★★
+ * 通过私信备注告知客服图片下载失败
+ */
+async function notifyMediaFailed({ account_id, conversation_id, message_id, media_type }) {
+    if (!account_id || !conversation_id) return;
+
+    const typeNames = {
+        image: '图片',
+        video: '视频',
+        audio: '音频',
+        ptt: '语音',
+        sticker: '贴纸',
+        document: '文件'
+    };
+
+    const typeName = typeNames[media_type] || '媒体';
+    const noteContent = `⚠️ ${typeName}下载失败（消息ID: ${message_id}）\n原始媒体无法获取，请联系客户重新发送。`;
+
+    try {
+        // 添加私信备注（只有客服可见）
+        await cw.request('POST',
+            `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`,
+            {
+                content: noteContent,
+                message_type: 'outgoing',
+                private: true
+            }
+        );
+        console.log(`[MEDIA_COMP] ✓ Media failure notified: conv=${conversation_id}, msg=${message_id}`);
+    } catch (e) {
+        console.error(`[MEDIA_COMP] Notify failed: ${e.message}`);
+    }
+}
+
+/**
+ * 处理媒体补偿队列
+ */
+async function processMediaCompensationQueue() {
+    if (!redis || !MEDIA_COMPENSATION_ENABLED) return;
+
+    const now = Date.now();
+
+    // 获取所有到期的任务（score <= now）
+    const items = await redis.zrangebyscore(MEDIA_COMPENSATION_KEY, 0, now, 'LIMIT', 0, 10);
+
+    if (items.length === 0) return;
+
+    console.log(`[MEDIA_COMP] Processing ${items.length} pending items`);
+
+    for (const itemStr of items) {
+        let item;
+        try {
+            item = JSON.parse(itemStr);
+        } catch (e) {
+            // 无效数据，移除
+            await redis.zrem(MEDIA_COMPENSATION_KEY, itemStr);
+            continue;
+        }
+
+        const { sessionId, messageId, conversationId, cwMessageId, mediaType, retryCount } = item;
+
+        console.log(`[MEDIA_COMP] Retrying: cw=${cwMessageId}, retry=${retryCount + 1}/${MEDIA_COMPENSATION_MAX_RETRIES}`);
+
+        try {
+            // 尝试重新获取媒体
+            const fetchMediaUrl = `${WA_BRIDGE_URL}/fetch-media`;
+            const mediaResp = await axios.post(fetchMediaUrl, {
+                sessionId,
+                messageId
+            }, {
+                headers: WA_BRIDGE_TOKEN ? {'x-api-token': WA_BRIDGE_TOKEN} : {},
+                timeout: 60000  // 补偿重试给更长时间
+            });
+
+            if (mediaResp?.data?.ok && mediaResp.data.media) {
+                const m = mediaResp.data.media;
+                console.log(`[MEDIA_COMP] ✓ Media fetched: ${m.mimetype}, size=${m.data?.length || 0}`);
+
+                // 成功获取媒体，更新 Chatwoot 消息
+                const attachment = {
+                    data_url: `data:${m.mimetype};base64,${m.data}`,
+                    mime: m.mimetype,
+                    filename: m.filename || `${mediaType}_${Date.now()}.${m.mimetype?.split('/')[1] || 'bin'}`
+                };
+
+                // 调用 Chatwoot API 添加附件到消息
+                const updated = await cw.addAttachmentToMessage({
+                    account_id: CHATWOOT_ACCOUNT_ID,
+                    conversation_id: conversationId,
+                    message_id: cwMessageId,
+                    attachment
+                });
+
+                if (updated) {
+                    console.log(`[MEDIA_COMP] ✓ Attachment added to message cw=${cwMessageId}`);
+                    // 成功，从队列移除
+                    await redis.zrem(MEDIA_COMPENSATION_KEY, itemStr);
+                } else {
+                    throw new Error('Failed to add attachment to message');
+                }
+            } else {
+                throw new Error('Media fetch returned no data');
+            }
+        } catch (e) {
+            console.log(`[MEDIA_COMP] ✗ Retry failed: ${e.message}`);
+
+            // 从队列移除旧项
+            await redis.zrem(MEDIA_COMPENSATION_KEY, itemStr);
+
+            // 判断是否需要继续重试
+            if (retryCount + 1 < MEDIA_COMPENSATION_MAX_RETRIES) {
+                // 增加重试次数，延长等待时间（指数退避）
+                const nextDelay = MEDIA_COMPENSATION_DELAY * Math.pow(2, retryCount + 1);
+                const newItem = {
+                    ...item,
+                    retryCount: retryCount + 1,
+                    nextRetryAt: Date.now() + nextDelay
+                };
+                await redis.zadd(MEDIA_COMPENSATION_KEY, newItem.nextRetryAt, JSON.stringify(newItem));
+                console.log(`[MEDIA_COMP] Scheduled next retry in ${nextDelay / 1000}s`);
+            } else {
+                console.log(`[MEDIA_COMP] Max retries reached, giving up: cw=${cwMessageId}`);
+
+                // ★★★ V5.3.17：最终失败时通知客服 ★★★
+                try {
+                    await notifyMediaFailed({
+                        account_id: CHATWOOT_ACCOUNT_ID,
+                        conversation_id: conversationId,
+                        message_id: cwMessageId,
+                        media_type: mediaType
+                    });
+                } catch (notifyErr) {
+                    console.error(`[MEDIA_COMP] Failed to notify: ${notifyErr.message}`);
+                }
+            }
+        }
+    }
+}
+
+// 启动媒体补偿队列处理器
+if (redis && MEDIA_COMPENSATION_ENABLED) {
+    setInterval(processMediaCompensationQueue, MEDIA_COMPENSATION_INTERVAL);
+    console.log(`[MEDIA_COMP] Queue processor started (interval: ${MEDIA_COMPENSATION_INTERVAL}ms, delay: ${MEDIA_COMPENSATION_DELAY}ms, maxRetries: ${MEDIA_COMPENSATION_MAX_RETRIES})`);
+}
+
 // ===== App 初始化 =====
 const app = express();
 const cors = require('cors');
@@ -1426,6 +1612,21 @@ app.post('/ingest', async (req, res) => {
         if (createdId && messageId && conversation_id) {
             await saveMessageMapping(conversation_id, messageId, createdId);
             console.log(`[INGEST] Message mapping saved: wa=${messageId.substring(0, 30)} -> cw=${createdId}`);
+
+            // ★★★ V5.3.17：如果媒体获取失败（Bridge 端标记）或没有附件，加入补偿队列 ★★★
+            const mediaFailed = req.body.mediaFailed === true;
+            const mediaTypeFromBridge = req.body.mediaType || type;
+
+            if ((MEDIA_TYPES.includes(type) && attachments.length === 0) || mediaFailed) {
+                await addToMediaCompensationQueue({
+                    sessionId,
+                    messageId,
+                    conversationId: conversation_id,
+                    cwMessageId: createdId,
+                    mediaType: mediaTypeFromBridge
+                });
+                console.log(`[INGEST] Added to compensation queue: cw=${createdId}, type=${mediaTypeFromBridge}, mediaFailed=${mediaFailed}`);
+            }
         }
 
         // 注意：新联系人的历史同步已在上方处理（直接返回），此处不再需要异步调用
@@ -4567,77 +4768,90 @@ app.post('/chatwoot/webhook', async (req, res) => {
                     message_id
                 });
 
-                // 后台异步发送（不阻塞响应）
+                // ★★★ V5.3.21：后台异步发送（带重试机制）★★★
+                // 重试间隔30秒，配合 bridge 的90秒冷却期，确保 session 有足够时间重启
                 setImmediate(async () => {
-                    const startTime = Date.now();
-                    try {
-                        const result = await postWithRetry(`${WA_BRIDGE_URL}/send/media`, payload, headers, 3, 180000); // 3分钟超时
+                    const MAX_RETRY_ATTEMPTS = 3;
+                    const RETRY_DELAY_MS = 30000; // 30秒后重试（等待 session 重启完成）
 
-                        const success = result?.ok || result?.success;
-                        const failedItems = (result?.results || []).filter(r => !r.ok);
-                        const duration = Date.now() - startTime;
+                    // 检查错误是否可重试
+                    const isRetryableError = (errMsg) => {
+                        return errMsg.includes('session_not_found') ||
+                            errMsg.includes('session not ready') ||
+                            errMsg.includes('restart') ||
+                            errMsg.includes('Session closed') ||
+                            errMsg.includes('markedUnread') ||
+                            errMsg.includes('page has been closed');
+                    };
 
-                        if (success && failedItems.length === 0) {
-                            logToCollector('[CW->WA] MEDIA_ASYNC_OK', {
-                                message_id,
-                                total: result?.total || mediaList.length,
-                                duration: `${duration}ms`
-                            });
-                            console.log(`[MEDIA_ASYNC] ✓ 发送成功: message_id=${message_id}, count=${mediaList.length}, duration=${duration}ms`);
+                    for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+                        const startTime = Date.now();
+                        try {
+                            const result = await postWithRetry(`${WA_BRIDGE_URL}/send/media`, payload, headers, 3, 180000);
 
+                            const success = result?.ok || result?.success;
+                            const failedItems = (result?.results || []).filter(r => !r.ok);
+                            const duration = Date.now() - startTime;
 
-                            // ★★★ V5.3.14修复：Bridge 返回的字段是 id 而不是 msgId ★★★
-                            const firstResult = (result?.results || [])[0];
-                            const firstMsgId = firstResult?.id || firstResult?.msgId || result?.msgId;
+                            if (success && failedItems.length === 0) {
+                                logToCollector('[CW->WA] MEDIA_ASYNC_OK', {
+                                    message_id,
+                                    total: result?.total || mediaList.length,
+                                    duration: `${duration}ms`,
+                                    attempt
+                                });
+                                console.log(`[MEDIA_ASYNC] ✓ 发送成功: message_id=${message_id}, count=${mediaList.length}, duration=${duration}ms, attempt=${attempt}`);
 
-                            console.log(`[MEDIA_ASYNC] firstResult: ${JSON.stringify(firstResult)}, firstMsgId: ${firstMsgId?.substring(0, 40)}`);
+                                const firstResult = (result?.results || [])[0];
+                                const firstMsgId = firstResult?.id || firstResult?.msgId || result?.msgId;
 
-                            if (firstMsgId && message_id && conversation_id) {
-                                // ★★★ V5.3.15：改进 source_id 回写错误处理 ★★★
-                                try {
-                                    const updateResult = await cw.updateMessageSourceId({
-                                        account_id: CHATWOOT_ACCOUNT_ID,
-                                        conversation_id: conversation_id,
-                                        message_id: message_id,
-                                        source_id: firstMsgId
-                                    });
-                                    if (updateResult) {
-                                        console.log(`[MEDIA_ASYNC] ✓ source_id 已回写: message_id=${message_id}`);
-                                    } else {
-                                        console.log(`[MEDIA_ASYNC] ⚠ source_id 回写跳过（消息可能已删除）: message_id=${message_id}`);
-                                    }
-                                } catch (updateErr) {
-                                    // 非 404 错误才记录为失败
-                                    console.error(`[MEDIA_ASYNC] ✗ source_id 回写失败: ${updateErr.message}`);
+                                if (firstMsgId && message_id && conversation_id) {
+                                    await saveMessageMapping(conversation_id, firstMsgId, message_id);
+                                    console.log(`[MEDIA_ASYNC] ✓ 消息映射已保存: wa=${firstMsgId.substring(0, 35)} -> cw=${message_id}`);
+                                }
+                                return; // 成功，退出重试循环
+                            } else {
+                                const errorMsg = failedItems.map(f => f.error).join('; ') || 'partial failure';
+
+                                // 检查是否全部失败且可重试
+                                if (failedItems.length === mediaList.length && isRetryableError(errorMsg) && attempt < MAX_RETRY_ATTEMPTS) {
+                                    console.warn(`[MEDIA_ASYNC] ⚠ 全部失败(可重试): message_id=${message_id}, attempt=${attempt}/${MAX_RETRY_ATTEMPTS}, waiting ${RETRY_DELAY_MS/1000}s...`);
+                                    await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                                    continue; // 继续重试
                                 }
 
-
-                                // ★★★ V5.3.13修复：媒体消息也要保存 Redis 映射（钢印原则）★★★
-                                await saveMessageMapping(conversation_id, firstMsgId, message_id);
-                                console.log(`[MEDIA_ASYNC] ✓ 消息映射已保存: wa=${firstMsgId.substring(0, 35)} -> cw=${message_id}`);
-                            } else {
-                                console.error(`[MEDIA_ASYNC] ✗ 无法保存映射: firstMsgId=${firstMsgId}, message_id=${message_id}, conversation_id=${conversation_id}`);
+                                logToCollector('[CW->WA] MEDIA_ASYNC_PARTIAL', {
+                                    message_id,
+                                    total: result?.total,
+                                    failed: failedItems.length,
+                                    error: errorMsg,
+                                    duration: `${duration}ms`,
+                                    attempt
+                                });
+                                console.error(`[MEDIA_ASYNC] ⚠ 部分失败: message_id=${message_id}, failed=${failedItems.length}/${mediaList.length}, error=${errorMsg}`);
+                                return; // 部分成功或不可重试，退出
                             }
-                        } else {
-                            const errorMsg = failedItems.map(f => f.error).join('; ') || 'partial failure';
-                            logToCollector('[CW->WA] MEDIA_ASYNC_PARTIAL', {
+                        } catch (err) {
+                            const duration = Date.now() - startTime;
+                            const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
+
+                            // 检查是否可重试
+                            if (isRetryableError(errorMsg) && attempt < MAX_RETRY_ATTEMPTS) {
+                                console.warn(`[MEDIA_ASYNC] ⚠ 发送异常(可重试): message_id=${message_id}, attempt=${attempt}/${MAX_RETRY_ATTEMPTS}, error=${errorMsg}, waiting ${RETRY_DELAY_MS/1000}s...`);
+                                await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                                continue; // 继续重试
+                            }
+
+                            logToCollector('[CW->WA] MEDIA_ASYNC_ERROR', {
                                 message_id,
-                                total: result?.total,
-                                failed: failedItems.length,
                                 error: errorMsg,
-                                duration: `${duration}ms`
+                                duration: `${duration}ms`,
+                                attempt,
+                                maxAttempts: MAX_RETRY_ATTEMPTS
                             });
-                            console.error(`[MEDIA_ASYNC] ⚠ 部分失败: message_id=${message_id}, failed=${failedItems.length}/${mediaList.length}, error=${errorMsg}`);
+                            console.error(`[MEDIA_ASYNC] ✗ 发送失败(已重试${attempt}次): message_id=${message_id}, error=${errorMsg}, duration=${duration}ms`);
+                            return; // 不可重试或已达最大重试次数，退出
                         }
-                    } catch (err) {
-                        const duration = Date.now() - startTime;
-                        const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
-                        logToCollector('[CW->WA] MEDIA_ASYNC_ERROR', {
-                            message_id,
-                            error: errorMsg,
-                            duration: `${duration}ms`
-                        });
-                        console.error(`[MEDIA_ASYNC] ✗ 发送失败: message_id=${message_id}, error=${errorMsg}, duration=${duration}ms`);
                     }
                 });
 
@@ -4711,103 +4925,142 @@ app.post('/chatwoot/webhook', async (req, res) => {
                 message_id
             });
 
-            // 后台异步发送（不阻塞响应）
+            // ★★★ V5.3.21：后台异步发送（带重试机制）★★★
+            // 重试间隔30秒，配合 bridge 的90秒冷却期，确保 session 有足够时间重启
             setImmediate(async () => {
-                const startTime = Date.now();
-                try {
-                    let result;
+                const MAX_RETRY_ATTEMPTS = 3;
+                const RETRY_DELAY_MS = 30000; // 30秒后重试
 
+                // 检查错误是否可重试
+                const isRetryableError = (errMsg) => {
+                    return errMsg.includes('session_not_found') ||
+                        errMsg.includes('session not ready') ||
+                        errMsg.includes('restart') ||
+                        errMsg.includes('Session closed') ||
+                        errMsg.includes('markedUnread') ||
+                        errMsg.includes('page has been closed');
+                };
 
-                    if (quotedMessageId) {
+                for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+                    const startTime = Date.now();
+                    try {
+                        let result;
 
-                        // Bridge 需要完整格式: phone@c.us 或 lid@lid
-                        let chatId = '';
-                        if (to && to !== 'none') {
-                            chatId = to.includes('@') ? to : `${to}@c.us`;
-                        } else if (to_lid && to_lid !== 'none') {
-                            chatId = to_lid.includes('@') ? to_lid : `${to_lid}@lid`;
-                        }
+                        if (quotedMessageId) {
+                            // Bridge 需要完整格式: phone@c.us 或 lid@lid
+                            let chatId = '';
+                            if (to && to !== 'none') {
+                                chatId = to.includes('@') ? to : `${to}@c.us`;
+                            } else if (to_lid && to_lid !== 'none') {
+                                chatId = to_lid.includes('@') ? to_lid : `${to_lid}@lid`;
+                            }
 
+                            result = await postWithRetry(
+                                `${WA_BRIDGE_URL}/send/reply/${finalSession}`,
+                                {
+                                    chatIdOrPhone: chatId,
+                                    text,
+                                    quotedMessageId,
+                                    quotedMessageSuffix
+                                },
+                                headers,
+                                3,
+                                60000
+                            );
 
-                        // send/reply会在发送方设备上用suffix查找正确的消息ID
-                        result = await postWithRetry(
-                            `${WA_BRIDGE_URL}/send/reply/${finalSession}`,
-                            {
-                                chatIdOrPhone: chatId,
-                                text,
-                                quotedMessageId,  // 原始ID（作为备用）
-                                quotedMessageSuffix  // suffix用于精确查找
-                            },
-                            headers,
-                            3,
-                            60000
-                        );
+                            const success = result?.ok;
+                            const duration = Date.now() - startTime;
 
-                        const success = result?.ok;
-                        const duration = Date.now() - startTime;
+                            if (success) {
+                                logToCollector('[CW->WA] REPLY_RESULT', {
+                                    success,
+                                    msgId: result?.msgId,
+                                    quotedMessageId: quotedMessageId?.substring(0, 30),
+                                    message_id,
+                                    duration: `${duration}ms`,
+                                    attempt
+                                });
+                                console.log(`[REPLY_ASYNC] ✓ 引用发送成功: message_id=${message_id}, msgId=${result?.msgId}, attempt=${attempt}`);
 
-                        logToCollector('[CW->WA] REPLY_RESULT', {
-                            success,
-                            msgId: result?.msgId,
-                            quotedMessageId: quotedMessageId?.substring(0, 30),
-                            quoteSuffix: quotedMessageSuffix,
-                            message_id,
-                            duration: `${duration}ms`
-                        });
-
-                        if (success) {
-                            console.log(`[REPLY_ASYNC] ✓ 引用发送成功: message_id=${message_id}, msgId=${result?.msgId}`);
-
-
-                            if (result?.msgId && message_id && conversation_id) {
-                                await saveMessageMapping(conversation_id, result.msgId, message_id);
-                                console.log(`[REPLY_ASYNC] ✓ 消息映射已保存: wa=${result.msgId.substring(0, 35)} -> cw=${message_id}`);
+                                if (result?.msgId && message_id && conversation_id) {
+                                    await saveMessageMapping(conversation_id, result.msgId, message_id);
+                                }
+                                return; // 成功，退出
+                            } else {
+                                const errorMsg = result?.error || 'unknown error';
+                                if (isRetryableError(errorMsg) && attempt < MAX_RETRY_ATTEMPTS) {
+                                    console.warn(`[REPLY_ASYNC] ⚠ 发送失败(可重试): message_id=${message_id}, attempt=${attempt}/${MAX_RETRY_ATTEMPTS}, waiting ${RETRY_DELAY_MS/1000}s...`);
+                                    await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                                    continue;
+                                }
+                                console.error(`[REPLY_ASYNC] ✗ 引用发送失败: message_id=${message_id}, error=${errorMsg}`);
+                                return;
                             }
                         } else {
-                            console.error(`[REPLY_ASYNC] ✗ 引用发送失败: message_id=${message_id}, error=${result?.error}`);
-                        }
-                    } else {
-                        // 普通发送
-                        result = await postWithRetry(
-                            `${WA_BRIDGE_URL}/send/text`,
-                            {sessionId: finalSession, to: to || '', to_lid: to_lid || '', text},
-                            headers,
-                            3,  // 3次重试
-                            60000  // 60秒超时
-                        );
+                            // 普通发送
+                            result = await postWithRetry(
+                                `${WA_BRIDGE_URL}/send/text`,
+                                {sessionId: finalSession, to: to || '', to_lid: to_lid || '', text},
+                                headers,
+                                3,
+                                60000
+                            );
 
-                        const success = result?.ok;
-                        const duration = Date.now() - startTime;
+                            const success = result?.ok;
+                            const duration = Date.now() - startTime;
 
-                        logToCollector('[CW->WA] TEXT_RESULT', {
-                            success,
-                            msgId: result?.msgId,
-                            message_id,
-                            duration: `${duration}ms`
-                        });
+                            if (success) {
+                                logToCollector('[CW->WA] TEXT_RESULT', {
+                                    success,
+                                    msgId: result?.msgId,
+                                    message_id,
+                                    duration: `${duration}ms`,
+                                    attempt
+                                });
+                                console.log(`[TEXT_ASYNC] ✓ 发送成功: message_id=${message_id}, msgId=${result?.msgId}, duration=${duration}ms, attempt=${attempt}`);
 
-                        if (!success) {
-                            console.error(`[TEXT_ASYNC] ✗ 发送失败: message_id=${message_id}, error=${result?.error}`);
-                        } else {
-                            console.log(`[TEXT_ASYNC] ✓ 发送成功: message_id=${message_id}, msgId=${result?.msgId}, duration=${duration}ms`);
-
-
-                            // Chatwoot不支持update_source_id API，所以改用Redis做映射
-                            if (result?.msgId && message_id && conversation_id) {
-                                await saveMessageMapping(conversation_id, result.msgId, message_id);
-                                console.log(`[TEXT_ASYNC] ✓ 消息映射已保存: wa=${result.msgId.substring(0, 35)} -> cw=${message_id}`);
+                                if (result?.msgId && message_id && conversation_id) {
+                                    await saveMessageMapping(conversation_id, result.msgId, message_id);
+                                }
+                                return; // 成功，退出
+                            } else {
+                                const errorMsg = result?.error || 'unknown error';
+                                if (isRetryableError(errorMsg) && attempt < MAX_RETRY_ATTEMPTS) {
+                                    console.warn(`[TEXT_ASYNC] ⚠ 发送失败(可重试): message_id=${message_id}, attempt=${attempt}/${MAX_RETRY_ATTEMPTS}, waiting ${RETRY_DELAY_MS/1000}s...`);
+                                    await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                                    continue;
+                                }
+                                console.error(`[TEXT_ASYNC] ✗ 发送失败: message_id=${message_id}, error=${errorMsg}`);
+                                logToCollector('[CW->WA] TEXT_RESULT', {
+                                    success: false,
+                                    error: errorMsg,
+                                    message_id,
+                                    duration: `${duration}ms`,
+                                    attempt
+                                });
+                                return;
                             }
                         }
+                    } catch (err) {
+                        const duration = Date.now() - startTime;
+                        const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
+
+                        if (isRetryableError(errorMsg) && attempt < MAX_RETRY_ATTEMPTS) {
+                            console.warn(`[TEXT_ASYNC] ⚠ 发送异常(可重试): message_id=${message_id}, attempt=${attempt}/${MAX_RETRY_ATTEMPTS}, error=${errorMsg}, waiting ${RETRY_DELAY_MS/1000}s...`);
+                            await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                            continue;
+                        }
+
+                        console.error(`[TEXT_ASYNC] ✗ 发送异常(已重试${attempt}次): message_id=${message_id}, error=${errorMsg}, duration=${duration}ms`);
+                        logToCollector('[CW->WA] TEXT_ERROR', {
+                            error: errorMsg,
+                            message_id,
+                            duration: `${duration}ms`,
+                            attempt,
+                            maxAttempts: MAX_RETRY_ATTEMPTS
+                        });
+                        return;
                     }
-                } catch (err) {
-                    const duration = Date.now() - startTime;
-                    const errorMsg = err?.response?.data?.error || err?.message || 'unknown error';
-                    console.error(`[TEXT_ASYNC] ✗ 发送异常: message_id=${message_id}, error=${errorMsg}, duration=${duration}ms`);
-                    logToCollector('[CW->WA] TEXT_ERROR', {
-                        error: errorMsg,
-                        message_id,
-                        duration: `${duration}ms`
-                    });
                 }
             });
 

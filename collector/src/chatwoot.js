@@ -1,6 +1,7 @@
 const axios = require('axios');
 const FormData = require('form-data');
 const path = require('path');
+const { LRUCache } = require('lru-cache');
 const { CFG } = require('./config');
 
 // ★★★ V5.3.13新增：提取消息ID后缀 ★★★
@@ -10,10 +11,18 @@ function extractMessageIdSuffix(messageId) {
   return parts.length > 0 ? parts[parts.length - 1] : null;
 }
 
-// ★★★ 新增：联系人内存缓存（解决 Chatwoot 搜索 API 索引延迟问题） ★★★
-const contactCache = new Map();  // key: digits -> value: { contact, timestamp }
-const conversationCache = new Map();  // key: contact_id:inbox_id -> value: { conversation, timestamp }
-const CACHE_TTL = 5 * 60 * 1000; // 5 分钟过期
+// ★★★ V5.3.22：使用 LRU 缓存替代 Map，自动过期管理 ★★★
+const CACHE_TTL = 10 * 60 * 1000; // 10 分钟过期
+const contactCache = new LRUCache({
+  max: 10000,              // 最多缓存 10000 个联系人
+  ttl: CACHE_TTL,          // 10 分钟后自动过期
+  updateAgeOnGet: true,    // 获取时刷新过期时间
+});
+const conversationCache = new LRUCache({
+  max: 10000,              // 最多缓存 10000 个会话
+  ttl: CACHE_TTL,          // 10 分钟后自动过期
+  updateAgeOnGet: true,    // 获取时刷新过期时间
+});
 
 // ★★★ 新增：锁机制（防止并发创建多个联系人/会话） ★★★
 const contactLocks = new Map();      // key: digits -> value: Promise
@@ -61,25 +70,22 @@ async function withConversationLock(contact_id, inbox_id, fn) {
   }
 }
 
-// ★★★ 修改：缓存 key 改为 digits:sessionId，区分不同 WhatsApp 账号 ★★★
+// ★★★ V5.3.22：LRU 缓存函数（自动过期，无需手动检查 timestamp）★★★
 function cacheContact(digits, sessionId, contact) {
   if (!digits || !contact?.id) return;
   const key = sessionId ? `${digits}:${sessionId}` : digits;
-  contactCache.set(key, { contact, timestamp: Date.now() });
+  contactCache.set(key, contact);  // LRU 自动管理过期
   console.log(`[contactCache] Cached contact ${contact.id} for key ${key}`);
 }
 
 function getCachedContact(digits, sessionId) {
   if (!digits) return null;
   const key = sessionId ? `${digits}:${sessionId}` : digits;
-  const cached = contactCache.get(key);
-  if (!cached) return null;
-  if (Date.now() - cached.timestamp > CACHE_TTL) {
-    contactCache.delete(key);
-    return null;
+  const contact = contactCache.get(key);  // LRU 自动返回 null 如果已过期
+  if (contact) {
+    console.log(`[contactCache] Hit! contact ${contact.id} for key ${key}`);
   }
-  console.log(`[contactCache] Hit! contact ${cached.contact.id} for key ${key}`);
-  return cached.contact;
+  return contact || null;
 }
 
 // ★★★ 新增：清除联系人缓存 ★★★
@@ -90,25 +96,22 @@ function clearContactCache(digits, sessionId) {
   console.log(`[contactCache] Cleared cache for key ${key}`);
 }
 
-// ★★★ 新增：会话缓存 ★★★
+// ★★★ V5.3.22：会话 LRU 缓存函数（自动过期）★★★
 function cacheConversation(contact_id, inbox_id, conversation) {
   if (!contact_id || !inbox_id || !conversation?.id) return;
   const key = `${contact_id}:${inbox_id}`;
-  conversationCache.set(key, { conversation, timestamp: Date.now() });
+  conversationCache.set(key, conversation);  // LRU 自动管理过期
   console.log(`[conversationCache] Cached conversation ${conversation.id} for contact ${contact_id} inbox ${inbox_id}`);
 }
 
 function getCachedConversation(contact_id, inbox_id) {
   if (!contact_id || !inbox_id) return null;
   const key = `${contact_id}:${inbox_id}`;
-  const cached = conversationCache.get(key);
-  if (!cached) return null;
-  if (Date.now() - cached.timestamp > CACHE_TTL) {
-    conversationCache.delete(key);
-    return null;
+  const conversation = conversationCache.get(key);  // LRU 自动返回 null 如果已过期
+  if (conversation) {
+    console.log(`[conversationCache] Hit! conversation ${conversation.id} for contact ${contact_id} inbox ${inbox_id}`);
   }
-  console.log(`[conversationCache] Hit! conversation ${cached.conversation.id} for contact ${contact_id} inbox ${inbox_id}`);
-  return cached.conversation;
+  return conversation || null;
 }
 
 // ★★★ 新增：清除会话缓存 ★★★
@@ -119,15 +122,15 @@ function clearConversationCache(contact_id, inbox_id) {
   console.log(`[conversationCache] Cleared cache for contact ${contact_id} inbox ${inbox_id}`);
 }
 
-// ★★★ 修改：清除所有与联系人相关的缓存（需要 sessionId） ★★★
+// ★★★ V5.3.22：清除所有与联系人相关的缓存（适配 LRU 缓存）★★★
 function clearAllCacheForDigits(digits, sessionId) {
   if (!digits) return;
   const key = sessionId ? `${digits}:${sessionId}` : digits;
-  const cached = contactCache.get(key);
-  if (cached?.contact?.id) {
+  const contact = contactCache.get(key);
+  if (contact?.id) {
     // 清除该联系人的所有会话缓存
-    for (const cacheKey of conversationCache.keys()) {
-      if (cacheKey.startsWith(`${cached.contact.id}:`)) {
+    for (const cacheKey of [...conversationCache.keys()]) {  // 转为数组避免迭代时修改
+      if (cacheKey.startsWith(`${contact.id}:`)) {
         conversationCache.delete(cacheKey);
         console.log(`[conversationCache] Cleared related cache: ${cacheKey}`);
       }
@@ -2007,6 +2010,98 @@ async function updateMessageSourceId({ account_id, conversation_id, message_id, 
   }
 }
 
+/**
+ * ★★★ V5.3.16：向现有消息添加附件（媒体补偿） ★★★
+ *
+ * 由于 Chatwoot API 不支持直接向消息添加附件，
+ * 此函数会删除原消息，然后重新创建一条带附件的消息。
+ *
+ * @param {Object} params
+ * @param {string} params.account_id - 账户 ID
+ * @param {number} params.conversation_id - 会话 ID
+ * @param {number} params.message_id - 消息 ID
+ * @param {Object} params.attachment - 附件对象 {data_url, mime, filename}
+ * @returns {Object|null} 新创建的消息或 null
+ */
+async function addAttachmentToMessage({ account_id, conversation_id, message_id, attachment }) {
+  if (!account_id || !conversation_id || !message_id || !attachment) {
+    console.warn('[addAttachmentToMessage] Missing required params');
+    return null;
+  }
+
+  try {
+    console.log(`[addAttachmentToMessage] Adding attachment to message ${message_id}...`);
+
+    // 1. 获取原消息内容
+    const messagesUrl = `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`;
+    const messagesResp = await cwRequest('get', messagesUrl);
+    const messages = messagesResp?.payload || messagesResp || [];
+
+    const originalMessage = messages.find(m => m.id === message_id);
+    if (!originalMessage) {
+      console.warn(`[addAttachmentToMessage] Original message ${message_id} not found`);
+      return null;
+    }
+
+    const originalContent = originalMessage.content || '';
+    const originalSourceId = originalMessage.source_id || '';
+
+    // 2. 删除原消息
+    try {
+      await cwRequest('delete',
+          `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages/${message_id}`
+      );
+      console.log(`[addAttachmentToMessage] Deleted original message ${message_id}`);
+    } catch (delErr) {
+      console.warn(`[addAttachmentToMessage] Failed to delete original message: ${delErr.message}`);
+      // 即使删除失败，也尝试创建新消息（可能会有重复）
+    }
+
+    // 3. 创建带附件的新消息
+    const FormData = require('form-data');
+    const form = new FormData();
+
+    // 添加消息内容
+    form.append('content', originalContent || '📷');
+    form.append('message_type', 'incoming');
+    form.append('private', 'false');
+
+    // 如果有原始 source_id，保留它
+    if (originalSourceId) {
+      form.append('source_id', originalSourceId);
+    }
+
+    // 处理附件
+    if (attachment.data_url) {
+      const matches = attachment.data_url.match(/^data:([^;]+);base64,(.+)$/);
+      if (matches) {
+        const mimeType = matches[1];
+        const base64Data = matches[2];
+        const buffer = Buffer.from(base64Data, 'base64');
+        const filename = attachment.filename || `media_${Date.now()}.${mimeType.split('/')[1] || 'bin'}`;
+
+        form.append('attachments[]', buffer, {
+          filename: filename,
+          contentType: mimeType
+        });
+      }
+    }
+
+    // 发送请求创建新消息
+    const createUrl = `/api/v1/accounts/${account_id}/conversations/${conversation_id}/messages`;
+    const newMessage = await cwRequest('post', createUrl, form, {
+      headers: form.getHeaders()
+    });
+
+    console.log(`[addAttachmentToMessage] ✓ Created new message with attachment: ${newMessage?.id}`);
+    return newMessage;
+
+  } catch (e) {
+    console.error(`[addAttachmentToMessage] Failed: ${e.message}`);
+    return null;
+  }
+}
+
 module.exports = {
   listAccounts,
   listInboxes,
@@ -2035,5 +2130,7 @@ module.exports = {
   // 新增：去重检查函数
   checkMessageExists,
   findMessageBySourceId,
-  checkMessagesExist
+  checkMessagesExist,
+  // ★★★ V5.3.16：媒体补偿函数 ★★★
+  addAttachmentToMessage
 };
